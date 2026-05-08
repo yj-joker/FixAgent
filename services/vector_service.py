@@ -39,14 +39,14 @@ class VectorService:
         try:
             self.redis.execute_command("FT.INFO", self.INDEX_NAME)
         except redis.exceptions.ResponseError:
-            # 索引不存在，创建它
+            # 索引不存在，创建它（Redis Stack 2.x / RediSearch 2.x 语法，需要参数数量）
             self.redis.execute_command(
                 "FT.CREATE",
                 self.INDEX_NAME,
                 "SCHEMA",
                 "id", "TEXT",
                 "text", "TEXT",
-                "vector", "VECTOR", "COSINE", "DIM", self.VECTOR_DIM, "TYPE", "FLOAT32",
+                "vector", "VECTOR", "HNSW", "6", "TYPE", "FLOAT32", "DIM", str(self.VECTOR_DIM), "DISTANCE_METRIC", "COSINE",
                 "metadata", "TEXT",
                 "created_at", "NUMERIC"
             )
@@ -78,26 +78,14 @@ class VectorService:
             key = f"doc:{doc_id}"
             metadata_json = json.dumps(metadata) if metadata else "{}"
 
-            # 存储文档数据
-            pipe = self.redis.pipeline()
-            pipe.hset(key, mapping={
+            # 存储文档数据并自动索引
+            self.redis.hset(key, mapping={
                 "id": doc_id,
                 "text": text,
                 "vector": self._to_bytes(vector),
                 "metadata": metadata_json,
                 "created_at": str(int(time.time()))
             })
-            # 添加到向量索引
-            pipe.execute_command(
-                "FT.VADD",
-                self.INDEX_NAME,
-                doc_id,
-                self._to_bytes(vector),
-                "id", doc_id,
-                "text", text,
-                "metadata", metadata_json,
-                "created_at", str(int(time.time()))
-            )
             return True
         except Exception as e:
             print(f"[ERROR] add_vector failed: {e}")
@@ -170,15 +158,23 @@ class VectorService:
             # 解析结果
             docs = []
             if results and len(results) > 1:
-                # results[0] 是总数量，后续是文档
+                # results[0] 是总数量，之后每两项为一组：[key, [fields...]]
                 for i in range(1, len(results), 2):
-                    if i + 1 < len(results):
-                        doc_fields = results[i]
-                        score = results[i + 1]
-                        doc = {"doc_id": doc_fields[1], "score": float(score)}
-                        if include_metadata:
-                            doc["text"] = doc_fields[3] if len(doc_fields) > 3 else ""
-                        docs.append(doc)
+                    key = results[i]
+                    fields = results[i + 1]
+                    # fields 是 [field, value, field, value, ...]
+                    field_dict = {}
+                    for j in range(0, len(fields), 2):
+                        field_dict[fields[j]] = fields[j + 1]
+
+                    doc = {
+                        "doc_id": field_dict.get(b"id", b"").decode() if isinstance(field_dict.get(b"id"), bytes) else field_dict.get(b"id", ""),
+                        "score": float(field_dict.get(b"score", 0))
+                    }
+                    if include_metadata:
+                        text_val = field_dict.get(b"text", b"")
+                        doc["text"] = text_val.decode() if isinstance(text_val, bytes) else text_val
+                    docs.append(doc)
 
             return docs
 

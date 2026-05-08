@@ -16,7 +16,9 @@
       "Bash(netstat -ano)",
       "Bash(findstr :6379)",
       "Bash(tasklist)",
-      "Bash(findstr 22524)"
+      "Bash(findstr 22524)",
+      "Bash(docker exec *)",
+      "Bash(rm *)"
     ]
   }
 }

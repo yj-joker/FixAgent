@@ -32,7 +32,12 @@ FixAgent/
 │   ├── orchestrator_agent.py    # 调度 Agent（意图识别/任务分解）
 │   ├── retrieval_agent.py       # 检索 Agent
 │   ├── diagnosis_agent.py       # 诊断 Agent
-│   └── guidance_agent.py        # 作业 Agent
+│   ├── guidance_agent.py        # 作业 Agent
+│   └── intention/                # 意图识别模块（LLM+关键词兜底）
+│       ├── __init__.py
+│       ├── recognizer.py        # 意图识别器（LLM识别）
+│       ├── prompts.py           # 识别提示词模板
+│       └── fallback.py          # 关键词兜底策略
 │
 ├── chains/                       # LangChain 链式调用（流程编排）
 │   ├── __init__.py

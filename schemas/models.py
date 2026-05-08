@@ -162,6 +162,29 @@ class IntentionType(str, Enum):
     GENERAL_CHAT = "general_chat"           # 一般对话
 
 
+class IntentionResult(BaseModel):
+    """
+    意图识别结果模型
+
+    【关联】OrchestratorAgent 意图识别
+    【何时用】意图识别完成后返回识别结果
+
+    【字段说明】
+    - intention: 识别的意图类型
+    - confidence: 置信度（0.0~1.0）
+    - reasoning: 识别理由/推理过程
+
+    【置信度参考】
+    - >= 0.9: 高度确信
+    - 0.7~0.9: 中度确信
+    - 0.5~0.7: 低度确信（兜底方案）
+    - < 0.5: 不确信
+    """
+    intention: IntentionType = Field(description="意图类型")
+    confidence: float = Field(description="置信度", ge=0.0, le=1.0)
+    reasoning: str = Field(description="识别理由")
+
+
 class ImageProcessStatus(str, Enum):
     """
     图片处理状态枚举
