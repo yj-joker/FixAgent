@@ -15,6 +15,7 @@ FastAPI Web 服务入口，负责 HTTP 接口、请求路由、参数校验。
 | `/ai/diagnosis` | POST | 纯诊断接口 | DiagnosisAgent |
 | `/ai/guidance` | POST | 纯指引接口 | GuidanceAgent |
 | `/ai/pipeline` | POST | 完整流程接口 | All Agents |
+| `/ai/memory/consolidate` | POST | 记忆整理接口 | MemoryAgent |
 
 ## 请求模型
 
@@ -27,6 +28,7 @@ FastAPI Web 服务入口，负责 HTTP 接口、请求路由、参数校验。
 - `SamSegmentRequest` - SAM分割请求
 - `ClipEmbedRequest` - CLIP向量化请求
 - `DocumentParseRequest` - 文档解析请求
+- `MemoryConsolidateRequest` - 记忆整理请求
 
 ## 响应模型
 
@@ -39,6 +41,7 @@ FastAPI Web 服务入口，负责 HTTP 接口、请求路由、参数校验。
 - `SamSegmentResponse` - SAM分割响应
 - `ClipEmbedResponse` - CLIP向量化响应
 - `DocumentParseResponse` - 文档解析响应
+- `MemoryConsolidateResponse` - 记忆整理响应
 
 ## 依赖关系
 
@@ -53,6 +56,7 @@ api/main.py
     ├── agents/retrieval_agent.py       # 检索Agent
     ├── agents/diagnosis_agent.py       # 诊断Agent
     ├── agents/guidance_agent.py       # 作业Agent
+    ├── agents/memory_agent.py         # 记忆整理Agent
     │
     └── services/llm_service.py        # 阿里云百炼
     └── services/vector_service.py      # Redis向量库
@@ -379,6 +383,7 @@ async def run_full_pipeline(self, session_id, message, images):
 | `POST /ai/diagnosis` | `AIController.diagnosis()` | 纯诊断接口 |
 | `POST /ai/guidance` | `AIController.guidance()` | 纯指引接口 |
 | `POST /ai/pipeline` | `AIController.pipeline()` | 完整流程接口 |
+| `POST /ai/memory/consolidate` | `AIController.memoryConsolidate()` | 记忆整理接口 |
 
 **调用流程**：
 

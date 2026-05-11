@@ -692,3 +692,55 @@ class TaskStatusResponse(BaseResponse):
     error: Optional[str] = None
     created_at: str
     updated_at: str
+
+
+# ==================== 记忆整理相关 ====================
+
+class MemorySummary(BaseModel):
+    """
+    记忆摘要模型
+
+    【功能关联】MemoryAgent 整理输出
+    【何时用】LLM 完成对话整理后，作为结构化摘要返回给 Java
+
+    【字段说明】
+    - core_question: 用户最关心的核心问题
+    - key_conclusions: 对话中给出的关键诊断结论/建议
+    - user_preferences: 用户表达的特殊偏好或约束
+    - unresolved: 用户问了但未解决的问题
+    - brief_summary: 200字以内的整体摘要
+    """
+    core_question: str = Field(default="", description="用户的核心问题")
+    key_conclusions: List[str] = Field(default_factory=list, description="关键结论列表")
+    user_preferences: List[str] = Field(default_factory=list, description="用户偏好/约束")
+    unresolved: List[str] = Field(default_factory=list, description="未解决的问题")
+    brief_summary: str = Field(default="", description="200字以内的整体摘要")
+
+
+class MemoryConsolidateResponse(BaseResponse):
+    """
+    记忆整理响应
+
+    【功能关联】POST /ai/memory/consolidate
+    【何时用】整理完成后返回结构化摘要给 Java
+
+    【字段说明】
+    - session_id: 关联的会话 ID
+    - summary: 整理后的记忆摘要（含核心问题、结论等五个子字段）
+    - original_count: 原始对话条数（用于 Java 端日志/统计）
+    - consolidated_at: 整理时间（ISO格式）
+
+    【Java 对应类】
+    ```java
+    public class MemoryConsolidateResponse extends BaseResponse {
+        String sessionId;
+        MemorySummary summary;
+        int originalCount;
+        String consolidatedAt;
+    }
+    ```
+    """
+    session_id: str = Field(..., description="会话ID")
+    summary: MemorySummary = Field(..., description="整理后的记忆摘要")
+    original_count: int = Field(..., description="原始对话条数")
+    consolidated_at: str = Field(..., description="整理时间")

@@ -33,6 +33,7 @@ FixAgent/
 │   ├── retrieval_agent.py       # 检索 Agent
 │   ├── diagnosis_agent.py       # 诊断 Agent
 │   ├── guidance_agent.py        # 作业 Agent
+│   ├── memory_agent.py          # 记忆整理 Agent（对话摘要压缩）
 │   └── intention/                # 意图识别模块（LLM+关键词兜底）
 │       ├── __init__.py
 │       ├── recognizer.py        # 意图识别器（LLM识别）
@@ -426,7 +427,7 @@ Java后端处理响应
 | 层级 | 包 | 职责 | Spring 类比 |
 |------|---|------|------------|
 | **入口层** | api/ | 接收 HTTP 请求、参数校验 | @RestController |
-| **调度层** | agents/ | 意图识别、分发任务、汇总结果 | @Service (业务编排) |
+| **调度层** | agents/ | 意图识别、分发任务、汇总结果、记忆整理 | @Service (业务编排) |
 | **流程层** | chains/ | LCEL 链式调用定义执行流程 | Integration Flow |
 | **工具层** | tools/ | 封装各种能力的调用接口 | @Component (工具类) |
 | **服务层** | services/ | 封装外部服务（LLM、Redis、Neo4j）客户端 | Feign Client |
@@ -437,7 +438,7 @@ Java后端处理响应
 
 | 关系 | 描述 |
 |------|------|
-| api → agents | api 接收请求后调用 OrchestratorAgent 执行调度 |
+| api → agents | api 接收请求后调用 OrchestratorAgent/MemoryAgent 执行任务 |
 | agents → chains | Agent 内部使用 Chains 定义的具体执行流程 |
 | agents → tools | Agent 调用 Tools 执行具体任务（检索、查询、检测等） |
 | agents → services | Agent 调用 Services 获取外部能力（LLM、向量、图谱） |
@@ -456,7 +457,7 @@ Java后端处理响应
 | 模块 | 职责 | 技术选型 | 边界 |
 |-----|------|---------|------|
 | `api` | HTTP 接口、请求路由、参数校验 | FastAPI | **Python AI** |
-| `agents` | Agent 实现、意图识别、任务调度 | LangChain Agent | **Python AI** |
+| `agents` | Agent 实现、意图识别、任务调度、记忆整理 | LangChain Agent | **Python AI** |
 | `chains` | LangChain 链定义、业务流程编排 | LangChain | **Python AI** |
 | `config` | API Keys、模型配置 | python-dotenv | **Python AI** |
 | `embeddings` | 文本/图像向量提取 | 百炼API / CLIP | **Python AI** |
@@ -544,6 +545,42 @@ Java后端处理响应
    └── 返回响应给用户
 ```
 
+### 记忆整理流程
+
+```
+Java后端检测对话数量
+   │
+   ├── 会话对话数 < 30条 → 继续累积
+   │
+   └── 会话对话数 >= 30条 → 触发整理
+              │
+              ▼
+        Java取出全部对话
+              │
+              ▼
+        POST /ai/memory/consolidate
+              │
+              ▼
+┌─────────────────────────────┐
+│     MemoryAgent             │
+│                             │
+│  1. 格式化30条对话为文本块    │
+│  2. 调用 LLM 生成摘要        │
+│  3. 解析 JSON 返回结构化摘要  │
+└─────────────────────────────┘
+              │
+              ▼
+        返回 MemoryConsolidateResponse
+        { summary: { core_question, key_conclusions,
+          user_preferences, unresolved, brief_summary } }
+              │
+              ▼
+        Java存储摘要 → 清空原始对话
+              │
+              ▼
+        后续对话带上"记忆摘要"作为上下文
+```
+
 ### 知识检索流程
 
 ```
@@ -584,6 +621,7 @@ Java后端处理响应
 | `/ai/diagnosis` | POST | 纯诊断接口 | 故障分析 |
 | `/ai/guidance` | POST | 纯指引接口 | 获取维修步骤 |
 | `/ai/pipeline` | POST | 完整流程接口 | 一站式故障排查 |
+| `/ai/memory/consolidate` | POST | 记忆整理接口 | 对话达到阈值时压缩为摘要 |
 
 ### 请求/响应模型
 
@@ -613,6 +651,34 @@ class AIChatResponse(BaseModel):
     reasoning: Optional[dict] = None       # 推理过程（可选）
 ```
 
+**记忆整理专用模型**
+
+```python
+# Request：Java发送待整理的对话列表
+class ConversationItem(BaseModel):
+    seq: int                              # 对话序号
+    role: str                             # 角色: user/assistant
+    content: str                          # 对话内容
+
+class MemoryConsolidateRequest(BaseModel):
+    session_id: str                       # 会话ID
+    conversations: List[ConversationItem] # 待整理的对话列表
+
+# Response：返回结构化记忆摘要
+class MemorySummary(BaseModel):
+    core_question: str                    # 用户核心问题
+    key_conclusions: List[str]            # 关键诊断结论
+    user_preferences: List[str]           # 用户偏好/约束
+    unresolved: List[str]                 # 未解决问题
+    brief_summary: str                    # 200字内整体摘要
+
+class MemoryConsolidateResponse(BaseModel):
+    session_id: str                       # 会话ID
+    summary: MemorySummary                # 整理后的记忆摘要
+    original_count: int                   # 原始对话条数
+    consolidated_at: str                  # 整理时间
+```
+
 ---
 
 ## 依赖关系
@@ -638,6 +704,8 @@ api/main.py (Python AI入口)
     │                   │
     │                   ├──► services/llm_service.py
     │                   └──► embeddings/...
+    │
+    ├──► agents/memory_agent.py ──► services/llm_service.py
     │
     ├──► services/llm_service.py ──► 阿里云百炼API
     ├──► services/vector_service.py ──► Redis向量库

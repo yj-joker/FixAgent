@@ -712,3 +712,52 @@ class DocumentParseRequest(BaseModel):
     """
     file_url: str = Field(..., description="文档URL")
     file_type: str = Field(..., description="文件类型: pdf/docx/txt")
+
+
+# ==================== 记忆整理相关 ====================
+
+class ConversationItem(BaseModel):
+    """
+    对话记录单项
+
+    【功能关联】记忆整理、工作记忆压缩
+    【何时用】Java 端收集到阈值数量的对话后，打包发给 Python 做整理时
+
+    【字段说明】
+    - seq: 对话序号，用于保持顺序
+    - role: 发言角色（user 或 assistant）
+    - content: 发言内容
+    """
+    seq: int = Field(..., description="对话序号")
+    role: str = Field(..., description="角色: user/assistant")
+    content: str = Field(..., description="对话内容")
+
+
+class MemoryConsolidateRequest(BaseModel):
+    """
+    记忆整理请求
+
+    【功能关联】POST /ai/memory/consolidate
+    【何时用】对话达到阈值（如30条）时，Java 端调用此接口压缩对话为摘要
+
+    【使用顺序】
+    1. Java 端检测到某会话对话数 >= 阈值
+    2. 从数据库取出该会话的全部对话
+    3. 组装 MemoryConsolidateRequest
+    4. 调用 Python AI 服务生成摘要
+    5. Java 端存储摘要、清空原始对话
+
+    【字段说明】
+    - session_id: 会话ID
+    - conversations: 待整理的对话列表（至少1条）
+
+    【Java 对应类】
+    ```java
+    public class MemoryConsolidateRequest {
+        String sessionId;
+        List<ConversationItem> conversations;
+    }
+    ```
+    """
+    session_id: str = Field(..., description="会话ID")
+    conversations: List[ConversationItem] = Field(..., min_length=1, description="待整理的对话列表")
