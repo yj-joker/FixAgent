@@ -92,37 +92,55 @@ class OrchestratorAgent(BaseAgent):
         3. 映射 IntentionType → AgentMode
         4. 按 mode 路由到对应 handler
         5. 汇总返回
+
+        异常处理：任意环节失败返回友好提示而非抛出异常，
+                  具体错误信息记录在 metadata 中供排查。
         """
         start_time = time.time()
 
-        # 1. 解析用户指定的 mode
-        user_mode = self._resolve_mode(input_data)
+        try:
+            # 1. 解析用户指定的 mode
+            user_mode = self._resolve_mode(input_data)
 
-        # 2. 意图识别
-        intention_result = None
-        if user_mode == AgentMode.CHAT:
-            # 用户未显式指定 → AI自动识别意图
-            intention_result = await self.recognizer.recognize(
-                input_data.user_message
+            # 2. 意图识别
+            intention_result = None
+            if user_mode == AgentMode.CHAT:
+                intention_result = await self.recognizer.recognize(
+                    input_data.user_message
+                )
+                effective_mode = map_intention_to_mode(intention_result.intention)
+            else:
+                effective_mode = user_mode
+
+            # 3. 按模式路由
+            output = await self._dispatch(effective_mode, input_data, intention_result)
+
+            # 4. 设置耗时和外层元数据
+            latency_ms = int((time.time() - start_time) * 1000)
+            output.latency_ms = latency_ms
+            output.metadata["effective_mode"] = effective_mode.value
+            output.metadata["user_mode"] = user_mode.value
+            if intention_result:
+                output.metadata["confidence"] = intention_result.confidence
+                output.metadata["reasoning"] = intention_result.reasoning
+
+            return output
+
+        except Exception as e:
+            latency_ms = int((time.time() - start_time) * 1000)
+            return AgentOutput(
+                agent_name=self.name,
+                message="AI服务暂时不可用，请稍后重试",
+                intention=None,
+                tools_used=[],
+                metadata={
+                    "status": "error",
+                    "error_type": type(e).__name__,
+                    "error_detail": str(e),
+                    "latency_ms": latency_ms
+                },
+                latency_ms=latency_ms
             )
-            effective_mode = map_intention_to_mode(intention_result.intention)
-        else:
-            # 用户显式指定了非CHAT模式 → 直接使用
-            effective_mode = user_mode
-
-        # 3. 按模式路由
-        output = await self._dispatch(effective_mode, input_data, intention_result)
-
-        # 4. 设置耗时和外层元数据
-        latency_ms = int((time.time() - start_time) * 1000)
-        output.latency_ms = latency_ms
-        output.metadata["effective_mode"] = effective_mode.value
-        output.metadata["user_mode"] = user_mode.value
-        if intention_result:
-            output.metadata["confidence"] = intention_result.confidence
-            output.metadata["reasoning"] = intention_result.reasoning
-
-        return output
 
     async def run_stream(self, input_data: AgentInput) -> AsyncIterator[str]:
         """

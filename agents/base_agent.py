@@ -14,6 +14,7 @@ Agent基类模块
 - 单例模式：各子Agent由调用方管理生命周期，BaseAgent不负责实例化
 """
 
+import time
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, AsyncIterator
 from datetime import datetime
@@ -221,36 +222,50 @@ class BaseAgent(ABC):
         3. 处理输出
         4. 返回结果
 
+        异常处理：任意环节失败返回友好提示，
+                  具体错误信息记录在 metadata 中供排查。
+
         Args:
             input_data: Agent输入数据
 
         Returns:
             AgentOutput对象
         """
-        import time
         start_time = time.time()
 
-        # 1. 构建消息
-        messages = self._build_messages(input_data)
+        try:
+            # 1. 构建消息
+            messages = self._build_messages(input_data)
 
-        # 2. 调用LLM
-        response = await self._call_llm(messages, stream=False)
+            # 2. 调用LLM
+            response = await self._call_llm(messages, stream=False)
 
-        # 3. 计算耗时
-        latency_ms = int((time.time() - start_time) * 1000)
+            # 3. 处理输出
+            intention = input_data.context.get("intention") if input_data.context else None
+            output = self._process_response(
+                raw_response=response,
+                tools_used=self.get_tools_used(input_data),
+                metadata={"latency_ms": 0},
+                intention=intention
+            )
+            output.latency_ms = int((time.time() - start_time) * 1000)
+            return output
 
-        # 4. 处理输出
-        # 从 context 中提取意图（由外部 Orchestrator 识别后填入）
-        intention = input_data.context.get("intention") if input_data.context else None
-        output = self._process_response(
-            raw_response=response,
-            tools_used=self.get_tools_used(input_data),
-            metadata={"latency_ms": latency_ms},
-            intention=intention
-        )
-        output.latency_ms = latency_ms
-
-        return output
+        except Exception as e:
+            latency_ms = int((time.time() - start_time) * 1000)
+            return AgentOutput(
+                agent_name=self.name,
+                message="AI服务暂时不可用，请稍后重试",
+                intention=None,
+                tools_used=[],
+                metadata={
+                    "status": "error",
+                    "error_type": type(e).__name__,
+                    "error_detail": str(e),
+                    "latency_ms": latency_ms
+                },
+                latency_ms=latency_ms
+            )
 
     async def run_stream(self, input_data: AgentInput) -> AsyncIterator[str]:
         """
