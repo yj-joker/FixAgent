@@ -267,6 +267,105 @@ class BaseAgent(ABC):
                 latency_ms=latency_ms
             )
 
+    async def run_with_react(
+        self,
+        input_data: AgentInput,
+        max_iterations: int = 10
+    ) -> AgentOutput:
+        """
+        ReAct 模式执行入口
+
+        使用 LLM function calling 实现 Thought → Action → Observation 循环。
+        LLM 自主决定每步调用哪个工具、何时结束、何时追问用户。
+
+        流程：
+        1. 构建消息（系统提示词 + 用户输入）
+        2. 收集子类提供的工具列表
+        3. 调用 chat_with_tools() 进入 ReAct 循环
+        4. LLM 返回最终文本响应后退出循环
+        5. 包装为 AgentOutput 返回
+
+        Args:
+            input_data: Agent 输入数据
+            max_iterations: 最大工具调用轮数（防止无限循环）
+
+        Returns:
+            AgentOutput 对象
+        """
+        start_time = time.time()
+
+        try:
+            # 1. 构建消息
+            messages = self._build_messages(input_data)
+
+            # 2. 获取工具列表，转为 OpenAI schema + handler 映射
+            tools = self.get_tools()
+            tool_schemas = [t.to_openai_schema() for t in tools]
+            tool_handlers = {}
+            for tool in tools:
+                def _make_handler(t):
+                    async def handler(**kwargs):
+                        result = await t.run(**kwargs)
+                        if result.success:
+                            return result.data if result.data is not None else {"result": "success"}
+                        else:
+                            return {"error": result.error.message if result.error else "unknown error"}
+                    return handler
+                tool_handlers[tool.name] = _make_handler(tool)
+
+            # 3. ReAct 循环（chat_with_tools 内部自动处理）
+            response = await self.llm_service.chat_with_tools(
+                messages=messages,
+                tools=tool_schemas,
+                tool_handlers=tool_handlers,
+                max_iterations=max_iterations
+            )
+
+            # 4. 记录使用的工具
+            tools_used = [t.name for t in tools]
+
+            # 5. 处理响应
+            intention = input_data.context.get("intention") if input_data.context else None
+            output = self._process_response(
+                raw_response=response,
+                tools_used=tools_used,
+                metadata={"execution_mode": "react"},
+                intention=intention
+            )
+            output.latency_ms = int((time.time() - start_time) * 1000)
+            return output
+
+        except RuntimeError as e:
+            # 工具调用超出最大迭代次数
+            latency_ms = int((time.time() - start_time) * 1000)
+            return AgentOutput(
+                agent_name=self.name,
+                message="AI推理步骤超出限制，请尝试简化问题后重新提问。",
+                intention=None,
+                tools_used=[],
+                metadata={
+                    "status": "max_iterations_exceeded",
+                    "error_detail": str(e),
+                    "latency_ms": latency_ms
+                },
+                latency_ms=latency_ms
+            )
+        except Exception as e:
+            latency_ms = int((time.time() - start_time) * 1000)
+            return AgentOutput(
+                agent_name=self.name,
+                message="AI服务暂时不可用，请稍后重试",
+                intention=None,
+                tools_used=[],
+                metadata={
+                    "status": "error",
+                    "error_type": type(e).__name__,
+                    "error_detail": str(e),
+                    "latency_ms": latency_ms
+                },
+                latency_ms=latency_ms
+            )
+
     async def run_stream(self, input_data: AgentInput) -> AsyncIterator[str]:
         """
         Agent流式执行入口
