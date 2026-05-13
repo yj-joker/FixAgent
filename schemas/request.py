@@ -91,7 +91,7 @@ class ChatRequest(BaseModel):
     ```
     """
     session_id: str = Field(..., description="会话ID，用于追踪对话历史")
-    message: str = Field(..., min_length=1, max_length=2000, description="用户消息")
+    message: str = Field(..., min_length=1, max_length=50000, description="用户消息")
     mode: AgentMode = Field(default=AgentMode.CHAT, description="运行模式")
     images: Optional[List[str]] = Field(default=None, description="图片URL列表")
     stream: bool = Field(default=True, description="是否启用流式输出")
