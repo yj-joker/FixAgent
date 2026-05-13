@@ -233,7 +233,7 @@ class MemoryAgent(BaseAgent):
                 tool_handlers=tool_handlers,
                 response_format={"type": "json_object"}
             )
-            content = response.get("content", "")
+            content = response.get("content") or ""
         except Exception as e:
             latency_ms = int((time.time() - start_time) * 1000)
             return AgentOutput(
@@ -263,8 +263,9 @@ class MemoryAgent(BaseAgent):
                     )
                 except Exception:
                     logger.exception("Failed to store facts to Redis vector DB")
-        except (json.JSONDecodeError, ValueError, ValidationError):
-            summary = MemorySummary(brief_summary=content[:200])
+        except (json.JSONDecodeError, ValueError, ValidationError, AttributeError, TypeError) as e:
+            logger.warning(f"JSON parse failed, using fallback: {e}, raw content: {content[:100]}")
+            summary = MemorySummary(brief_summary=content[:200] if content else "")
 
         return AgentOutput(
             agent_name=self.name,

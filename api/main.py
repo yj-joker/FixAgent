@@ -178,6 +178,11 @@ async def memory_consolidate(request: MemoryConsolidateRequest) -> MemoryConsoli
 
         result = await get_memory_agent().run(agent_input)
 
+        if result.metadata.get("status") == "error":
+            error_type = result.metadata.get("error_type", "UnknownError")
+            error_detail = result.metadata.get("error_detail", "记忆整理失败")
+            raise HTTPException(status_code=500, detail=f"[{error_type}] {error_detail}")
+
         return MemoryConsolidateResponse(
             success=True,
             message="整理完成",
@@ -187,6 +192,8 @@ async def memory_consolidate(request: MemoryConsolidateRequest) -> MemoryConsoli
             original_count=len(request.memoryMessages),
             consolidated_at=datetime.now().isoformat()
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
