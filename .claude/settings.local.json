@@ -20,7 +20,8 @@
       "Bash(docker exec *)",
       "Bash(rm *)",
       "Read(//usr/local/share/claude-code/**)",
-      "Read(//c/Program Files/Claude/**)"
+      "Read(//c/Program Files/Claude/**)",
+      "Bash(powershell *)"
     ]
   }
 }
