@@ -18,10 +18,10 @@ OrchestratorAgent — 调度中枢
 """
 
 import time
-from typing import Optional, AsyncIterator
+from collections.abc import AsyncIterator
 
 from agents.base_agent import BaseAgent, AgentInput, AgentOutput
-from agents.intention.recognizer import get_intention_recognizer, IntentionRecognizer
+from agents.intention.recognizer import get_intention_recognizer
 from chains.orchestrator import map_intention_to_mode
 from schemas.models import AgentMode, IntentionType, IntentionResult
 from services.llm_service import LLMService
@@ -198,7 +198,7 @@ class OrchestratorAgent(BaseAgent):
         self,
         mode: AgentMode,
         input_data: AgentInput,
-        intention_result: Optional[IntentionResult]
+        intention_result: IntentionResult | None
     ) -> AgentOutput:
         """
         按模式分发到对应的 handler
@@ -229,7 +229,7 @@ class OrchestratorAgent(BaseAgent):
     async def _execute_chat(
         self,
         input_data: AgentInput,
-        intention_result: Optional[IntentionResult]
+        intention_result: IntentionResult | None
     ) -> AgentOutput:
         """
         CHAT 模式 —— 直接 LLM 对话
@@ -250,15 +250,15 @@ class OrchestratorAgent(BaseAgent):
     async def _execute_retrieval(
         self,
         input_data: AgentInput,
-        intention_result: Optional[IntentionResult]
+        intention_result: IntentionResult | None
     ) -> AgentOutput:
         """
-        RETRIEVAL 模式 —— 从知识库检索相关文档
+        RETRIEVAL 模式 —— ReAct 知识检索
 
-        TODO: RetrievalAgent 实现后，取消下方注释，删除占位返回。
+        将用户问题交给 RetrievalAgent，由 LLM 自主决定检索策略。
         """
-        # TODO: RetrievalAgent 实现后启用
-        # return await self.retrieval_agent.run(input_data)
+        if self.retrieval_agent is not None:
+            return await self.retrieval_agent.run_with_react(input_data)
 
         intention_str = intention_result.intention.value if intention_result else None
         return AgentOutput(
@@ -272,15 +272,15 @@ class OrchestratorAgent(BaseAgent):
     async def _execute_diagnosis(
         self,
         input_data: AgentInput,
-        intention_result: Optional[IntentionResult]
+        intention_result: IntentionResult | None
     ) -> AgentOutput:
         """
-        DIAGNOSIS 模式 —— 故障诊断分析
+        DIAGNOSIS 模式 —— ReAct 故障诊断
 
-        TODO: DiagnosisAgent 实现后，取消下方注释，删除占位返回。
+        将用户问题交给 DiagnosisAgent，由 LLM 自主决定：检索→追问→推理→诊断。
         """
-        # TODO: DiagnosisAgent 实现后启用
-        # return await self.diagnosis_agent.run(input_data)
+        if self.diagnosis_agent is not None:
+            return await self.diagnosis_agent.run_with_react(input_data)
 
         intention_str = intention_result.intention.value if intention_result else None
         return AgentOutput(
@@ -294,15 +294,15 @@ class OrchestratorAgent(BaseAgent):
     async def _execute_guidance(
         self,
         input_data: AgentInput,
-        intention_result: Optional[IntentionResult]
+        intention_result: IntentionResult | None
     ) -> AgentOutput:
         """
-        GUIDANCE 模式 —— 生成维修作业指引
+        GUIDANCE 模式 —— ReAct 维修作业指引
 
-        TODO: GuidanceAgent 实现后，取消下方注释，删除占位返回。
+        将用户需求交给 GuidanceAgent，由 LLM 自主决定：检索标准流程→生成步骤→校验合规。
         """
-        # TODO: GuidanceAgent 实现后启用
-        # return await self.guidance_agent.run(input_data)
+        if self.guidance_agent is not None:
+            return await self.guidance_agent.run_with_react(input_data)
 
         intention_str = intention_result.intention.value if intention_result else None
         return AgentOutput(
@@ -316,45 +316,87 @@ class OrchestratorAgent(BaseAgent):
     async def _execute_full_pipeline(
         self,
         input_data: AgentInput,
-        intention_result: Optional[IntentionResult]
+        intention_result: IntentionResult | None
     ) -> AgentOutput:
         """
         FULL 模式 —— 完整流程：检索 → 诊断 → 指引
 
-        TODO: chains/pipeline.py 实现后，取消下方注释，删除占位返回。
-        预期流程：
-        1. RetrievalAgent.run()  → 从知识库检索相关文档
-        2. DiagnosisAgent.run()  → 结合检索结果分析故障原因
-        3. GuidanceAgent.run()   → 生成维修步骤
-        4. 汇总三步结果返回
+        依次调用三个子 Agent 的 ReAct 模式，将前一步结果作为上下文传给下一步。
         """
-        # TODO: chains/pipeline.py 实现后启用
-        # from chains.pipeline import run_pipeline
-        # return await run_pipeline(
-        #     retrieval_agent=self.retrieval_agent,
-        #     diagnosis_agent=self.diagnosis_agent,
-        #     guidance_agent=self.guidance_agent,
-        #     input_data=input_data
-        # )
+        tools_used = []
+        context = dict(input_data.context or {})
+
+        # Step 1: 检索
+        if self.retrieval_agent is not None:
+            retrieval_output = await self.retrieval_agent.run_with_react(input_data)
+            tools_used.extend(retrieval_output.tools_used)
+            context["retrieval_result"] = retrieval_output.message
+        else:
+            context["retrieval_result"] = "（检索Agent尚未注入，跳过）"
+
+        # Step 2: 诊断（传入检索结果作为上下文）
+        if self.diagnosis_agent is not None:
+            diagnosis_input = AgentInput(
+                user_message=input_data.user_message,
+                session_id=input_data.session_id,
+                images=input_data.images,
+                context=context
+            )
+            diagnosis_output = await self.diagnosis_agent.run_with_react(diagnosis_input)
+            tools_used.extend(diagnosis_output.tools_used)
+            context["diagnosis_result"] = diagnosis_output.message
+        else:
+            context["diagnosis_result"] = "（诊断Agent尚未注入，跳过）"
+
+        # Step 3: 指引（传入检索+诊断结果作为上下文）
+        if self.guidance_agent is not None:
+            guidance_input = AgentInput(
+                user_message=input_data.user_message,
+                session_id=input_data.session_id,
+                images=input_data.images,
+                context=context
+            )
+            guidance_output = await self.guidance_agent.run_with_react(guidance_input)
+            tools_used.extend(guidance_output.tools_used)
+            context["guidance_result"] = guidance_output.message
+        else:
+            context["guidance_result"] = "（指引Agent尚未注入，跳过）"
+
+        # 汇总
+        summary_parts = []
+        if context.get("retrieval_result"):
+            summary_parts.append(f"## 相关知识检索\n{context['retrieval_result']}")
+        if context.get("diagnosis_result"):
+            summary_parts.append(f"## 故障诊断分析\n{context['diagnosis_result']}")
+        if context.get("guidance_result"):
+            summary_parts.append(f"## 维修作业指引\n{context['guidance_result']}")
 
         intention_str = intention_result.intention.value if intention_result else None
         return AgentOutput(
             agent_name=self.name,
-            message="完整诊断流程正在开发中，当前仅支持对话模式。请使用 mode=chat 或将问题直接发送给我。",
+            message="\n\n".join(summary_parts) if summary_parts else "完整诊断流程正在开发中，当前仅支持对话模式。",
             intention=intention_str,
-            tools_used=[],
-            metadata={"mode": AgentMode.FULL.value, "status": "not_implemented"}
+            tools_used=tools_used,
+            metadata={"mode": AgentMode.FULL.value, "context": context}
         )
 
 
 # 单例
-_orchestrator_agent: Optional[OrchestratorAgent] = None
+_orchestrator_agent: OrchestratorAgent | None = None
 
 
 def get_orchestrator_agent() -> OrchestratorAgent:
-    """获取 OrchestratorAgent 单例"""
+    """获取 OrchestratorAgent 单例，自动注入子Agent"""
     global _orchestrator_agent
     if _orchestrator_agent is None:
         from services.llm_service import get_llm_service
         _orchestrator_agent = OrchestratorAgent(get_llm_service())
+
+        # 注入子Agent（延迟导入避免循环依赖）
+        from agents.retrieval_agent import get_retrieval_agent
+        from agents.diagnosis_agent import get_diagnosis_agent
+        from agents.guidance_agent import get_guidance_agent
+        _orchestrator_agent.set_retrieval_agent(get_retrieval_agent())
+        _orchestrator_agent.set_diagnosis_agent(get_diagnosis_agent())
+        _orchestrator_agent.set_guidance_agent(get_guidance_agent())
     return _orchestrator_agent

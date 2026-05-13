@@ -6,14 +6,12 @@ import json
 from schemas.request import ChatRequest, KnowledgeSearchRequest, MemoryConsolidateRequest
 from schemas.response import ChatResponse, KnowledgeSearchResponse, BaseResponse, MemoryConsolidateResponse
 from schemas.models import AgentMode
-from services.llm_service import get_llm_service
 from agents.orchestrator_agent import get_orchestrator_agent
-from agents.memory_agent import MemoryAgent
+from agents.memory_agent import get_memory_agent
 from agents.base_agent import AgentInput
 
 # Agent 惰性初始化（首次请求时创建，避免启动时加载模型）
 _orchestrator = None
-_memory_agent = None
 
 
 def _get_orchestrator():
@@ -21,13 +19,6 @@ def _get_orchestrator():
     if _orchestrator is None:
         _orchestrator = get_orchestrator_agent()
     return _orchestrator
-
-
-def _get_memory_agent():
-    global _memory_agent
-    if _memory_agent is None:
-        _memory_agent = MemoryAgent(get_llm_service())
-    return _memory_agent
 
 
 app = FastAPI(
@@ -158,7 +149,7 @@ async def knowledge_search(request: KnowledgeSearchRequest) -> KnowledgeSearchRe
 
 
 """记忆整理"""
-@app.post("/ai/memory/consolidate", response_model=MemoryConsolidateResponse)
+@app.post("/ai/memory/consolidate", response_model=MemoryConsolidateResponse, response_model_by_alias=True)
 async def memory_consolidate(request: MemoryConsolidateRequest) -> MemoryConsolidateResponse:
     """
     将多条原始对话压缩为结构化记忆摘要（滑动窗口 + 分类记忆）。
@@ -174,18 +165,18 @@ async def memory_consolidate(request: MemoryConsolidateRequest) -> MemoryConsoli
     from datetime import datetime
 
     try:
-        conv_dicts = [{"seq": c.seq, "role": c.role, "content": c.content} for c in request.conversations]
+        conv_dicts = [{"seq": i + 1, "role": m.role, "content": m.content} for i, m in enumerate(request.memoryMessages)]
         agent_input = AgentInput(
             user_message="请整理以下对话记录",
             session_id=request.session_id,
             context={
                 "conversations": conv_dicts,
-                "old_preferences": request.old_preferences,
-                "old_unresolved": request.old_unresolved
+                "old_preferences": [p.model_dump() for p in request.memoryPreferenceVOList],
+                "old_unresolved": [u.model_dump() for u in request.memoryUnresolvedVOList]
             }
         )
 
-        result = await _get_memory_agent().run(agent_input)
+        result = await get_memory_agent().run(agent_input)
 
         return MemoryConsolidateResponse(
             success=True,
@@ -193,7 +184,7 @@ async def memory_consolidate(request: MemoryConsolidateRequest) -> MemoryConsoli
             code=200,
             session_id=request.session_id,
             summary=result.metadata.get("summary", {}),
-            original_count=len(request.conversations),
+            original_count=len(request.memoryMessages),
             consolidated_at=datetime.now().isoformat()
         )
     except Exception as e:

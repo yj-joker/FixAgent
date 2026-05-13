@@ -1,4 +1,5 @@
 import json
+import time
 import httpx
 from typing import AsyncIterator, Optional, List, Dict, Any, Callable, Awaitable
 from config.settings import get_settings
@@ -30,7 +31,8 @@ class LLMService:
         messages: List[Dict[str, str]],
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-        stream: bool = False
+        stream: bool = False,
+        response_format: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any] | AsyncIterator[str]:
         """
         对话接口
@@ -40,6 +42,7 @@ class LLMService:
             temperature: 温度参数，控制随机性
             max_tokens: 最大生成长度
             stream: 是否流式输出
+            response_format: 输出格式约束，如 {"type": "json_object"}
 
         Returns:
             非流式：完整响应字典
@@ -52,6 +55,9 @@ class LLMService:
             "top_p": self.settings.llm_top_p,
             "max_tokens": max_tokens or self.settings.llm_max_tokens
         }
+
+        if response_format:
+            params["response_format"] = response_format
 
         if stream:
             params["stream"] = True
@@ -147,7 +153,8 @@ class LLMService:
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
         tool_handlers: Dict[str, Callable[..., Awaitable]],
-        max_iterations: int = 10
+        max_iterations: int = 10,
+        response_format: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:
         """
         带工具调用的对话
@@ -162,9 +169,10 @@ class LLMService:
             tools: OpenAI 格式的工具定义列表
             tool_handlers: {"工具名": async_handler} 映射
             max_iterations: 最大工具调用轮数
+            response_format: 输出格式约束，如 {"type": "json_object"}
 
         Returns:
-            最终响应字典，包含 content / usage / request_id
+            最终响应字典，包含 content / usage / request_id / trace
         """
         params = {
             "model": self.model,
@@ -176,17 +184,40 @@ class LLMService:
             "max_tokens": self.settings.llm_max_tokens
         }
 
+        if response_format:
+            params["response_format"] = response_format
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
 
-        for _ in range(max_iterations):
+        trace = []
+
+        for i in range(max_iterations):
+            step_start = time.time()
             response = await self._sync_chat_with_tools(self.client, headers, params)
 
             tool_calls = response.get("tool_calls", [])
+            step_duration_ms = int((time.time() - step_start) * 1000)
+
             if not tool_calls:
+                trace.append({
+                    "iteration": i + 1,
+                    "action": "finish",
+                    "content_preview": (response.get("content") or "")[:100],
+                    "duration_ms": step_duration_ms
+                })
+                response["trace"] = trace
                 return response
+
+            # 收集本轮工具调用详情
+            step_info = {
+                "iteration": i + 1,
+                "action": "tool_call",
+                "duration_ms": step_duration_ms,
+                "tool_calls": []
+            }
 
             # 添加 assistant 消息（含 tool_calls）
             messages.append({
@@ -203,18 +234,34 @@ class LLMService:
                 except json.JSONDecodeError:
                     func_args = {}
 
+                call_record = {
+                    "name": func_name,
+                    "arguments": func_args
+                }
+
                 if func_name in tool_handlers:
                     try:
                         result = await tool_handlers[func_name](**func_args)
                     except Exception as e:
                         result = {"error": str(e)}
 
+                    call_record["result_summary"] = str(result)[:200]
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
                         "content": json.dumps(result, ensure_ascii=False)
                     })
+                else:
+                    call_record["result_summary"] = f"tool not found: {func_name}"
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": json.dumps({"error": f"Tool {func_name} not found"})
+                    })
 
+                step_info["tool_calls"].append(call_record)
+
+            trace.append(step_info)
             params["messages"] = messages
 
         raise RuntimeError(f"Tool calling 超出最大迭代次数 ({max_iterations})")

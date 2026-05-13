@@ -326,10 +326,15 @@ class BaseAgent(ABC):
 
             # 5. 处理响应
             intention = input_data.context.get("intention") if input_data.context else None
+            react_trace = response.get("trace", [])
             output = self._process_response(
                 raw_response=response,
                 tools_used=tools_used,
-                metadata={"execution_mode": "react"},
+                metadata={
+                    "execution_mode": "react",
+                    "react_trace": react_trace,
+                    "react_iterations": len(react_trace)
+                },
                 intention=intention
             )
             output.latency_ms = int((time.time() - start_time) * 1000)
