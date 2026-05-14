@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
+from api.asr_api import asr_router
 from schemas.request import ChatRequest, KnowledgeImportRequest, KnowledgeSearchRequest, MemoryConsolidateRequest
 from schemas.response import ChatResponse, KnowledgeImportResponse, KnowledgeSearchResponse, BaseResponse, MemoryConsolidateResponse
 from agents.orchestrator_agent import get_orchestrator_agent
@@ -49,6 +50,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+app.include_router(asr_router)
 
 """对话，非流式响应"""
 @app.post("/ai/chat", response_model=ChatResponse)

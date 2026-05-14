@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/pip list *)",
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(.venv/Scripts/pip.exe list *)",
+      "Bash(git push *)",
+      "Bash(git config *)",
+      "WebSearch",
+      "WebFetch(domain:help.aliyun.com)",
+      "Bash(python -c \"from api.main import app; print\\([r.path for r in app.routes]\\)\")",
+      "Bash(python -c \"from api.main import app; print\\([\\(r.path, r.methods\\) for r in app.routes if 'chat' in r.path]\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(git *)",
+      "Bash(python *)",
+      "Bash(netstat -ano)",
+      "Bash(findstr :6379)",
+      "Bash(tasklist)",
+      "Bash(findstr 22524)",
+      "Bash(docker exec *)",
+      "Bash(rm *)",
+      "Read(//usr/local/share/claude-code/**)",
+      "Read(//c/Program Files/Claude/**)",
+      "Bash(powershell *)",
+      "Bash(pip install *)",
+      "Bash(pip show *)"
+    ]
+  }
+}
