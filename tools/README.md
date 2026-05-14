@@ -16,7 +16,7 @@ Tools 是 Agent 的**能力扩展层**，将外部能力封装为统一接口，
 | `graph_search_devices` | graph_query_tool.py | Neo4j设备搜索 | **已实现** |
 | `yolo_detect` | yolo_tool.py | YOLO目标检测 | TODO 占位 |
 | `sam_segment` | sam_tool.py | SAM图像分割 | TODO 占位 |
-| `document_parser` | document_tool.py | 文档解析 | TODO 占位 |
+| `document_parser` | document_tool.py | 文档解析 | **已实现**（PDF/Word/TXT，文本/表格/图片提取） |
 
 ## BaseTool 基类
 
@@ -69,10 +69,10 @@ tools/
 ├── base_tool.py                  # 基类: BaseTool / ToolResult / ToolException / ToolError
 ├── knowledge_retrieval_tool.py   # 知识库向量检索
 ├── fact_retrieval_tool.py        # 事实向量检索（MemoryAgent 专用）
-├── graph_query_tool.py           # Neo4j 图谱查询（两条工具链）
+├── graph_query_tool.py           # Neo4j 图谱查询（诊断路径 + 设备搜索）
 ├── yolo_tool.py                  # TODO: YOLO 目标检测
 ├── sam_tool.py                   # TODO: SAM 图像分割
-└── document_tool.py              # TODO: 文档解析
+└── document_tool.py              # 文档解析（PDF/Word/TXT，文本/表格/图片提取）
 ```
 
 ## 与其他模块的关系

@@ -17,6 +17,7 @@ Services 是系统的**核心服务层**，封装与外部服务的交互：
 | `llm_service` | llm_service.py | 大模型对话 + function calling + ReAct 循环 | 阿里云百炼 DashScope |
 | `vector_service` | vector_service.py | 向量存储 / 检索 / 删除 / 计数 | Redis Stack (FT.SEARCH) |
 | `graph_service` | graph_service.py | Neo4j CRUD + Cypher 查询 + 路径查询 | Neo4j |
+| `knowledge_service` | knowledge_service.py | 文档导入编排：解析→向量化→入库 | DocumentParserTool + TextEmbedding + VectorService |
 
 ## LLMService — 核心接口
 
@@ -74,6 +75,33 @@ faults = graph_service.find_faults_by_component(component_id, limit=10)
 solutions = graph_service.find_solutions_by_fault(fault_id, verified_only=True)
 ```
 
+## KnowledgeService — 核心接口
+
+```python
+from services.knowledge_service import get_knowledge_service
+
+svc = get_knowledge_service()
+
+# 导入文档：解析 PDF → 向量化 → 存入 Redis 向量库
+result = await svc.import_document(
+    file_url="/path/to/manual.pdf",
+    file_type="pdf",
+    category="维修手册",
+    tags=["电动机", "轴承"]
+)
+# result: {
+#   "file_name": "...",
+#   "total_pages": N,
+#   "text_count": 125,      # 入库文本块数
+#   "image_count": 30,      # 入库图片数
+#   "table_count": 12,     # 入库表格数
+#   "sections": [...],
+#   "process_time_ms": 3200
+# }
+```
+
+编排流程：DocumentParserTool 解析 → TextEmbedding 批量向量化 → VectorService 入库
+
 ## 文件结构
 
 ```
@@ -81,7 +109,8 @@ services/
 ├── __init__.py
 ├── llm_service.py              # LLM 调用（chat / chat_with_tools / ReAct trace）
 ├── vector_service.py           # Redis 向量库（search / add_vector / add_vector_batch）
-└── graph_service.py            # Neo4j 图数据库（query_diagnosis_path / find_* / CRUD）
+├── graph_service.py            # Neo4j 图数据库（query_diagnosis_path / find_* / CRUD）
+└── knowledge_service.py        # 文档导入编排（import_document: 解析→向量化→入库）
 ```
 
 ## 日志输出点

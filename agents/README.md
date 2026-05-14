@@ -21,7 +21,7 @@ Agent 是系统的**核心智能组件**，采用**混合架构**：
 │                                                        │
 │  _resolve_mode() → 解析用户指定模式                   │
 │  IntentionRecognizer.recognize() → CHAT模式自动识别意图 │
-│  map_intention_to_mode() → 映射为 AgentMode            │
+│  _map_intention_to_mode() → 映射为 AgentMode           │
 │  _dispatch() → 路由到对应 handler                      │
 └──────────────────────────────────────────────────────┘
            │

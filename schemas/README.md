@@ -220,7 +220,7 @@ from models import AgentMode, CaseStatus
 class ChatRequest(BaseModel):
     """对话请求"""
     session_id: str = Field(..., description="会话ID，用于追踪对话历史")
-    message: str = Field(..., min_length=1, max_length=2000, description="用户消息")
+    message: str = Field(..., min_length=1, max_length=50000, description="用户消息")
     mode: AgentMode = Field(default=AgentMode.CHAT, description="运行模式")
     images: Optional[List[str]] = Field(default=None, description="图片URL列表")
     stream: bool = Field(default=True, description="是否启用流式输出")
@@ -385,7 +385,7 @@ class ClipEmbedRequest(BaseModel):
 class DocumentParseRequest(BaseModel):
     """文档解析请求"""
     file_url: str = Field(..., description="文档URL")
-    file_type: str = Field(..., description="文件类型: pdf/docx/txt")
+    file_type: str = Field(default="pdf", description="文件类型，目前仅支持 pdf")
 ```
 
 ### response.py - 响应模型定义
