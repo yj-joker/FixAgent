@@ -194,11 +194,9 @@ class RealtimeMemoryAgent(BaseAgent):
         ]
 
         try:
-            # 直接调用LLM，不用 function calling（更快）
-            response = await self.llm_service.chat_with_tools(
+            # 直接调用 LLM chat 接口（无需 function calling），返回 JSON 格式
+            response = await self.llm_service.chat(
                 messages=messages,
-                tools=[],  # 不注册任何工具
-                tool_handlers={},
                 response_format={"type": "json_object"}
             )
             content = response.get("content") or ""

@@ -24,7 +24,9 @@
       "Bash(powershell *)",
       "Bash(pip install *)",
       "Bash(pip show *)",
-      "Bash(Get-ChildItem *)"
+      "Bash(Get-ChildItem *)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.google.com)"
     ]
   }
 }
