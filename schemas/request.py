@@ -91,10 +91,12 @@ class ChatRequest(BaseModel):
     ```
     """
     session_id: str = Field(..., description="会话ID，用于追踪对话历史")
-    message: str = Field(..., min_length=1, max_length=50000, description="用户消息")
+    message: str = Field(..., min_length=1, max_length=50000, description="用户消息（当前轮纯文本）")
     mode: AgentMode = Field(default=AgentMode.CHAT, description="运行模式")
     images: Optional[List[str]] = Field(default=None, description="图片URL列表")
     stream: bool = Field(default=True, description="是否启用流式输出")
+    conversation_history: Optional[List[dict]] = Field(default=None, description="多轮对话历史，格式：[{'role':'user','content':'...'},{'role':'assistant','content':'...'}]")
+    context: Optional[dict] = Field(default=None, description="结构化上下文（摘要、事实、偏好、待办）")
 
     @validator('images')
     def validate_images(cls, v):

@@ -258,15 +258,23 @@ class VectorService:
         """
         删除向量
 
+        通过删除 Redis Hash key 来移除向量。
+        Redis Search 索引会自动感知 Hash 被删除并从索引中移除该文档。
+
         Args:
-            doc_id: 文档ID
+            doc_id: 文档ID（存储时 key 为 "doc:{doc_id}"）
 
         Returns:
             是否删除成功
         """
         try:
-            self.redis.execute_command("FT.DEL", self.INDEX_NAME, doc_id)
-            return True
+            key = f"doc:{doc_id}"
+            result = self.redis.delete(key)
+            if result:
+                logger.info(f"delete vector success: {key}")
+            else:
+                logger.warning(f"delete vector key not found: {key}")
+            return bool(result)
         except Exception as e:
             logger.error(f"delete failed: {e}")
             return False
