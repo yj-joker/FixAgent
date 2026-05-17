@@ -30,10 +30,11 @@ logger = logging.getLogger(__name__)
 
 class AgentInput(BaseModel):
     """Agent输入模型"""
-    user_message: str = Field(description="用户消息")
+    user_message: str = Field(description="当前轮用户消息（纯文本）")
     session_id: str = Field(description="会话ID")
     images: Optional[List[str]] = Field(default=None, description="图片列表")
-    context: Optional[Dict[str, Any]] = Field(default=None, description="上下文信息")
+    context: Optional[Dict[str, Any]] = Field(default=None, description="结构化上下文（摘要、事实、偏好、待办）")
+    conversation_history: Optional[List[Dict[str, str]]] = Field(default=None, description="多轮对话历史[{'role':'user','content':'...'}]")
 
 
 class AgentOutput(BaseModel):
@@ -135,27 +136,69 @@ class BaseAgent(ABC):
 
     def _build_messages(self, input_data: AgentInput) -> List[Dict[str, str]]:
         """
-        构建LLM消息列表
+        构建LLM消息列表（支持多轮对话历史和结构化上下文）
+
+        消息结构：
+        1. system: 角色定义 + 上下文信息（摘要/事实/偏好/待办）
+        2. 历史对话: 按user/assistant交替排列（多轮记忆）
+        3. 当前user消息: 本轮用户输入
 
         Args:
             input_data: Agent输入数据
 
         Returns:
-            消息列表，格式：[{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
+            消息列表，格式：[{"role": "system", ...}, {"role": "user", ...}, {"role": "assistant", ...}, ...]
         """
-        messages = [
-            {"role": "system", "content": self.get_system_prompt()}
-        ]
+        # ===== 1. 构建system prompt（角色 + 上下文） =====
+        system_content = self.get_system_prompt()
 
-        # 构建用户消息内容（包含用户输入、上下文、图片）
-        user_content = input_data.user_message
-
-        # 添加上下文信息（如有）
+        # 将结构化上下文注入system prompt，让LLM知道背景信息
         if input_data.context:
-            context_str = "\n\n## 上下文信息\n"
-            for k, v in input_data.context.items():
-                context_str += f"- {k}: {v}\n"
-            user_content += context_str
+            context_parts = []
+
+            # 之前的对话摘要
+            if input_data.context.get("previous_summary"):
+                context_parts.append(f"## 之前的对话摘要\n{input_data.context['previous_summary']}")
+
+            # 相关历史事实（向量检索得到）
+            if input_data.context.get("relevant_facts"):
+                facts = input_data.context["relevant_facts"]
+                facts_str = "\n".join(f"- {f.get('text', f) if isinstance(f, dict) else f}" for f in facts)
+                context_parts.append(f"## 相关历史事实\n{facts_str}")
+
+            # 用户偏好
+            if input_data.context.get("user_preferences"):
+                prefs = input_data.context["user_preferences"]
+                prefs_str = "\n".join(f"- {p.get('content', p) if isinstance(p, dict) else p}" for p in prefs)
+                context_parts.append(f"## 用户偏好\n{prefs_str}")
+
+            # 会话偏好
+            if input_data.context.get("session_preferences"):
+                prefs = input_data.context["session_preferences"]
+                prefs_str = "\n".join(f"- {p.get('content', p) if isinstance(p, dict) else p}" for p in prefs)
+                context_parts.append(f"## 当前会话偏好\n{prefs_str}")
+
+            # 未解决事项
+            if input_data.context.get("unresolved_items"):
+                items = input_data.context["unresolved_items"]
+                items_str = "\n".join(f"- [{i.get('type', '未知')}] {i.get('content', i) if isinstance(i, dict) else i}" for i in items)
+                context_parts.append(f"## 待解决事项\n{items_str}")
+
+            if context_parts:
+                system_content += "\n\n---\n以下是当前对话的背景信息，请据此回答用户问题：\n\n" + "\n\n".join(context_parts)
+
+        messages = [{"role": "system", "content": system_content}]
+
+        # ===== 2. 添加多轮对话历史（保持user/assistant角色） =====
+        if input_data.conversation_history:
+            for turn in input_data.conversation_history:
+                role = turn.get("role", "user")
+                content = turn.get("content", "")
+                if role in ("user", "assistant") and content:
+                    messages.append({"role": role, "content": content})
+
+        # ===== 3. 添加当前轮用户消息 =====
+        user_content = input_data.user_message
 
         # 添加图片信息（如有）
         if input_data.images:
@@ -164,7 +207,6 @@ class BaseAgent(ABC):
                 images_str += f"- 图片{i+1}: {img}\n"
             user_content += images_str
 
-        # 添加用户消息
         messages.append({"role": "user", "content": user_content})
 
         return messages

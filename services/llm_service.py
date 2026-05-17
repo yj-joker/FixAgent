@@ -181,12 +181,15 @@ class LLMService:
         params = {
             "model": self.model,
             "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
             "temperature": self.settings.llm_temperature,
             "top_p": self.settings.llm_top_p,
             "max_tokens": self.settings.llm_max_tokens
         }
+
+        # 仅在有工具时才传 tools 和 tool_choice，避免空数组导致API报错
+        if tools:
+            params["tools"] = tools
+            params["tool_choice"] = "auto"
 
         if response_format:
             params["response_format"] = response_format

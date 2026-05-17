@@ -23,7 +23,8 @@
       "Read(//c/Program Files/Claude/**)",
       "Bash(powershell *)",
       "Bash(pip install *)",
-      "Bash(pip show *)"
+      "Bash(pip show *)",
+      "Bash(Get-ChildItem *)"
     ]
   }
 }

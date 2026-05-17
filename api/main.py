@@ -2,6 +2,7 @@ import json
 import logging
 from functools import partial
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from fastapi.responses import StreamingResponse, JSONResponse
 
 # 全局替换：所有 json.dumps 默认保留中文原文，避免 \uXXXX 乱码
@@ -61,7 +62,9 @@ async def chat(request: ChatRequest) -> ChatResponse:
         input_data = AgentInput(
             user_message=request.message,
             session_id=request.session_id,
-            images=request.images
+            images=request.images,
+            conversation_history=request.conversation_history,
+            context=request.context
         )
 
         fix_result = await get_fix_agent().run_with_react(input_data)
@@ -111,7 +114,9 @@ async def chat_stream(request: ChatRequest):
         input_data = AgentInput(
             user_message=request.message,
             session_id=request.session_id,
-            images=request.images
+            images=request.images,
+            conversation_history=request.conversation_history,
+            context=request.context
         )
 
         try:
@@ -300,7 +305,13 @@ async def memory_consolidate(request: MemoryConsolidateRequest) -> MemoryConsoli
             error_type = result.metadata.get("error_type", "UnknownError")
             error_detail = result.metadata.get("error_detail", "记忆整理失败")
             logger.error(f"[memory_consolidate] session={request.session_id} agent_error=[{error_type}] {error_detail}")
-            raise HTTPException(status_code=500, detail=f"[{error_type}] {error_detail}")
+            # 返回200但带error状态，让Java端重试逻辑能解析
+            return JSONResponse(content={
+                "status": "error",
+                "error_type": error_type,
+                "error_detail": error_detail,
+                "session_id": request.session_id
+            })
 
         return MemoryConsolidateResponse(
             success=True,
@@ -368,6 +379,106 @@ async def search_facts(query: str, top_k: int = 5):
     except Exception as e:
         logger.exception(f"[search_facts] error")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class RealtimeUpdateRequest(BaseModel):
+    """实时记忆更新请求体"""
+    session_id: str
+    user_message: str
+    ai_response: str = ""
+    recent_facts: list = []
+
+
+@app.post("/ai/memory/realtime_update")
+async def realtime_memory_update(request: RealtimeUpdateRequest):
+    """
+    实时记忆更新检测接口
+
+    每轮对话完成后，Java端异步调用此接口。
+    轻量级LLM判断用户是否纠正了事实或改变了偏好。
+    如果检测到变更，立即更新向量库和返回偏好变更给Java端保存。
+
+    【与定时整合的区别】
+    - 本接口：只处理"纠正"和"偏好变更"，2-3秒完成
+    - /consolidate：做完整整合（新事实、待办、摘要），40-60秒
+
+    【调用时机】
+    Java端在 doOnComplete 保存AI回复后立即异步调用。
+    不阻塞主对话流，用户感知不到。
+
+    Args:
+        session_id: 会话ID
+        user_message: 用户本轮消息
+        ai_response: AI本轮回复（可选）
+        recent_facts: JSON格式的本轮注入事实列表（可选）
+
+    Returns:
+        {
+            "has_update": true/false,
+            "fact_corrections": [...],  // 已在向量库中更新的事实
+            "preference_changes": [...] // 需要Java端保存的偏好变更
+        }
+    """
+    import time as t
+
+    try:
+        t0 = t.time()
+
+        session_id = request.session_id
+        user_message = request.user_message
+        ai_response = request.ai_response
+        recent_facts = request.recent_facts
+
+        # 解析 recent_facts
+        if isinstance(recent_facts, str):
+            try:
+                facts_list = json.loads(recent_facts) if recent_facts else []
+            except (json.JSONDecodeError, TypeError):
+                facts_list = []
+        else:
+            facts_list = recent_facts if recent_facts else []
+
+        from agents.realtime_memory_agent import get_realtime_memory_agent
+        agent = get_realtime_memory_agent()
+
+        input_data = AgentInput(
+            user_message=user_message,
+            session_id=session_id,
+            context={
+                "user_message": user_message,
+                "ai_response": ai_response,
+                "recent_facts": facts_list
+            }
+        )
+
+        result = await agent.run(input_data)
+        latency_ms = int((t.time() - t0) * 1000)
+
+        result_data = result.metadata.get("result", {})
+        logger.info(
+            f"[realtime_update] session={session_id} "
+            f"has_update={result_data.get('has_update', False)} "
+            f"latency={latency_ms}ms"
+        )
+
+        return {
+            "has_update": result_data.get("has_update", False),
+            "fact_corrections": result_data.get("fact_corrections", []),
+            "preference_changes": result_data.get("preference_changes", []),
+            # 被替代的旧事实的向量库doc_id列表
+            # Java端用这些ID在MySQL memory_fact表中标记旧事实为superseded
+            "superseded_fact_ids": result_data.get("superseded_fact_ids", []),
+            "latency_ms": latency_ms
+        }
+
+    except Exception as e:
+        logger.exception(f"[realtime_update] error")
+        return {
+            "has_update": False,
+            "fact_corrections": [],
+            "preference_changes": [],
+            "error": str(e)
+        }
 
 
 @app.exception_handler(Exception)
