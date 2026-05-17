@@ -468,6 +468,9 @@ async def realtime_memory_update(request: RealtimeUpdateRequest):
             # 被替代的旧事实的向量库doc_id列表
             # Java端用这些ID在MySQL memory_fact表中标记旧事实为superseded
             "superseded_fact_ids": result_data.get("superseded_fact_ids", []),
+            # 新写入的纠正事实的向量库doc_id列表
+            # Java端用这些ID作为MySQL的factId，确保两端ID一致
+            "new_fact_ids": result_data.get("new_fact_ids", []),
             "latency_ms": latency_ms
         }
 

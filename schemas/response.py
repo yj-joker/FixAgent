@@ -772,6 +772,8 @@ class MemorySummary(BaseModel):
     # 改为用数据库ID精确匹配，替代之前的content文本匹配
     resolved_item_ids: List[int] = Field(default_factory=list, serialization_alias="resolvedItemIds", description="已解决事项的数据库ID列表")
     brief_summary: str = Field(default="", serialization_alias="briefSummary", description="100字以内的渐进式摘要")
+    # 向量库生成的doc_id列表，与new_facts一一对应，Java端用作MySQL的factId
+    fact_ids: List[str] = Field(default_factory=list, serialization_alias="fact_ids", description="向量库doc_id列表，与newFacts一一对应")
 
 
 class MemoryConsolidateResponse(BaseResponse):
