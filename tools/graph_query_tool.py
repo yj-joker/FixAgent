@@ -271,39 +271,36 @@ class GraphImageSearchTool(BaseTool):
             if not image_urls and not text:
                 return {"paths": [], "message": "至少需要提供图片或文字描述"}
 
-            # 使用融合向量：文字 + 图片 → 单个多模态向量
-            from embeddings.image_embedding import get_image_embedding
-            svc = get_image_embedding()
-            headers = {
-                "Authorization": f"Bearer {svc.api_key}",
-                "Content-Type": "application/json"
-            }
+            import numpy as np
 
             text_vec = None
             img_vec = None
 
             if text:
-                params = {"model": svc.model, "input": [{"text": text}]}
-                resp = await svc.client.post(f"{svc.api_base}/embeddings", headers=headers, json=params)
-                resp.raise_for_status()
-                data = resp.json()
-                if "data" in data and data["data"]:
-                    text_vec = data["data"][0]["embedding"]
+                from embeddings.text_embedding import get_text_embedding
+                text_emb = get_text_embedding()
+                text_vec = np.array(await text_emb.embed(text))
 
             if image_urls:
-                vectors = await svc.embed_batch(image_urls)
-                if vectors:
-                    dim = len(vectors[0])
-                    img_vec = [sum(v[i] for v in vectors) / len(vectors) for i in range(dim)]
+                from embeddings.image_embedding import get_image_embedding
+                img_emb = get_image_embedding()
+                img_vecs = await img_emb.embed_batch(image_urls)
+                img_vec = np.mean(img_vecs, axis=0)
 
-            if text_vec and img_vec:
-                avg_vector = [0.3 * t + 0.7 * g for t, g in zip(text_vec, img_vec)]
-            elif text_vec:
-                avg_vector = text_vec
-            elif img_vec:
-                avg_vector = img_vec
+            # 加权融合
+            if text_vec is not None and img_vec is not None:
+                fused = 0.3 * text_vec + 0.7 * img_vec
+            elif text_vec is not None:
+                fused = text_vec
             else:
-                return {"paths": [], "message": "向量化失败"}
+                fused = img_vec
+
+            # 归一化
+            norm = np.linalg.norm(fused)
+            if norm > 0:
+                fused = fused / norm
+
+            avg_vector = fused.tolist()
 
             graph = get_graph_service()
             paths = graph.query_diagnosis_by_image_vector(
@@ -317,7 +314,8 @@ class GraphImageSearchTool(BaseTool):
                     "fault_severity": p.fault_severity,
                     "solution_title": p.solution_title or "暂无解决方案",
                     "estimated_time": p.estimated_time,
-                    "verified": p.verified
+                    "verified": p.verified,
+                    "fault_score": p.fault_score
                 })
             return {
                 "input_text": bool(text),

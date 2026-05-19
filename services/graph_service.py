@@ -449,6 +449,77 @@ class GraphService:
         total = self._execute_single(count_cypher, params)
         return records, total["total"] if total else 0
 
+    def query_diagnosis_path(
+        self, keyword: str = None, fault_name: str = None, limit: int = 10
+    ) -> List[DiagnosisPath]:
+        """
+        简化版诊断路径查询（供 GraphQueryTool 使用）。
+        按设备关键字 + 故障名称模糊匹配，返回 Device→Component→Fault→Solution 路径。
+        """
+        where_parts = []
+        params = {"limit": limit}
+
+        if self._has_text(keyword):
+            where_parts.append(
+                "(d.name CONTAINS $keyword OR d.code CONTAINS $keyword "
+                "OR d.model CONTAINS $keyword OR d.location CONTAINS $keyword)"
+            )
+            params["keyword"] = keyword
+
+        if self._has_text(fault_name):
+            where_parts.append("f.name CONTAINS $faultName")
+            params["faultName"] = fault_name
+
+        where_clause = " AND ".join(where_parts) if where_parts else "true"
+
+        cypher = f"""
+            MATCH (d:Device)-[:OWNS]->(c:Component)-[:CAUSES]->(f:Fault)
+            WHERE {where_clause}
+            OPTIONAL MATCH (f)-[:HAS_SOLUTION]->(s:Solution)
+            WITH d, c, f, s
+            ORDER BY s.verified DESC, s.estimated_time ASC
+            LIMIT $limit
+            RETURN d.id AS deviceId, d.name AS deviceName,
+                   c.id AS componentId, c.name AS componentName,
+                   f.id AS faultId, f.name AS faultName, f.severity AS faultSeverity,
+                   s.id AS solutionId, s.title AS solutionTitle,
+                   s.estimated_time AS estimatedTime, s.verified AS verified
+        """
+        rows = self._execute_query(cypher, params)
+        return [DiagnosisPath(**_map_path(r)) for r in rows]
+
+    def query_diagnosis_by_image_vector(
+        self, vector: List[float], limit: int = 10, min_score: float = 0.5
+    ) -> List[DiagnosisPath]:
+        """
+        用多模态向量检索故障，并展开关联的部件和解决方案路径。
+        """
+        cypher = """
+            CALL db.index.vector.queryNodes('fault_multimodal_index', $limit, $vector)
+            YIELD node AS f, score
+            WHERE score >= $minScore
+            OPTIONAL MATCH (c:Component)-[:CAUSES]->(f)
+            OPTIONAL MATCH (f)-[:HAS_SOLUTION]->(s:Solution)
+            OPTIONAL MATCH (d:Device)-[:OWNS]->(c)
+            RETURN d.id AS deviceId, d.name AS deviceName,
+                   c.id AS componentId, c.name AS componentName,
+                   f.id AS faultId, f.name AS faultName, f.severity AS faultSeverity,
+                   s.id AS solutionId, s.title AS solutionTitle,
+                   s.estimated_time AS estimatedTime, s.verified AS verified,
+                   score
+            ORDER BY score DESC, s.verified DESC
+            LIMIT $limit
+        """
+        rows = self._execute_query(cypher, {
+            "vector": vector, "limit": limit, "minScore": min_score
+        })
+        results = []
+        for r in rows:
+            path = DiagnosisPath(**_map_path(r))
+            path.fault_score = r.get("score")
+            results.append(path)
+        return results
+
     @staticmethod
     def _has_text(value: str) -> bool:
         return value is not None and value.strip() != ""
