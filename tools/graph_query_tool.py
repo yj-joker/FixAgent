@@ -229,10 +229,111 @@ class GraphSearchDeviceTool(BaseTool):
             )
 
 
+class GraphImageSearchTool(BaseTool):
+    """图片检索诊断路径工具"""
+
+    @property
+    def name(self) -> str:
+        return "graph_image_search"
+
+    @property
+    def description(self) -> str:
+        return (
+            "通过上传的图片从知识图谱中检索诊断路径。"
+            "将图片转为向量，在故障图片索引中搜索相似故障，"
+            "返回关联的部件和解决方案。"
+            "适用场景：用户上传了故障现场照片，需要识别故障并给出维修方案。"
+        )
+
+    def get_parameters_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "image_urls": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "图片 URL 列表（MinIO 地址），可选"
+                },
+                "text": {
+                    "type": "string",
+                    "description": "文字描述，可选。与图片一起融合为多模态向量检索"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "返回结果数量上限，默认10",
+                    "default": 10
+                }
+            }
+        }
+
+    async def _execute(self, image_urls: list = None, text: str = "", limit: int = 10) -> dict:
+        try:
+            if not image_urls and not text:
+                return {"paths": [], "message": "至少需要提供图片或文字描述"}
+
+            # 使用融合向量：文字 + 图片 → 单个多模态向量
+            from embeddings.image_embedding import get_image_embedding
+            svc = get_image_embedding()
+            headers = {
+                "Authorization": f"Bearer {svc.api_key}",
+                "Content-Type": "application/json"
+            }
+
+            text_vec = None
+            img_vec = None
+
+            if text:
+                params = {"model": svc.model, "input": [{"text": text}]}
+                resp = await svc.client.post(f"{svc.api_base}/embeddings", headers=headers, json=params)
+                resp.raise_for_status()
+                data = resp.json()
+                if "data" in data and data["data"]:
+                    text_vec = data["data"][0]["embedding"]
+
+            if image_urls:
+                vectors = await svc.embed_batch(image_urls)
+                if vectors:
+                    dim = len(vectors[0])
+                    img_vec = [sum(v[i] for v in vectors) / len(vectors) for i in range(dim)]
+
+            if text_vec and img_vec:
+                avg_vector = [0.3 * t + 0.7 * g for t, g in zip(text_vec, img_vec)]
+            elif text_vec:
+                avg_vector = text_vec
+            elif img_vec:
+                avg_vector = img_vec
+            else:
+                return {"paths": [], "message": "向量化失败"}
+
+            graph = get_graph_service()
+            paths = graph.query_diagnosis_by_image_vector(
+                vector=avg_vector, limit=limit, min_score=0.5
+            )
+            formatted = []
+            for p in paths:
+                formatted.append({
+                    "component_name": p.component_name or "未知部件",
+                    "fault_name": p.fault_name or "未知故障",
+                    "fault_severity": p.fault_severity,
+                    "solution_title": p.solution_title or "暂无解决方案",
+                    "estimated_time": p.estimated_time,
+                    "verified": p.verified
+                })
+            return {
+                "input_text": bool(text),
+                "input_images": len(image_urls or []),
+                "paths_found": len(formatted),
+                "paths": formatted
+            }
+        except Exception as e:
+            raise ToolException(code="GRAPH_IMAGE_SEARCH_FAILED", message=f"多模态检索诊断路径失败: {e}")
+
+
 # ==================== 单例 ====================
 
 _query_tool: Optional[GraphQueryTool] = None
 _search_tool: Optional[GraphSearchDeviceTool] = None
+_image_search_tool: Optional[GraphImageSearchTool] = None
 
 
 def get_graph_query_tool() -> GraphQueryTool:
@@ -249,3 +350,10 @@ def get_graph_search_device_tool() -> GraphSearchDeviceTool:
     if _search_tool is None:
         _search_tool = GraphSearchDeviceTool()
     return _search_tool
+
+
+def get_graph_image_search_tool() -> GraphImageSearchTool:
+    global _image_search_tool
+    if _image_search_tool is None:
+        _image_search_tool = GraphImageSearchTool()
+    return _image_search_tool
