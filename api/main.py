@@ -4,6 +4,7 @@ import os
 import tempfile
 from functools import partial
 from fastapi import FastAPI, HTTPException, Request, File, UploadFile
+from typing import List
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -22,6 +23,7 @@ from services.vector_service import get_vector_service
 from config.asr_settings import get_asr_settings
 from services.asr_service import get_asr_service, ALLOWED_EXTENSIONS
 from schemas.asr import ASRResponse
+from embeddings.image_embedding import get_image_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -651,6 +653,80 @@ async def asr_transcribe_stream(request: Request, file: UploadFile = File(...)):
         raise
     except Exception as e:
         logger.exception("[asr] transcribe-stream error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== Embedding 接口 ====================
+
+class ImageEmbeddingRequest(BaseModel):
+    """图像向量化请求体"""
+    image_urls: List[str]
+
+
+class TextMultimodalEmbeddingRequest(BaseModel):
+    """文本多模态向量化请求体"""
+    text: str
+
+
+@app.post("/ai/embedding/image")
+async def image_embedding(request: ImageEmbeddingRequest):
+    """
+    图像批量向量化接口
+
+    使用多模态 Embedding 模型将图片 URL 列表转为向量。
+
+    Returns:
+        {"vectors": [[...], [...]], "dimension": 1024, "count": 2}
+    """
+    try:
+        logger.info(f"[image_embedding] count={len(request.image_urls)}")
+        svc = get_image_embedding()
+        vectors = await svc.embed_batch(request.image_urls)
+        dimension = len(vectors[0]) if vectors else 1024
+        logger.info(f"[image_embedding] done count={len(vectors)} dimension={dimension}")
+        return {"vectors": vectors, "dimension": dimension, "count": len(vectors)}
+    except Exception as e:
+        logger.exception("[image_embedding] error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ai/embedding/text-multimodal")
+async def text_multimodal_embedding(request: TextMultimodalEmbeddingRequest):
+    """
+    文本多模态向量化接口
+
+    使用与图像相同的 multimodal-embedding-v1 模型，以文本格式输入。
+    直接复用 ImageEmbedding 服务的 client、api_key、api_base、model 字段。
+
+    Returns:
+        {"vector": [...], "dimension": 1024}
+    """
+    try:
+        logger.info(f"[text_multimodal_embedding] text_len={len(request.text)}")
+        svc = get_image_embedding()
+        headers = {
+            "Authorization": f"Bearer {svc.api_key}",
+            "Content-Type": "application/json"
+        }
+        params = {
+            "model": svc.model,
+            "input": [{"text": request.text}]
+        }
+        response = await svc.client.post(
+            f"{svc.api_base}/embeddings",
+            headers=headers,
+            json=params
+        )
+        response.raise_for_status()
+        result = response.json()
+        if "data" not in result or not result["data"]:
+            raise ValueError(f"Unexpected API response: {result}")
+        vector = result["data"][0]["embedding"]
+        dimension = len(vector)
+        logger.info(f"[text_multimodal_embedding] done dimension={dimension}")
+        return {"vector": vector, "dimension": dimension}
+    except Exception as e:
+        logger.exception("[text_multimodal_embedding] error")
         raise HTTPException(status_code=500, detail=str(e))
 
 

@@ -15,7 +15,7 @@ Schemas请求模型模块
    （如 GraphQueryRequest, CaseCreateRequest, DeviceCreateRequest 等）
 3. 已废弃 → 被其他模型替代（如 KnowledgeUploadRequest 被 KnowledgeImportRequest 替代）
 
-标注在对应类的注释中。新开发时注意区分。"""
+标注在对应类的注释中。新开发时注意区分。
 
 【使用顺序】
 1. Java 端构造请求 JSON
@@ -244,6 +244,7 @@ class KnowledgeUploadRequest(BaseModel):
     【状态】已废弃，由 KnowledgeImportRequest 替代。
     原有字段与 KnowledgeImportRequest 功能重叠且缺少 file_type/category/tags 支持。
     请使用 KnowledgeImportRequest 代替。保留此模型仅用于兼容旧调用方。
+    """
     title: str = Field(..., description="文档标题")
     file_name: str = Field(..., description="文件名")
     file_url: str = Field(..., description="文件URL")
