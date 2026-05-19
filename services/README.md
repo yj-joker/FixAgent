@@ -16,7 +16,7 @@ Services 是系统的**核心服务层**，封装与外部服务的交互：
 |------|------|------|---------|
 | `llm_service` | llm_service.py | 大模型对话 + function calling + ReAct 循环 | 阿里云百炼 DashScope |
 | `vector_service` | vector_service.py | 向量存储 / 检索 / 删除 / 计数 | Redis Stack (FT.SEARCH) |
-| `graph_service` | graph_service.py | Neo4j CRUD + Cypher 查询 + 路径查询 | Neo4j |
+| `graph_service` | graph_service.py | Neo4j 只读查询 + Cypher 路径查询 | Neo4j |
 | `knowledge_service` | knowledge_service.py | 文档导入编排：解析→向量化→入库 | DocumentParserTool + TextEmbedding + VectorService |
 
 ## LLMService — 核心接口
@@ -109,7 +109,7 @@ services/
 ├── __init__.py
 ├── llm_service.py              # LLM 调用（chat / chat_with_tools / ReAct trace）
 ├── vector_service.py           # Redis 向量库（search / add_vector / add_vector_batch）
-├── graph_service.py            # Neo4j 图数据库（query_diagnosis_path / find_* / CRUD）
+├── graph_service.py            # Neo4j 图数据库（query_diagnosis_path / find_* 只读查询）
 └── knowledge_service.py        # 文档导入编排（import_document: 解析→向量化→入库）
 ```
 

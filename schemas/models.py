@@ -5,7 +5,6 @@ Schemas基础模型模块
 
 【关联功能】
 - agents/: Agent运行模式选择、意图识别
-- chains/: 流程分支判断、状态流转
 - api/: HTTP请求参数校验、响应格式统一
 
 【使用顺序】
@@ -20,7 +19,7 @@ Schemas基础模型模块
 | KnowledgeStatus | 知识状态 | 知识库的发布/归档管理 |
 | CaseStatus | 案例状态 | 案例提交→审核→通过/拒绝流程 |
 | AgentMode | Agent模式 | 调度时选择 retrieval/diagnosis/guidance |
-| IntentionType | 用户意图 | Orchestrator 识别用户想干什么 |
+| IntentionType | 用户意图 | 旧架构Orchestrator识别用户想干什么（已废弃） |
 | ImageProcessStatus | 图片状态 | 图片上传后的处理状态跟踪 |
 | TaskStatus | 异步任务 | 长任务的状态查询 |
 """
@@ -102,25 +101,18 @@ class AgentMode(str, Enum):
     """
     Agent运行模式枚举
 
-    【关联】Orchestrator调度、API路由
-    【何时用】用户请求时指定或自动识别使用的Agent模式
+    注意：此枚举属于旧架构（Orchestrator + 子Agent），
+    当前已由 FixAgent 统一 ReAct 循环替代。
+    保留仅用于兼容 Java 端旧请求，新代码不应依赖此枚举。
 
-    【使用顺序】
-    1. ChatRequest.mode 传入（用户显式指定）
-    2. 或由 Orchestrator 根据意图自动推断
-    3. Agent 根据 mode 选择不同处理路径
-
-    【与 IntentionType 的关系】
-    - IntentionType 是用户意图的语义分类
-    - AgentMode 是执行层面的模式选择
-    - 映射关系在 orchestrator_agent 中定义
-
-    【值说明】
+    旧架构中各模式的说明：
     - CHAT: 一般对话，不调用工具
     - RETRIEVAL: 纯检索，从向量库查知识
     - DIAGNOSIS: 纯诊断，分析故障原因
     - GUIDANCE: 纯指引，生成维修步骤
     - FULL: 完整流程（检索→诊断→指引）
+
+    当前 FixAgent 完全忽略此字段，通过 ReAct 循环自主决定行为。
     """
     CHAT = "chat"            # 对话模式（简单问答）
     RETRIEVAL = "retrieval"  # 检索模式（查知识库）
@@ -133,22 +125,11 @@ class IntentionType(str, Enum):
     """
     用户意图类型枚举
 
-    【关联】OrchestratorAgent 意图识别
-    【何时用】自动识别用户想干什么，决定调度路径
+    注意：此枚举属于旧架构（Orchestrator 意图路由），
+    当前已由 FixAgent 统一 ReAct 循环替代，不再需要意图识别。
+    保留仅用于兼容，新代码不应依赖此枚举。
 
-    【使用顺序】
-    1. 用户消息进入 OrchestratorAgent
-    2. IntentionRecognizer 识别意图类型
-    3. 根据意图类型路由到对应 Agent/Chain
-
-    【识别关键词示例】
-    - troubleshoot: "坏了"、"不转"、"过热"、"原因"
-    - query_knowledge: "什么是"、"查询"、"知识"
-    - seek_guidance: "怎么修"、"操作步骤"、"指引"
-    - submit_case: "提交案例"、"上传案例"
-    - general_chat: 其他闲聊内容
-
-    【与 AgentMode 的映射】
+    旧架构中的意图与 AgentMode 映射关系：
     - QUERY_KNOWLEDGE → RETRIEVAL
     - TROUBLESHOOT → DIAGNOSIS
     - SEEK_GUIDANCE → GUIDANCE
@@ -166,8 +147,8 @@ class IntentionResult(BaseModel):
     """
     意图识别结果模型
 
-    【关联】OrchestratorAgent 意图识别
-    【何时用】意图识别完成后返回识别结果
+    注意：此模型属于旧架构（Orchestrator 意图路由），
+    当前已由 FixAgent 统一 ReAct 循环替代，不再使用。保留仅用于兼容。
 
     【字段说明】
     - intention: 识别的意图类型
@@ -586,7 +567,6 @@ class GraphQueryResult(BaseModel):
     【功能关联】图谱服务返回结果的封装
     【何时用】
     - GraphQueryTool.execute() 返回结果
-    - chains/diagnosis_chain.py 中封装图谱数据
 
     【注意】此模型目前未被 GraphQueryResponse 直接使用
     GraphQueryResponse 直接使用了 nodes 和 relations 字段

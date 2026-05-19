@@ -28,25 +28,26 @@
 FixAgent/
 ├── api/                          # FastAPI Web 服务入口
 │   ├── __init__.py
-│   ├── main.py                   # API 路由定义、请求处理
-│   └── asr_api.py                # 语音识别接口
+│   └── main.py                   # API 路由定义、请求处理（含 ASR 语音识别）
 │
 ├── agents/                       # Agent 实现（AI核心）
 │   ├── __init__.py
 │   ├── base_agent.py            # Agent 基类（ReAct/Stream/FC 模板）
 │   ├── fix_agent.py             # 统一诊断 Agent（ReAct，持有全部工具）
-│   ├── review_agent.py          # 审核 Agent（纯 LLM 校验，无工具）
-│   └── memory_agent.py          # 记忆整理 Agent（function calling）
+│   ├── review_agent.py          # 审核 Agent（3层确定性校验，零 LLM 调用）
+│   ├── memory_agent.py          # 记忆整理 Agent（function calling）
+│   └── realtime_memory_agent.py  # 实时记忆更新 Agent
 │
 ├── config/                       # 配置管理（仅AI相关）
 │   ├── __init__.py
-│   └── settings.py              # 环境配置、API Keys
+│   ├── settings.py              # 环境配置、API Keys
+│   └── asr_settings.py          # ASR 语音识别配置
 │
 ├── embeddings/                   # 向量化工具
 │   ├── __init__.py
 │   ├── text_embedding.py        # 文本向量化（百炼API text-embedding-v4）
-│   ├── image_embedding.py       # 图像向量化（预留）
-│   └── multimodal_embedding.py  # 多模态向量化（预留）
+│   ├── image_embedding.py       # 图像向量化（百炼 multimodal-embedding-v1）
+│   └── multimodal_embedding.py  # 多模态统一向量化（门面模式聚合文本+图片）
 │
 ├── schemas/                      # 数据模型
 │   ├── __init__.py
@@ -81,7 +82,7 @@ FixAgent/
 
 ### 架构选型
 
-**ReAct（Reasoning + Acting）+ Reflexion（输出审核）**
+**ReAct（Reasoning + Acting）+ 3层确定性校验管线**
 
 旧架构采用 Orchestrator + 意图路由 + 3 个子 Agent（检索/诊断/指引），存在以下问题：
 
@@ -95,8 +96,9 @@ FixAgent/
 新架构移除意图路由层，合并为单一 FixAgent：
 
 - **FixAgent**：统一 ReAct Agent，持有全部工具（知识检索 + 图谱查询 + 设备搜索），LLM 在 ReAct 循环中自主决定调用哪些工具、调用顺序、调用次数
-- **ReviewAgent**：Reflexion 思想的审核 Agent，纯 LLM 无工具，对 FixAgent 输出做最终校验（诊断依据是否充分、安全提示是否完整、有无遗漏故障原因、有无自相矛盾）
+- **ReviewAgent**：3层确定性校验管线，零 LLM 调用，对 FixAgent 输出做校验（检索依据向量相似度 → 图谱路径 Neo4j 确认 → 安全规则引擎补全）
 - **MemoryAgent**：保持不变，独立由 `/ai/memory/consolidate` 端点调用
+- **RealtimeMemoryAgent**：实时记忆更新检测，每轮对话后异步调用，检测事实纠正和偏好变更（< 3s），不阻塞主对话流
 
 ### 为什么不用 LangGraph
 
@@ -142,7 +144,12 @@ FixAgent/
 │  │  POST /ai/chat/stream       - 对话（SSE 流式）            │   │
 │  │  POST /ai/knowledge/import  - 知识导入                    │   │
 │  │  POST /ai/knowledge/search  - 知识检索                    │   │
-│  │  POST /ai/memory/consolidate - 记忆整理                   │   │
+│  │  POST /ai/memory/consolidate  - 记忆整理                   │   │
+│  │  POST /ai/memory/realtime_update - 实时记忆更新检测        │   │
+│  │  POST /ai/memory/search_facts - 事实向量检索               │   │
+│  │  GET  /api/asr/health          - ASR 健康检查              │   │
+│  │  POST /api/asr/transcribe      - 音频转写（非流式）         │   │
+│  │  POST /api/asr/transcribe-stream - 音频转写（SSE 流式）    │   │
 │  └──────────────────────────────────────────────────────────┘   │
 │                              │                                   │
 │                              ▼                                   │
@@ -160,16 +167,14 @@ FixAgent/
 │                              │                                   │
 │                              ▼                                   │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │              ReviewAgent (输出审核 Agent)                  │   │
+│  │              ReviewAgent (3层确定性校验管线)               │   │
 │  │                                                            │   │
-│  │  纯 LLM 调用，无工具                                      │   │
-│  │  校验维度：                                                │   │
-│  │  ├── 诊断依据是否充分（有无凭空推测）                      │   │
-│  │  ├── 安全提示是否完整（高压/高温/化学品等）                │   │
-│  │  ├── 有无遗漏的可能故障原因                                │   │
-│  │  └── 回答内容有无自相矛盾                                  │   │
-│  │                                                            │   │
-│  │  输出：approved → 直接返回 / revised → 返回修正后内容      │   │
+│  │  零 LLM 调用，全部为确定性操作                             │   │
+│  │  校验流程：                                                │   │
+│  │  ├── 第1层：检索依据校验（向量相似度比对）                 │   │
+│  │  ├── 第2层：图谱路径校验（Neo4j Cypher 确认）             │   │
+│  │  ├── 第3层：安全规则引擎（关键调节点匹配补全）             │   │
+│  │  └── 仅第3层会修改输出（追加安全警告）                    │   │
 │  └──────────────────────────────────────────────────────────┘   │
 │                              │                                   │
 │                              ▼                                   │
@@ -210,11 +215,12 @@ Java 后端接收请求
               │
               ▼
 ┌─────────────────────────────────────────┐
-│          ReviewAgent（输出审核）          │
+│          ReviewAgent（3层确定性校验）     │
 │                                         │
-│  读取 FixAgent 回答 + react_trace       │
-│  校验：依据充分性 / 安全性 / 完整性     │
-│  输出：approved / revised               │
+│  第1层：检索依据校验（向量相似度比对）   │
+│  第2层：图谱路径校验（Neo4j Cypher）    │
+│  第3层：安全规则引擎（关键词匹配补全）  │
+│  输出：标记未验证声明 / 追加安全警告    │
 └─────────────────────────────────────────┘
               │
               ▼
@@ -283,7 +289,7 @@ Java 后端接收请求
 │  ┌────────────────────────────────┐                                          │
 │  │    ReviewAgent (输出审核)       │                                          │
 │  │                                │                                          │
-│  │  纯 LLM，无工具               │                                          │
+│  │  3层确定性校验，零 LLM 调用     │                                          │
 │  │  校验 FixAgent 输出质量        │                                          │
 │  └────────────────────────────────┘                                          │
 │                          │                                                   │
@@ -377,16 +383,18 @@ Java 后端接收请求
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  4. ReviewAgent 审核                                                      │
+│  4. ReviewAgent 3层确定性校验                                              │
 │                                                                           │
 │   输入：FixAgent 回答 + react_trace（工具调用记录）                      │
-│   校验：                                                                  │
-│   ├── 诊断结论是否有检索证据支撑？                                      │
-│   ├── 是否遗漏了可能的故障原因？                                        │
-│   ├── 安全提示是否完整？（高温操作注意事项）                            │
-│   └── 内容有无自相矛盾？                                                │
+│   校验流程：                                                              │
+│   ├── 第1层 检索依据校验：向量化回答中的事实性陈述，与检索结果比对     │
+│   │   相似度 < 0.35 标记为"未验证"                                       │
+│   ├── 第2层 图谱路径校验：故障-方案对应关系是否在 Neo4j 中真实存在      │
+│   │   Cypher 查询确认，不可用时用 trace 结果兜底                        │
+│   ├── 第3层 安全规则引擎：7类危险操作的关键词匹配，缺失则追加警告      │
+│   └── 全部为确定性操作，零 LLM 调用                                      │
 │                                                                           │
-│   结果：approved → 原样返回 / revised → 返回修正后内容                  │
+│   结果：标记未验证声明 / 自动追加安全警告 / 返回最终回答                │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -491,7 +499,7 @@ Java 后端检测对话数量
 | 模块 | 职责 | 技术选型 |
 |-----|------|---------|
 | `api` | HTTP 接口、请求路由、参数校验 | FastAPI |
-| `agents` | FixAgent 统一推理 + ReviewAgent 审核 + MemoryAgent 记忆整理 | 原生 Python（ReAct + FC） |
+| `agents` | FixAgent 统一推理 + ReviewAgent 审核 + MemoryAgent 记忆整理 + RealtimeMemoryAgent 实时更新检测 | 原生 Python（ReAct + FC + 纯判断） |
 | `config` | API Keys、模型配置 | python-dotenv |
 | `embeddings` | 文本向量提取 | 百炼API text-embedding-v4 |
 | `schemas` | 请求/响应数据模型 | Pydantic |
@@ -517,8 +525,9 @@ Java 后端检测对话数量
 | 模块 | 职责 |
 |-----|------|
 | FixAgent | 统一推理：知识检索 + 故障诊断 + 维修指引 |
-| ReviewAgent | 输出质量审核 |
-| MemoryAgent | 对话记忆整理压缩 |
+| ReviewAgent | 3层确定性校验管线（检索依据/图谱路径/安全规则） |
+| MemoryAgent | 对话记忆整理压缩（定时整合） |
+| RealtimeMemoryAgent | 实时记忆更新检测（事实纠正 + 偏好变更，每轮对话后异步调用） |
 | Tools | 知识检索、图谱查询（只读） |
 | Services | LLM 调用、向量检索、图谱查询 |
 | Embeddings | 文本向量化 |
@@ -548,6 +557,11 @@ Java 后端检测对话数量
 | `/ai/knowledge/search` | POST | 直接调用 VectorService 检索 | 查询知识库 |
 | `/ai/knowledge/import` | POST | 文档解析→向量化→入库 | 导入维修手册 |
 | `/ai/memory/consolidate` | POST | 记忆整理 | 对话达到阈值时压缩 |
+| `/ai/memory/realtime_update` | POST | 实时记忆更新检测（事实纠正+偏好变更，<3s） | 每轮对话后异步调用 |
+| `/ai/memory/search_facts` | POST | 用用户消息检索相关历史事实 | 组装对话上下文时注入事实 |
+| `/api/asr/health` | GET | ASR 服务健康检查 | 检查 ASR 模型状态 |
+| `/api/asr/transcribe` | POST | 音频转写（非流式），返回完整结果 | 音频文件转文字 |
+| `/api/asr/transcribe-stream` | POST | 音频转写（SSE 流式），按 segment 分段返回 | 音频文件流式转文字 |
 
 ### 已移除的接口
 
@@ -589,18 +603,27 @@ api/main.py (Python AI 入口)
     │         │
     │         └──► services/llm_service.py → 百炼API (qwen-plus)
     │
-    ├──► agents/review_agent.py (输出审核)
-    │         └──► services/llm_service.py → 百炼API
+    ├──► agents/review_agent.py (3层确定性校验)
+    │         ├──► embeddings/text_embedding.py → 百炼API（第1层向量化）
+    │         └──► services/graph_service.py → Neo4j（第2层图谱确认）
     │
     ├──► agents/memory_agent.py (记忆整理)
     │         ├──► tools/fact_retrieval_tool.py
     │         │         └──► services/vector_service.py → Redis
     │         └──► services/llm_service.py → 百炼API
     │
+    ├──► agents/realtime_memory_agent.py (实时记忆更新)
+    │         ├──► services/llm_service.py → 百炼API（纯判断）
+    │         ├──► embeddings/text_embedding.py → 百炼API（向量化纠正事实）
+    │         └──► services/vector_service.py → Redis（增删旧事实）
+    │
     ├──► services/knowledge_service.py (知识导入)
     │         ├──► tools/document_tool.py
     │         ├──► embeddings/text_embedding.py
     │         └──► services/vector_service.py
+    │
+    ├──► services/asr_service.py (语音识别)
+    │         └──► config/asr_settings.py
     │
     └──► services/vector_service.py (知识检索直通)
 ```

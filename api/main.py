@@ -1,7 +1,9 @@
 import json
 import logging
+import os
+import tempfile
 from functools import partial
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, File, UploadFile
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -10,7 +12,6 @@ from fastapi.responses import StreamingResponse, JSONResponse
 json_dumps = partial(json.dumps, ensure_ascii=False)
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
-from api.asr_api import asr_router
 from schemas.request import ChatRequest, KnowledgeImportRequest, KnowledgeSearchRequest, MemoryConsolidateRequest
 from schemas.response import ChatResponse, KnowledgeImportResponse, KnowledgeSearchResponse, BaseResponse, MemoryConsolidateResponse
 from agents.fix_agent import get_fix_agent
@@ -18,6 +19,9 @@ from agents.review_agent import get_review_agent
 from agents.memory_agent import get_memory_agent
 from agents.base_agent import AgentInput, AgentOutput
 from services.vector_service import get_vector_service
+from config.asr_settings import get_asr_settings
+from services.asr_service import get_asr_service, ALLOWED_EXTENSIONS
+from schemas.asr import ASRResponse
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +35,7 @@ logging.basicConfig(
 app = FastAPI(
     title="FixAgent AI Module",
     version="2.0.0",
-    description="AI推理引擎：FixAgent 统一诊断 + ReviewAgent 输出审核"
+    description="AI推理引擎：FixAgent 统一诊断 + 3层确定性校验"
 )
 
 app.add_middleware(
@@ -43,18 +47,15 @@ app.add_middleware(
 )
 
 
-app.include_router(asr_router)
-
-
 @app.post("/ai/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
     """
-    核心对话接口 —— FixAgent ReAct 推理 + ReviewAgent 审核
+    核心对话接口 —— FixAgent ReAct 推理 + 3层确定性校验
 
     流程：
     1. FixAgent 通过 ReAct 循环自主决策工具调用
-    2. ReviewAgent 对 FixAgent 输出做质量审核
-    3. 返回最终结果（原样或修正后）
+    2. 3层校验：检索依据校验 → 图谱路径校验 → 安全规则引擎
+    3. 返回最终结果（含校验标注和安全补充）
     """
     try:
         logger.info(f"[chat] session={request.session_id} msg_len={len(request.message)}")
@@ -80,9 +81,12 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
         final_result = await get_review_agent().review(fix_result)
 
+        verification = final_result.metadata.get("verification", {})
+        has_issues = final_result.metadata.get("verification_has_issues", False)
+
         logger.info(
             f"[chat] session={request.session_id} done "
-            f"review={final_result.metadata.get('review_status')} "
+            f"issues={'yes' if has_issues else 'no'} "
             f"latency={final_result.latency_ms}ms"
         )
 
@@ -90,7 +94,8 @@ async def chat(request: ChatRequest) -> ChatResponse:
             session_id=request.session_id,
             message=final_result.message,
             tools_used=final_result.tools_used if final_result.tools_used else None,
-            latency_ms=final_result.latency_ms
+            latency_ms=final_result.latency_ms,
+            verification=verification if has_issues else None
         )
     except Exception as e:
         logger.exception(f"[chat] session={request.session_id} error")
@@ -100,13 +105,20 @@ async def chat(request: ChatRequest) -> ChatResponse:
 @app.post("/ai/chat/stream")
 async def chat_stream(request: ChatRequest):
     """
-    SSE 流式对话接口
+    SSE 流式对话接口（内联验证标记）
+
+    采用「先缓冲再验证」策略：
+    - ReAct 阶段实时推送 status / tool 事件（展示进度）
+    - token 先缓冲不发送
+    - ReAct 完成后运行 3 层验证（~300ms）
+    - 逐字流式输出最终回答，在未验证内容前插入 marker 事件
 
     事件流：
     1. session_id 事件
-    2. FixAgent ReAct 阶段：status / tool / token 事件
-    3. ReviewAgent 审核：review 事件
-    4. done 事件
+    2. FixAgent ReAct 阶段：status / tool 事件（实时）
+    3. 回答流式阶段：marker / token 事件（验证后输出）
+    4. verification 事件（校验摘要）
+    5. done 事件
     """
     async def event_generator():
         yield f"data: {json_dumps({'event': 'session_id', 'data': {'session_id': request.session_id}})}\n\n"
@@ -122,58 +134,96 @@ async def chat_stream(request: ChatRequest):
         try:
             fix_agent = get_fix_agent()
 
-            # run_with_react_stream 内部调用 run_with_react 一次，
-            # 然后将工具调用事件和最终回答逐字符流式输出。
-            # 我们拦截 done 事件，在其之前插入 ReviewAgent 审核。
-            collected_events = []
+            # 执行 FixAgent ReAct，转发进度事件（status/tool），缓冲 token
+            # 等 ReAct 完成 + 验证管线跑完后再流式输出带内联标记的回答
+            import asyncio as _asyncio
+            token_buffer: list = []
+            done_data: dict = {}
+            tools_in_stream: list = []
+            error_occurred = False
+
             async for event in fix_agent.run_with_react_stream(input_data):
-                collected_events.append(event)
-                if event.get("event") != "done":
+                ev_type = event.get("event")
+                if ev_type == "status":
+                    yield f"data: {json_dumps(event)}\n\n"
+                elif ev_type == "tool":
+                    tools_in_stream.append(event.get("data", {}).get("tool", ""))
+                    yield f"data: {json_dumps(event)}\n\n"
+                elif ev_type == "token":
+                    token_buffer.append(event.get("data", {}).get("content", ""))
+                elif ev_type == "done":
+                    done_data = event.get("data", {})
+                elif ev_type == "error":
+                    error_occurred = True
                     yield f"data: {json_dumps(event)}\n\n"
 
-            # 从流式事件中重建 fix_output 用于审核
-            # run_with_react_stream 的 done 事件包含 latency_ms
-            done_event = next((e for e in collected_events if e.get("event") == "done"), {})
-            fix_latency = done_event.get("data", {}).get("latency_ms", 0)
-
-            # 收集流式输出的完整回答文本
-            full_message = "".join(
-                e.get("data", {}).get("content", "")
-                for e in collected_events
-                if e.get("event") == "token"
-            )
-
-            # 收集工具调用信息
-            tools_used_in_stream = [
-                e.get("data", {}).get("tool", "")
-                for e in collected_events
-                if e.get("event") == "tool"
-            ]
-
-            error_events = [e for e in collected_events if e.get("event") == "error"]
-            if error_events:
+            if error_occurred or not token_buffer:
                 yield f"data: {json_dumps({'event': 'done', 'data': {}})}\n\n"
                 return
 
-            # 构建 AgentOutput 供 ReviewAgent 审核
+            full_message = "".join(token_buffer)
+            stream_react_trace = done_data.get("react_trace", [])
+            stream_tools_used = done_data.get("tools_used", [])
+            fix_latency = done_data.get("latency_ms", 0)
+
+            # 构建 AgentOutput 供验证管线校验
             fix_output = AgentOutput(
                 agent_name="fix_agent",
                 message=full_message,
                 intention=None,
-                tools_used=tools_used_in_stream,
-                metadata={"react_trace": []},
+                tools_used=tools_in_stream if tools_in_stream else stream_tools_used,
+                metadata={"react_trace": stream_react_trace},
                 latency_ms=fix_latency
             )
 
-            review_result = await get_review_agent().review(fix_output)
-            review_status = review_result.metadata.get("review_status", "approved")
+            # 运行3层确定性校验（~300ms），获取内联标记位置
+            verified_output = await get_review_agent().review(fix_output)
+            verification = verified_output.metadata.get("verification", {})
+            has_issues = verified_output.metadata.get("verification_has_issues", False)
+            markers = get_review_agent().get_inline_markers(full_message, verification)
 
-            yield f"data: {json_dumps({'event': 'review', 'data': {'status': review_status}})}\n\n"
+            # 流式输出最终回答（逐字），在未验证语句前插入 marker 事件
+            final_message = verified_output.message
+            marker_idx = 0
+            for i, char in enumerate(final_message):
+                while marker_idx < len(markers) and markers[marker_idx]["char_pos"] <= i:
+                    m = markers[marker_idx]
+                    yield f"data: {json_dumps({'event': 'marker', 'data': {'text': m['text'], 'type': m['type']}})}\n\n"
+                    marker_idx += 1
 
-            if review_status == "revised":
-                yield f"data: {json_dumps({'event': 'revised_content', 'data': {'content': review_result.message}})}\n\n"
+                yield f"data: {json_dumps({'event': 'token', 'data': {'content': char}})}\n\n"
+                if i % 15 == 0:
+                    await _asyncio.sleep(0)
 
-            yield f"data: {json_dumps({'event': 'done', 'data': {'tools_used': review_result.tools_used, 'latency_ms': review_result.latency_ms}})}\n\n"
+            # 末尾剩余标记（安全追加文本中可能出现的新段落）
+            while marker_idx < len(markers):
+                m = markers[marker_idx]
+                yield f"data: {json_dumps({'event': 'marker', 'data': {'text': m['text'], 'type': m['type']}})}\n\n"
+                marker_idx += 1
+
+            # 验证摘要事件
+            verification_event = {
+                "event": "verification",
+                "data": {
+                    "has_issues": has_issues,
+                    "summary": {
+                        "grounding_unverified": verification.get("grounding", {}).get("unverified_count", 0),
+                        "graph_unverified": verification.get("graph", {}).get("unverified_count", 0),
+                        "safety_missing": verification.get("safety", {}).get("missing_count", 0)
+                    }
+                }
+            }
+            yield f"data: {json_dumps(verification_event)}\n\n"
+
+            # 完成事件
+            final_done = {
+                "event": "done",
+                "data": {
+                    "tools_used": verified_output.tools_used,
+                    "latency_ms": verified_output.latency_ms
+                }
+            }
+            yield f"data: {json_dumps(final_done)}\n\n"
 
         except Exception as e:
             logger.exception(f"[chat_stream] session={request.session_id} error")
@@ -479,6 +529,129 @@ async def realtime_memory_update(request: RealtimeUpdateRequest):
             "preference_changes": [],
             "error": str(e)
         }
+
+
+# ==================== ASR 语音识别接口 ====================
+
+asr_settings = get_asr_settings()
+
+
+def _validate_audio(upload_file: UploadFile, content_length: str | None) -> str:
+    """验证上传音频文件，写入临时文件，返回临时文件路径。"""
+    ext = os.path.splitext(upload_file.filename or "")[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的音频格式: {ext}。支持: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+        )
+
+    max_bytes = asr_settings.max_upload_mb * 1024 * 1024
+
+    if content_length:
+        try:
+            if int(content_length) > max_bytes:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"文件大小超过限制 ({asr_settings.max_upload_mb}MB)",
+                )
+        except ValueError:
+            pass
+
+    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+    tmp_path = tmp.name
+    try:
+        content = upload_file.file.read()
+        if len(content) > max_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"文件大小超过限制 ({asr_settings.max_upload_mb}MB)",
+            )
+        tmp.write(content)
+        tmp.flush()
+    except HTTPException:
+        os.unlink(tmp_path)
+        raise
+    finally:
+        tmp.close()
+
+    return tmp_path
+
+
+@app.get("/api/asr/health")
+async def asr_health():
+    """ASR 服务健康检查"""
+    return {"status": "ok", "model": asr_settings.model_name}
+
+
+@app.post("/api/asr/transcribe", response_model=ASRResponse)
+async def asr_transcribe(request: Request, file: UploadFile = File(...)):
+    """音频转写（非流式）。上传音频文件，返回完整转写结果 JSON。"""
+    tmp_path = None
+    try:
+        content_length = request.headers.get("content-length")
+        tmp_path = _validate_audio(file, content_length)
+        logger.info(f"[asr] transcribe file={file.filename} size={os.path.getsize(tmp_path)}")
+
+        service = get_asr_service()
+        result = await service.transcribe(tmp_path)
+
+        logger.info(
+            f"[asr] transcribe done language={result['language']} "
+            f"duration={result['duration']:.1f}s segments={len(result['segments'])}"
+        )
+        return ASRResponse(
+            success=True,
+            message="转写完成",
+            code=200,
+            language=result["language"],
+            language_probability=result["language_probability"],
+            duration=result["duration"],
+            text=result["text"],
+            segments=result["segments"],
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("[asr] transcribe error")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+@app.post("/api/asr/transcribe-stream")
+async def asr_transcribe_stream(request: Request, file: UploadFile = File(...)):
+    """音频转写（SSE 流式）。上传音频文件，按 segment 分段流式返回识别内容。"""
+    tmp_path = None
+    try:
+        content_length = request.headers.get("content-length")
+        tmp_path = _validate_audio(file, content_length)
+        logger.info(f"[asr] transcribe-stream file={file.filename} size={os.path.getsize(tmp_path)}")
+
+        service = get_asr_service()
+
+        async def event_generator():
+            try:
+                async for segment in service.transcribe_stream(tmp_path):
+                    yield f"data: {json_dumps(segment)}\n\n"
+                yield f"data: {json_dumps({'event': 'done'})}\n\n"
+            except Exception as e:
+                logger.exception("[asr] stream error")
+                yield f"data: {json_dumps({'event': 'error', 'data': {'message': str(e)}})}\n\n"
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("[asr] transcribe-stream error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.exception_handler(Exception)

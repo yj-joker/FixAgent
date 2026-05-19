@@ -470,9 +470,16 @@ class BaseAgent(ABC):
                 if i % 15 == 0:
                     await asyncio.sleep(0)
 
-            # 附加耗时
+            # 附加耗时和 react_trace（供下游验证管线使用）
             latency = output.latency_ms or int((time.time() - start_time) * 1000)
-            yield {"event": "done", "data": {"latency_ms": latency}}
+            yield {
+                "event": "done",
+                "data": {
+                    "latency_ms": latency,
+                    "react_trace": react_trace,
+                    "tools_used": output.tools_used
+                }
+            }
 
         except Exception as e:
             yield {"event": "error", "data": {"message": str(e)}}

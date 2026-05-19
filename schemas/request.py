@@ -8,6 +8,15 @@ Schemas请求模型模块
 - 校验参数合法性（类型、长度、范围）
 - 提供清晰的错误提示
 
+【重要：模型分类说明】
+本文件中的模型分为三类：
+1. 已实现 API 端点 → Python 端有对应的 FastAPI 路由（如 ChatRequest, KnowledgeImportRequest）
+2. Java 端专用 → 仅供 Java 后端参考数据结构，Python 端不提供服务端点的
+   （如 GraphQueryRequest, CaseCreateRequest, DeviceCreateRequest 等）
+3. 已废弃 → 被其他模型替代（如 KnowledgeUploadRequest 被 KnowledgeImportRequest 替代）
+
+标注在对应类的注释中。新开发时注意区分。"""
+
 【使用顺序】
 1. Java 端构造请求 JSON
 2. FastAPI 自动反序列化 → Pydantic 模型
@@ -232,28 +241,9 @@ class KnowledgeUploadRequest(BaseModel):
     """
     知识上传请求（文档导入）
 
-    【功能关联】文档解析、知识批量导入
-    【何时用】上传 PDF/Word 等文档到知识库时
-
-    【使用顺序】
-    1. 用户上传文档文件
-    2. Java 后端存储文件，获取 URL
-    3. 调用 Python API 解析文档
-    4. Python 解析后存入知识库
-
-    【与 KnowledgeCreateRequest 的区别】
-    - Create: 用户手工输入知识内容
-    - Upload: 解析已有文档，自动提取知识
-
-    【支持的 file_type】
-    - pdf: PDF 文档
-    - docx: Word 文档
-    - txt: 纯文本
-
-    【后续处理】
-    - DocumentParseRequest → DocumentParseResponse
-    - 解析结果自动创建 Knowledge 条目
-    """
+    【状态】已废弃，由 KnowledgeImportRequest 替代。
+    原有字段与 KnowledgeImportRequest 功能重叠且缺少 file_type/category/tags 支持。
+    请使用 KnowledgeImportRequest 代替。保留此模型仅用于兼容旧调用方。
     title: str = Field(..., description="文档标题")
     file_name: str = Field(..., description="文件名")
     file_url: str = Field(..., description="文件URL")
@@ -289,8 +279,8 @@ class CaseCreateRequest(BaseModel):
     """
     创建案例请求
 
-    【功能关联】案例库管理、故障案例提交
-    【何时用】用户提交一个新的故障案例时
+    【状态】Java 端专用，Python 端不提供服务端点。
+    案例管理全部由 Java 后端负责，此模型仅供 Java 端参考请求数据结构。
 
     【使用顺序】
     1. 用户填写案例信息（故障描述、原因、解决方案）
@@ -339,7 +329,7 @@ class CaseUpdateRequest(BaseModel):
     """
     更新案例请求
 
-    【功能关联】案例编辑、案例修改
+    【状态】Java 端专用。案例管理由 Java 后端负责。
     【何时用】修改已有案例内容时
 
     【注意】
@@ -363,7 +353,7 @@ class CaseSubmitRequest(BaseModel):
     """
     提交案例审核请求
 
-    【功能关联】案例提交审核流程
+    【状态】Java 端专用。案例审核流程由 Java 后端负责。
     【何时用】案例创建或修改完成后，提交给审核员审核
 
     【使用顺序】
@@ -392,7 +382,7 @@ class CaseReviewRequest(BaseModel):
     """
     审核案例请求
 
-    【功能关联】案例审核流程
+    【状态】Java 端专用。案例审核由 Java 后端负责。
     【何时用】审核员审核案例时使用
 
     【使用顺序】
@@ -429,7 +419,7 @@ class DeviceCreateRequest(BaseModel):
     """
     创建设备请求
 
-    【功能关联】设备管理
+    【状态】Java 端专用。设备管理由 Java 后端负责，Python 端不提供服务端点。
     【何时用】向系统添加新设备时
 
     【使用顺序】
@@ -467,7 +457,7 @@ class DeviceUpdateRequest(BaseModel):
     """
     更新设备请求
 
-    【功能关联】设备编辑
+    【状态】Java 端专用。设备管理由 Java 后端负责。
     【何时用】修改已有设备信息时
 
     【与 DeviceCreateRequest 的区别】
@@ -486,6 +476,10 @@ class DeviceUpdateRequest(BaseModel):
 class GraphQueryRequest(BaseModel):
     """
     图谱查询请求
+
+    【状态】Java 端专用，Python 端不提供服务端点
+    Python 端通过 Tool 方式（graph_query_tool.py）内部调用，不对外暴露 HTTP 接口。
+    此模型仅供 Java 端参考请求数据结构。
 
     【功能关联】Neo4j 图数据库、知识图谱查询
     【何时用】查询设备故障知识图谱时
@@ -534,6 +528,8 @@ class GraphPathRequest(BaseModel):
     """
     图谱路径查询请求
 
+    【状态】Java 端专用，Python 端不提供服务端点
+
     【功能关联】Neo4j 图数据库、故障传播路径分析
     【何时用】查询两个实体之间的关联路径时
 
@@ -579,6 +575,10 @@ class YoloDetectRequest(BaseModel):
     """
     YOLO目标检测请求
 
+    【状态】未实现。赛题场景为"开放设备类型"，
+    架构文档已明确不使用 YOLO（原因见 架构.txt 多模态处理流程章节）。
+    保留此模型仅用于参考。
+
     【功能关联】YOLO目标检测模型、故障部件识别
     【何时用】检测图片中的设备部件或故障点时
 
@@ -613,6 +613,9 @@ class YoloDetectRequest(BaseModel):
 class SamSegmentRequest(BaseModel):
     """
     SAM图像分割请求
+
+    【状态】未实现。架构文档已明确不使用 SAM 图像分割（原因见 架构.txt）。
+    保留此模型仅用于参考。
 
     【功能关联】SAM(Segment Anything Model)、精细化故障区域提取
     【何时用】需要精确分割图片中特定区域时
@@ -652,6 +655,9 @@ class SamSegmentRequest(BaseModel):
 class ClipEmbedRequest(BaseModel):
     """
     CLIP向量化请求
+
+    【状态】未实现。Python 端使用百炼 text-embedding-v4 代替 CLIP。
+    保留此模型仅用于参考。
 
     【功能关联】CLIP多模态模型、文本/图片向量化
     【何时用】生成文本或图片的向量表示时
@@ -702,6 +708,9 @@ class ClipEmbedRequest(BaseModel):
 class DocumentParseRequest(BaseModel):
     """
     文档解析请求
+
+    【状态】内部使用，由 KnowledgeService 编排调用，不对外暴露 HTTP 端点。
+    调用方直接通过 document_tool.py 使用。
 
     【功能关联】文档解析服务（PDF、Word、TXT）
     【何时用】从文档中提取结构化知识时

@@ -107,6 +107,10 @@ class FixAgent(BaseAgent):
     减少一轮 LLM 意图识别调用的延迟。
     """
 
+    def __init__(self, llm_service):
+        super().__init__(llm_service)
+        self._tools = None
+
     @property
     def name(self) -> str:
         return "fix_agent"
@@ -119,14 +123,16 @@ class FixAgent(BaseAgent):
         return FIX_AGENT_SYSTEM_PROMPT
 
     def get_tools(self) -> List[Any]:
-        from tools.knowledge_retrieval_tool import get_knowledge_retrieval_tool
-        from tools.graph_query_tool import get_graph_query_tool, get_graph_search_device_tool
+        if self._tools is None:
+            from tools.knowledge_retrieval_tool import get_knowledge_retrieval_tool
+            from tools.graph_query_tool import get_graph_query_tool, get_graph_search_device_tool
 
-        return [
-            get_knowledge_retrieval_tool(),
-            get_graph_query_tool(),
-            get_graph_search_device_tool(),
-        ]
+            self._tools = [
+                get_knowledge_retrieval_tool(),
+                get_graph_query_tool(),
+                get_graph_search_device_tool(),
+            ]
+        return self._tools
 
 
 # 单例

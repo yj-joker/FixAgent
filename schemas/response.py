@@ -124,6 +124,7 @@ class ChatResponse(BaseResponse):
     intention: Optional[str] = Field(default=None, description="识别到的意图")
     tools_used: Optional[List[str]] = Field(default=None, description="使用的工具列表")
     latency_ms: Optional[int] = Field(default=None, description="响应延迟(ms)")
+    verification: Optional[dict] = Field(default=None, description="3层确定性校验结果")
 
     class Config:
         json_schema_extra = {
@@ -723,7 +724,9 @@ class TaskStatusResponse(BaseResponse):
 # ==================== 记忆整理相关 ====================
 
 class FactSummary(BaseModel):
-    """事实摘要子模型"""
+    """事实摘要子模型
+    【注意】与 schemas/memory.py 中的 FactItem 结构相同，但添加了 serialization_alias。
+    修改字段时两边应同步更新。"""
     content: str = Field(description="事实描述")
     keywords: str = Field(default="", description="检索用关键词")
     source_seq_range: str = Field(default="", serialization_alias="sourceSeqRange", description="来源对话序号范围")
@@ -732,6 +735,9 @@ class FactSummary(BaseModel):
 class PreferenceSummary(BaseModel):
     """
     偏好摘要子模型
+
+    【注意】与 schemas/memory.py 中的 PreferenceItem 结构相同，但添加了 serialization_alias。
+    修改字段时两边应同步更新。
 
     新增 sourceType 字段：区分偏好来源的可靠度
     - explicit: 用户直接说出来的指令，可信度高，Java端直接存为确认偏好
@@ -744,7 +750,9 @@ class PreferenceSummary(BaseModel):
 
 
 class UnresolvedSummary(BaseModel):
-    """未完成事项子模型"""
+    """未完成事项子模型
+    【注意】与 schemas/memory.py 中的 UnresolvedItem 结构相同。
+    修改字段时两边应同步更新。"""
     content: str = Field(description="待解决描述")
     type: str = Field(default="待办", description="类型: 未答复问题|进行中任务|用户待办")
     status: str = Field(default="active", description="状态: active=进行中, superseded=已放弃")
@@ -754,7 +762,10 @@ class MemorySummary(BaseModel):
     """
     记忆摘要模型
 
-    【功能关联】MemoryAgent 整理输出
+    【功能关联】MemoryAgent 整理输出 — API 响应序列化版本
+    【注意】与 schemas/memory.py 中的 MemorySummary 字段结构相同，但带有 serialization_alias
+    用于将 snake_case 字段序列化为 camelCase 输出给 Java 端。
+    修改字段时两边应同步更新。
     【何时用】LLM 完成对话整理后，作为结构化摘要返回给 Java
 
     【字段说明】

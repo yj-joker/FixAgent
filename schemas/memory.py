@@ -4,6 +4,12 @@ MemoryAgent 结构化输出模型
 定义了 MemoryAgent（记忆整理Agent）的 LLM 输出结构。
 LLM 返回 JSON 后会被解析为这些 Pydantic 模型，用于校验格式正确性。
 
+【与 schemas/response.py 的关系】
+- memory.py：定义 LLM 输出解析用的模型（字段名 snake_case，无 serialization_alias）
+- response.py：定义 API 响应序列化用的模型（字段名带 serialization_alias，输出 camelCase 给 Java 端）
+- 两者字段结构相同，但序列化上下文不同，所以各自独立维护。
+- 修改字段时两边应同步更新。
+
 【数据流向】
 LLM 输出 JSON → _extract_json() 解析 → MemorySummary 对象 →
 序列化为 dict → 放入 AgentOutput.metadata["summary"] →
