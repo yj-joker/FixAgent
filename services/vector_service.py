@@ -136,7 +136,7 @@ class VectorService:
             self.redis.hset(key, mapping=mapping)
             return True
         except Exception as e:
-            logger.error(f"add_vector failed: {e}")
+            logger.error(f"向量添加失败: {e}")
             return False
 
     def add_vector_batch(
@@ -248,7 +248,7 @@ class VectorService:
             return docs
 
         except Exception as e:
-            logger.error(f"search failed: {e}")
+            logger.error(f"向量搜索失败: {e}")
             return []
 
     async def search_by_text(
@@ -293,12 +293,12 @@ class VectorService:
             key = f"doc:{doc_id}"
             result = self.redis.delete(key)
             if result:
-                logger.info(f"delete vector success: {key}")
+                logger.info(f"向量删除成功: {key}")
             else:
-                logger.warning(f"delete vector key not found: {key}")
+                logger.warning(f"向量键不存在: {key}")
             return bool(result)
         except Exception as e:
-            logger.error(f"delete failed: {e}")
+            logger.error(f"向量删除失败: {e}")
             return False
 
     def count(self) -> int:

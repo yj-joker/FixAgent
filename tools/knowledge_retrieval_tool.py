@@ -130,7 +130,7 @@ class KnowledgeRetrievalTool(BaseTool):
                 dim = len(all_vecs[0])
                 vector = [sum(col) / len(all_vecs) for col in zip(*all_vecs)]
                 logger.info(
-                    f"[knowledge_retrieval] multimodal: text + {len(image_vecs)} images -> fused {dim}d"
+                    f"[knowledge_retrieval] 多模态检索: 文本 + {len(image_vecs)} 张图片 -> 融合为 {dim} 维向量"
                 )
             else:
                 embedding_service = get_text_embedding()

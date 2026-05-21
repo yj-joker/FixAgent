@@ -121,7 +121,7 @@ class _GroundingCheck:
             n = len(factual)
             sent_vecs, ev_vecs = vecs[:n], vecs[n:]
         except Exception as e:
-            logger.warning(f"[grounding] embedding failed: {e}")
+            logger.warning(f"[grounding] 向量化失败: {e}")
             return {"unverified_claims": [], "total_claims": len(factual),
                     "verified_count": len(factual), "unverified_count": 0,
                     "threshold": cls.THRESHOLD, "error": str(e), "note": "向量化失败，默认通过"}
@@ -136,7 +136,7 @@ class _GroundingCheck:
             else:
                 verified_count += 1
 
-        logger.info(f"[grounding] claims={n} verified={verified_count} unverified={len(unverified)}")
+        logger.info(f"[grounding] 总声明={n} 已验证={verified_count} 未验证={len(unverified)}")
         return {"unverified_claims": unverified, "total_claims": n,
                 "verified_count": verified_count, "unverified_count": len(unverified),
                 "threshold": cls.THRESHOLD}
@@ -219,42 +219,56 @@ class _GraphCheck:
         verified, unverified = [], []
 
         try:
-            from services.graph_service import get_graph_service
-            gs = get_graph_service()
+            import httpx
+            from config.settings import get_settings
+            base_url = get_settings().java_service_url
 
-            for c in claims:
-                fn, st = c["fault_name"], c["solution_title"]
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                for c in claims:
+                    fn, st = c["fault_name"], c["solution_title"]
 
-                if fn in known_faults and (not st or (fn, st) in known_pairs):
-                    verified.append({"fault_name": fn, "solution_title": st, "verified_by": "trace"})
-                    continue
-
-                try:
-                    if not gs.fault_node_exists(fn):
-                        unverified.append({"fault_name": fn, "solution_title": st,
-                                          "reason": "故障名不在图谱中"})
+                    if fn in known_faults and (not st or (fn, st) in known_pairs):
+                        verified.append({"fault_name": fn, "solution_title": st, "verified_by": "trace"})
                         continue
-                    if st:
-                        if gs.solution_node_exists(st):
-                            verified.append({"fault_name": fn, "solution_title": st,
-                                           "verified_by": "neo4j"})
-                        else:
+
+                    try:
+                        resp = await client.get(
+                            f"{base_url}/weixiu/path/fault-exists",
+                            params={"name": fn}
+                        )
+                        fault_exists = resp.json().get("data", False) if resp.status_code == 200 else False
+
+                        if not fault_exists:
                             unverified.append({"fault_name": fn, "solution_title": st,
-                                             "reason": "方案名不在图谱中"})
-                    else:
-                        verified.append({"fault_name": fn, "solution_title": "", "verified_by": "fault_only"})
-                except Exception:
-                    unverified.append({"fault_name": fn, "solution_title": st, "reason": "查询执行异常"})
+                                              "reason": "故障名不在图谱中"})
+                            continue
+                        if st:
+                            resp = await client.get(
+                                f"{base_url}/weixiu/path/solution-exists",
+                                params={"title": st}
+                            )
+                            sol_exists = resp.json().get("data", False) if resp.status_code == 200 else False
+
+                            if sol_exists:
+                                verified.append({"fault_name": fn, "solution_title": st,
+                                               "verified_by": "java_api"})
+                            else:
+                                unverified.append({"fault_name": fn, "solution_title": st,
+                                                 "reason": "方案名不在图谱中"})
+                        else:
+                            verified.append({"fault_name": fn, "solution_title": "", "verified_by": "fault_only"})
+                    except Exception:
+                        unverified.append({"fault_name": fn, "solution_title": st, "reason": "查询执行异常"})
 
         except Exception as e:
-            logger.warning(f"[graph] Neo4j unavailable: {e}")
+            logger.warning(f"[验证] Java 图谱接口不可用: {e}")
             for c in claims:
                 if c["fault_name"] in known_faults:
                     verified.append({**c, "verified_by": "trace_fallback"})
                 else:
-                    unverified.append({**c, "reason": "Neo4j不可用"})
+                    unverified.append({**c, "reason": "图谱接口不可用"})
 
-        logger.info(f"[graph] total={len(claims)} verified={len(verified)} unverified={len(unverified)}")
+        logger.info(f"[graph] 总路径={len(claims)} 已验证={len(verified)} 未验证={len(unverified)}")
         return {"unverified_paths": unverified, "verified_paths": verified,
                 "total_paths": len(claims), "verified_count": len(verified),
                 "unverified_count": len(unverified)}
@@ -337,7 +351,7 @@ class _SafetyCheck:
                 append_parts.append(rule["warning"])
 
         appended = "\n\n".join(append_parts) if append_parts else ""
-        logger.info(f"[safety] triggered={len(triggered)} missing={len(missing)}")
+        logger.info(f"[safety] 触发规则={len(triggered)} 缺失警告={len(missing)}")
         return {
             "triggered_rules": triggered,
             "missing_warnings": missing,
@@ -410,13 +424,13 @@ class ReviewAgent:
 
         latency = verification["verification_latency_ms"]
         logger.info(
-            f"[review] g={grounding.get('unverified_count', 0)}/"
+            f"[review] 依据校验={grounding.get('unverified_count', 0)}/"
             f"{grounding.get('total_claims', 0)} "
-            f"gr={graph.get('unverified_count', 0)}/"
+            f"图谱校验={graph.get('unverified_count', 0)}/"
             f"{graph.get('total_paths', 0)} "
-            f"s={safety.get('missing_count', 0)}/"
+            f"安全校验={safety.get('missing_count', 0)}/"
             f"{safety.get('triggered_count', 0)} "
-            f"t={latency}ms has_issues={has_issues}"
+            f"耗时={latency}ms 有问题={has_issues}"
         )
 
         return AgentOutput(
