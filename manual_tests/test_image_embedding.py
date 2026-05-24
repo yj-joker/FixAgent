@@ -39,7 +39,7 @@ def auto_test():
         svc.redis.get.return_value = pickle.dumps(fake_vector(0.9))
         svc._call_api_sync = MagicMock(return_value=[fake_vector()])
         result = await svc.embed("https://example.com/fault.jpg")
-        return {"first": result[0], "api_calls": svc._call_api_sync.call_count, "key": svc._get_cache_key("https://example.com/fault.jpg")[:11]}
+        return {"first": result[0], "api_calls": svc._call_api_sync.call_count, "key": svc._get_cache_key("https://example.com/fault.jpg")[:19]}
 
     def singleton():
         with patch("embeddings.image_embedding.redis.Redis"):
@@ -64,9 +64,9 @@ def auto_test():
         {
             "name": "Redis 缓存命中时不调用 API，key 前缀为 img_emb:v2:",
             "input": "缓存已有相同图片 URL",
-            "expected": {"api_calls": 0, "key_prefix": "img_emb:v2:"},
+            "expected": {"api_calls": 0, "key_prefix": "cache:emb:image:v2:"},
             "run": lambda: run_async(cache_hit()),
-            "check": lambda x: x["first"] == 0.9 and x["api_calls"] == 0 and x["key"] == "img_emb:v2:",
+            "check": lambda x: x["first"] == 0.9 and x["api_calls"] == 0 and x["key"] == "cache:emb:image:v2:",
         },
         {
             "name": "get_image_embedding() 多次调用返回同一实例",

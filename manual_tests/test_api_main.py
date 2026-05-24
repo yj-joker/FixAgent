@@ -132,6 +132,24 @@ def auto_test():
             response = await main.knowledge_search(KnowledgeSearchRequest(query="bearing", top_k=1))
             return response.model_dump()
 
+    async def knowledge_storage_stats_success():
+        svc = MagicMock()
+        svc.get_storage_stats.return_value = {
+            "vector_records": 3,
+            "document_manifests": 1,
+            "cache": {"text": 2, "image": 1, "total": 3},
+        }
+        with patch.object(main, "get_vector_service", return_value=svc):
+            response = await main.knowledge_storage_stats()
+            return response.model_dump()
+
+    async def knowledge_clear_cache_success():
+        svc = MagicMock()
+        svc.clear_embedding_cache.return_value = {"text_deleted": 2, "image_deleted": 1, "total_deleted": 3}
+        with patch.object(main, "get_vector_service", return_value=svc):
+            response = await main.knowledge_clear_embedding_cache()
+            return response.model_dump()
+
     async def memory_consolidate_error_response():
         agent = MagicMock()
         agent.run = AsyncMock(
@@ -244,6 +262,20 @@ def auto_test():
                 "expected": "total=1",
                 "run": lambda: run_async(knowledge_search_success()),
                 "check": lambda x: x["total"] == 1 and x["data"][0]["id"] == "doc1",
+            },
+            {
+                "name": "knowledge_storage_stats() exposes separated vector and cache counts",
+                "input": "mock storage stats",
+                "expected": "cache and vectors separated",
+                "run": lambda: run_async(knowledge_storage_stats_success()),
+                "check": lambda x: x["vector_records"] == 3 and x["cache"]["total"] == 3,
+            },
+            {
+                "name": "knowledge_clear_embedding_cache() only reports cache deletion",
+                "input": "mock cache deletion",
+                "expected": "three cache keys deleted",
+                "run": lambda: run_async(knowledge_clear_cache_success()),
+                "check": lambda x: x["total_deleted"] == 3,
             },
             {
                 "name": "memory_consolidate() returns JSONResponse when agent status=error",

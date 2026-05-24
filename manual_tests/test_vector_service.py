@@ -109,6 +109,35 @@ def auto_test():
                 "deleted_keys": [call.args[0] for call in client.delete.call_args_list],
             }
 
+    def index_prefix_case():
+        with patch("services.vector_service.redis.Redis") as redis_cls:
+            client = MagicMock()
+            redis_cls.return_value = client
+            client.execute_command.side_effect = [module.redis.exceptions.ResponseError("missing"), "OK"]
+            module.VectorService()
+            return client.execute_command.call_args_list[1].args
+
+    def storage_stats_and_cache_cleanup_case():
+        with patch("services.vector_service.redis.Redis") as redis_cls:
+            client = MagicMock()
+            redis_cls.return_value = client
+            client.execute_command.return_value = ["num_docs", "3"]
+            client.scan_iter.side_effect = lambda match, count=1000: iter({
+                "doc:*": [b"doc:a", b"doc:b", b"doc:c"],
+                "document:*": [b"document:manual"],
+                "cache:emb:text:*": [b"cache:emb:text:a", b"cache:emb:text:b"],
+                "cache:emb:image:*": [b"cache:emb:image:a"],
+            }.get(match, []))
+            client.delete.return_value = 1
+            svc = module.VectorService()
+            stats = svc.get_storage_stats()
+            cleared = svc.clear_embedding_cache()
+            return {
+                "stats": stats,
+                "cleared": cleared,
+                "deleted": [call.args[0] for call in client.delete.call_args_list],
+            }
+
     run_auto_cases([
         {
             "name": "build_redis_filter 生成 category/tags 过滤表达式",
@@ -165,6 +194,25 @@ def auto_test():
             and x["deleted_keys"] == [b"doc:a", b"doc:b"]
             and "10000" in x["first_search"]
             and r"motorcycle\-engine\-manual\-real\-pdf" in x["first_search"][2],
+        },
+        {
+            "name": "vector index is scoped to long-lived doc keys only",
+            "input": "new FT.CREATE command",
+            "expected": "PREFIX 1 doc:",
+            "run": index_prefix_case,
+            "check": lambda x: "PREFIX" in x and "doc:" in x,
+        },
+        {
+            "name": "storage statistics distinguish vectors, manifests and disposable cache",
+            "input": "three key categories",
+            "expected": "cleanup deletes cache keys only",
+            "run": storage_stats_and_cache_cleanup_case,
+            "check": lambda x: x["stats"]["vector_records"] == 3
+            and x["stats"]["document_manifests"] == 1
+            and x["stats"]["cache"]["text"] == 2
+            and x["stats"]["cache"]["image"] == 1
+            and x["cleared"]["total_deleted"] == 3
+            and x["deleted"] == [b"cache:emb:text:a", b"cache:emb:text:b", b"cache:emb:image:a"],
         },
     ])
 

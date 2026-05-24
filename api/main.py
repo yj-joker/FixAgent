@@ -13,7 +13,15 @@ json_dumps = partial(json.dumps, ensure_ascii=False)
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 from schemas.request import ChatRequest, KnowledgeImportRequest, KnowledgeSearchRequest, MemoryConsolidateRequest
-from schemas.response import ChatResponse, KnowledgeImportResponse, KnowledgeSearchResponse, BaseResponse, MemoryConsolidateResponse
+from schemas.response import (
+    BaseResponse,
+    ChatResponse,
+    KnowledgeCacheClearResponse,
+    KnowledgeImportResponse,
+    KnowledgeSearchResponse,
+    KnowledgeStorageStatsResponse,
+    MemoryConsolidateResponse,
+)
 from agents.fix_agent import get_fix_agent
 from agents.review_agent import get_review_agent
 from agents.memory_agent import get_memory_agent
@@ -272,6 +280,7 @@ async def knowledge_import(request: KnowledgeImportRequest) -> KnowledgeImportRe
             total_pages=result["total_pages"],
             text_count=result["text_count"],
             image_count=result["image_count"],
+            image_summary_count=result.get("image_summary_count", 0),
             table_count=result["table_count"],
             sections=result["sections"],
             extraction_summary=result["extraction_summary"],
@@ -283,6 +292,28 @@ async def knowledge_import(request: KnowledgeImportRequest) -> KnowledgeImportRe
     except Exception as e:
         logger.exception(f"[knowledge_import] error")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ai/knowledge/storage/stats", response_model=KnowledgeStorageStatsResponse)
+async def knowledge_storage_stats() -> KnowledgeStorageStatsResponse:
+    stats = get_vector_service().get_storage_stats()
+    return KnowledgeStorageStatsResponse(
+        success=True,
+        message="knowledge storage statistics",
+        code=200,
+        **stats,
+    )
+
+
+@app.delete("/ai/knowledge/cache/embedding", response_model=KnowledgeCacheClearResponse)
+async def knowledge_clear_embedding_cache() -> KnowledgeCacheClearResponse:
+    deleted = get_vector_service().clear_embedding_cache()
+    return KnowledgeCacheClearResponse(
+        success=True,
+        message="embedding cache cleared",
+        code=200,
+        **deleted,
+    )
 
 
 @app.post("/ai/knowledge/search", response_model=KnowledgeSearchResponse)
@@ -316,7 +347,11 @@ async def knowledge_search(request: KnowledgeSearchRequest) -> KnowledgeSearchRe
             )
 
         data = result.data
-        first_meta = data[0].metadata if data else {}
+        if data:
+            first_item = data[0]
+            first_meta = first_item.metadata if hasattr(first_item, "metadata") else first_item.get("metadata", {})
+        else:
+            first_meta = {}
 
         logger.info(f"[knowledge_search] found={len(data)} latency={query_time_ms}ms")
         return KnowledgeSearchResponse(

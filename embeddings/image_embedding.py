@@ -40,7 +40,7 @@ class ImageEmbedding:
         self.cache_ttl = self.settings.redis_ttl
 
     def _get_cache_key(self, image_url: str) -> str:
-        return f"img_emb:v2:{hashlib.md5(image_url.encode()).hexdigest()}"
+        return f"cache:emb:image:v2:{hashlib.md5(image_url.encode()).hexdigest()}"
 
     def _get_from_cache(self, image_url: str) -> Optional[List[float]]:
         data = self.redis.get(self._get_cache_key(image_url))

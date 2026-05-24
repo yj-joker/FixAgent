@@ -284,6 +284,7 @@ class KnowledgeImportResponse(BaseResponse):
     total_pages: int
     text_count: int
     image_count: int
+    image_summary_count: int = 0
     table_count: int
     sections: List[dict]
     extraction_summary: dict
@@ -291,6 +292,19 @@ class KnowledgeImportResponse(BaseResponse):
     document_id: Optional[str] = None
     document_version: Optional[str] = None
     source_file_url: Optional[str] = None
+
+
+class KnowledgeStorageStatsResponse(BaseResponse):
+    vector_records: int
+    indexed_vector_records: int = 0
+    document_manifests: int
+    cache: dict
+
+
+class KnowledgeCacheClearResponse(BaseResponse):
+    text_deleted: int
+    image_deleted: int
+    total_deleted: int
 
 
 # ==================== 案例相关 ====================

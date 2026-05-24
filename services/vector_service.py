@@ -76,7 +76,11 @@ class VectorService:
     使用 Redis Stack 的向量搜索能力（KNN搜索）
     """
 
-    INDEX_NAME = "knowledge_vectors"
+    INDEX_NAME = "knowledge_vectors_v2"
+    VECTOR_KEY_PREFIX = "doc:"
+    DOCUMENT_KEY_PREFIX = "document:"
+    TEXT_CACHE_PATTERNS = ("cache:emb:text:*", "emb:*")
+    IMAGE_CACHE_PATTERNS = ("cache:emb:image:*", "img_emb:*")
     VECTOR_DIM = 1024  # text-embedding-v4 输出维度
 
     def __init__(self):
@@ -100,6 +104,8 @@ class VectorService:
             self.redis.execute_command(
                 "FT.CREATE",
                 self.INDEX_NAME,
+                "ON", "HASH",
+                "PREFIX", "1", self.VECTOR_KEY_PREFIX,
                 "SCHEMA",
                 "id", "TEXT",
                 "text", "TEXT",
@@ -153,7 +159,7 @@ class VectorService:
             是否添加成功
         """
         try:
-            key = f"doc:{doc_id}"
+            key = f"{self.VECTOR_KEY_PREFIX}{doc_id}"
             # ensure_ascii=False：保留中文原文，避免存入Redis后变成 \uXXXX 乱码
             metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else "{}"
 
@@ -388,7 +394,7 @@ class VectorService:
             是否删除成功
         """
         try:
-            key = f"doc:{doc_id}"
+            key = f"{self.VECTOR_KEY_PREFIX}{doc_id}"
             result = self.redis.delete(key)
             if result:
                 logger.info(f"delete vector success: {key}")
@@ -432,7 +438,7 @@ class VectorService:
             return False
         try:
             self.redis.hset(
-                f"document:{document_id}",
+                f"{self.DOCUMENT_KEY_PREFIX}{document_id}",
                 mapping={
                     "document_id": document_id,
                     "manifest": json.dumps(manifest, ensure_ascii=False),
@@ -447,7 +453,7 @@ class VectorService:
     def get_document_manifest(self, document_id: str) -> Dict[str, Any]:
         """Read document import metadata for status or rebuild workflows."""
         try:
-            raw = self.redis.hget(f"document:{document_id}", "manifest")
+            raw = self.redis.hget(f"{self.DOCUMENT_KEY_PREFIX}{document_id}", "manifest")
             if raw is None:
                 return {}
             text = raw.decode() if isinstance(raw, bytes) else raw
@@ -455,6 +461,39 @@ class VectorService:
         except Exception as e:
             logger.error(f"get_document_manifest failed: {e}")
             return {}
+
+    def _count_keys(self, patterns) -> int:
+        keys = set()
+        for pattern in patterns:
+            keys.update(self.redis.scan_iter(match=pattern, count=1000))
+        return len(keys)
+
+    def get_storage_stats(self) -> Dict[str, Any]:
+        """Return separate counts for long-lived vectors, manifests and cache keys."""
+        text_cache = self._count_keys(self.TEXT_CACHE_PATTERNS)
+        image_cache = self._count_keys(self.IMAGE_CACHE_PATTERNS)
+        return {
+            "vector_records": self._count_keys((f"{self.VECTOR_KEY_PREFIX}*",)),
+            "indexed_vector_records": self.count(),
+            "document_manifests": self._count_keys((f"{self.DOCUMENT_KEY_PREFIX}*",)),
+            "cache": {
+                "text": text_cache,
+                "image": image_cache,
+                "total": text_cache + image_cache,
+            },
+        }
+
+    def clear_embedding_cache(self) -> Dict[str, int]:
+        """Delete only disposable embedding cache keys, never vectors or manifests."""
+        deleted = {"text_deleted": 0, "image_deleted": 0}
+        for pattern in self.TEXT_CACHE_PATTERNS:
+            for key in self.redis.scan_iter(match=pattern, count=1000):
+                deleted["text_deleted"] += int(bool(self.redis.delete(key)))
+        for pattern in self.IMAGE_CACHE_PATTERNS:
+            for key in self.redis.scan_iter(match=pattern, count=1000):
+                deleted["image_deleted"] += int(bool(self.redis.delete(key)))
+        deleted["total_deleted"] = deleted["text_deleted"] + deleted["image_deleted"]
+        return deleted
 
     def count(self) -> int:
         """

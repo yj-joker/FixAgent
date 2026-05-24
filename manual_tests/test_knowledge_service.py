@@ -47,7 +47,7 @@ def build_service(parse_result):
             "summary_source": "test",
         })
         vector = MagicMock()
-        vector.add_vector_batch.return_value = 1
+        vector.add_vector_batch.side_effect = lambda docs: len(docs)
         vector.add_vector.return_value = True
         vector.put_document_manifest.return_value = True
         get_parser.return_value = parser
@@ -89,6 +89,7 @@ def auto_test():
             "summary_metadata": summary_metadata,
             "batch_docs": vector.add_vector_batch.call_args.args[0],
             "add_vector_calls": vector.add_vector.call_count,
+            "ready_manifest": vector.put_document_manifest.call_args_list[-1].args[1],
         }
 
     async def batching_case():
@@ -124,6 +125,16 @@ def auto_test():
             "summary_metadata": summary_call.kwargs["metadata"],
         }
 
+    async def failed_write_marks_manifest_failed():
+        svc, _, _, _, _, vector = build_service(sample_parse_result(tables=[], images=[]))
+        vector.add_vector_batch.side_effect = None
+        vector.add_vector_batch.return_value = 0
+        try:
+            await svc.import_document("manual.pdf", document_id="manual-001")
+        except RuntimeError:
+            pass
+        return [call.args[1]["status"] for call in vector.put_document_manifest.call_args_list]
+
     def table_to_text():
         return module.KnowledgeService._table_to_text({"caption": "参数表", "rows": [["名称", "值"], ["电压", "380V"]]})
 
@@ -138,7 +149,7 @@ def auto_test():
             "input": "1文本 + 1表格 + 1图片",
             "expected": "text_count=1,image_count=1,table_count=1",
             "run": lambda: run_async(full_pipeline()),
-            "check": lambda x: x["result"]["text_count"] == 1 and x["result"]["table_count"] == 1 and x["result"]["image_count"] == 1 and x["add_vector_calls"] == 3 and x["image_embed_calls"] == 1 and x["image_embed_input"] == "D:/img1.png" and x["image_metadata"]["embedding_source"] == "local_image" and x["image_metadata"]["image_url"] == "http://localhost:9000/weixiu-public-tupian/img1.png" and x["summary_metadata"]["retrieval_route"] == "image_summary",
+            "check": lambda x: x["result"]["text_count"] == 1 and x["result"]["table_count"] == 1 and x["result"]["image_count"] == 1 and x["result"]["image_summary_count"] == 1 and x["add_vector_calls"] == 3 and x["image_embed_calls"] == 1 and x["image_embed_input"] == "D:/img1.png" and x["image_metadata"]["embedding_source"] == "local_image" and x["image_metadata"]["image_url"] == "http://localhost:9000/weixiu-public-tupian/img1.png" and x["summary_metadata"]["retrieval_route"] == "image_summary" and x["ready_manifest"]["image_summary_count"] == 1,
         },
         {
             "name": "文本块按 BATCH_SIZE=20 分批 embed_batch 入库",
@@ -174,6 +185,13 @@ def auto_test():
             "expected": True,
             "run": singleton,
             "check": lambda x: x is True,
+        },
+        {
+            "name": "failed vector writes persist failed document status",
+            "input": "text vector batch write fails",
+            "expected": "failed manifest status",
+            "run": lambda: run_async(failed_write_marks_manifest_failed()),
+            "check": lambda x: x[-1] == "failed" and "indexing" in x,
         },
     ])
 

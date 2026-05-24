@@ -136,11 +136,17 @@ def _install_optional_dependency_stubs() -> None:
             def add_middleware(self, *args, **kwargs):
                 return None
 
+            def mount(self, *args, **kwargs):
+                return None
+
             def post(self, *args, **kwargs):
                 def decorator(func):
                     self.routes.append(("POST", args, kwargs, func))
                     return func
                 return decorator
+
+            get = post
+            delete = post
 
             def exception_handler(self, *args, **kwargs):
                 def decorator(func):
@@ -175,6 +181,15 @@ def _install_optional_dependency_stubs() -> None:
 
         cors_mod.CORSMiddleware = CORSMiddleware
         sys.modules["fastapi.middleware.cors"] = cors_mod
+
+        staticfiles_mod = types.ModuleType("fastapi.staticfiles")
+
+        class StaticFiles:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        staticfiles_mod.StaticFiles = StaticFiles
+        sys.modules["fastapi.staticfiles"] = staticfiles_mod
 
 
 _install_optional_dependency_stubs()

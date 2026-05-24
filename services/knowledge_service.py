@@ -53,6 +53,42 @@ class KnowledgeService:
         document_version: Optional[str] = None,
         replace_existing: bool = False
     ) -> dict:
+        try:
+            return await self._import_document_impl(
+                file_url=file_url,
+                file_type=file_type,
+                category=category,
+                tags=tags,
+                document_id=document_id,
+                device_type=device_type,
+                manual_type=manual_type,
+                document_version=document_version,
+                replace_existing=replace_existing,
+            )
+        except Exception as exc:
+            if document_id:
+                current = self.vector_svc.get_document_manifest(document_id) or {}
+                if current.get("status") != "failed":
+                    self.vector_svc.put_document_manifest(document_id, {
+                        **current,
+                        "document_id": document_id,
+                        "status": "failed",
+                        "error_message": str(exc),
+                    })
+            raise
+
+    async def _import_document_impl(
+        self,
+        file_url: str,
+        file_type: str = "pdf",
+        category: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        document_id: Optional[str] = None,
+        device_type: Optional[str] = None,
+        manual_type: Optional[str] = None,
+        document_version: Optional[str] = None,
+        replace_existing: bool = False
+    ) -> dict:
         """
         导入文档：解析 → 向量化 → 入库
 
@@ -69,6 +105,17 @@ class KnowledgeService:
             }
         """
         t0 = time.time()
+        if document_id:
+            self.vector_svc.put_document_manifest(document_id, {
+                "document_id": document_id,
+                "source_file_url": file_url,
+                "device_type": device_type,
+                "manual_type": manual_type,
+                "document_version": document_version,
+                "status": "parsing",
+                "category": category,
+                "tags": tags or [],
+            })
 
         # 1. 解析文档
         parse_result = await self.parser._execute(file_url, file_type)
@@ -100,6 +147,7 @@ class KnowledgeService:
         text_count = 0
         image_count = 0
         table_count = 0
+        image_summary_count = 0
 
         # 2. 逐 section 处理
         for sec_idx, section in enumerate(sections):
@@ -138,7 +186,14 @@ class KnowledgeService:
                             "context_after": chunk.get("context_after", "")
                         }
                     })
-                self.vector_svc.add_vector_batch(docs)
+                written = self.vector_svc.add_vector_batch(docs)
+                if written != len(docs):
+                    self._mark_failed_import(
+                        document_id, common_metadata, category, tags,
+                        text_count, image_count, table_count, image_summary_count,
+                        "failed to write all text vector records",
+                    )
+                    raise RuntimeError("failed to write all text vector records")
                 text_count += len(docs)
 
             # 2b. 表格 → 转文本 → 入库
@@ -148,7 +203,7 @@ class KnowledgeService:
                     continue
                 vec = await self.text_emb.embed(table_text)
                 table_id = f"{doc_prefix}:{sec_idx:02d}:tbl:{t_idx:04d}"
-                self.vector_svc.add_vector(
+                table_written = self.vector_svc.add_vector(
                     doc_id=table_id,
                     text=table_text,
                     vector=vec,
@@ -163,6 +218,13 @@ class KnowledgeService:
                         "caption": table.get("caption", "")
                     }
                 )
+                if not table_written:
+                    self._mark_failed_import(
+                        document_id, common_metadata, category, tags,
+                        text_count, image_count, table_count, image_summary_count,
+                        "failed to write table vector record",
+                    )
+                    raise RuntimeError("failed to write table vector record")
                 table_count += 1
 
             # 2c. 图片 → 图注文本向量化 → 入库
@@ -183,7 +245,7 @@ class KnowledgeService:
                     vec = await self.text_emb.embed(img_text)
                     embedding_source = "caption_text"
                 img_id = f"{doc_prefix}:{sec_idx:02d}:img:{img_idx:04d}"
-                self.vector_svc.add_vector(
+                image_written = self.vector_svc.add_vector(
                     doc_id=img_id,
                     text=img_text,
                     vector=vec,
@@ -202,6 +264,13 @@ class KnowledgeService:
                         "embedding_source": embedding_source
                     }
                 )
+                if not image_written:
+                    self._mark_failed_import(
+                        document_id, common_metadata, category, tags,
+                        text_count, image_count, table_count, image_summary_count,
+                        "failed to write image vector record",
+                    )
+                    raise RuntimeError("failed to write image vector record")
                 summary = await self.image_summary_svc.summarize(
                     image_url=image_url,
                     caption=caption,
@@ -212,7 +281,7 @@ class KnowledgeService:
                 summary_text = (summary.get("image_summary") or "").strip()
                 if summary_text:
                     summary_vec = await self.text_emb.embed(summary_text)
-                    self.vector_svc.add_vector(
+                    summary_written = self.vector_svc.add_vector(
                         doc_id=f"{doc_prefix}:{sec_idx:02d}:ims:{img_idx:04d}",
                         text=summary_text,
                         vector=summary_vec,
@@ -235,6 +304,14 @@ class KnowledgeService:
                             "context_after": img.get("context_after", ""),
                         }
                     )
+                    if not summary_written:
+                        self._mark_failed_import(
+                            document_id, common_metadata, category, tags,
+                            text_count, image_count, table_count, image_summary_count,
+                            "failed to write image summary vector record",
+                        )
+                        raise RuntimeError("failed to write image summary vector record")
+                    image_summary_count += 1
                 image_count += 1
 
         t1 = time.time()
@@ -246,6 +323,7 @@ class KnowledgeService:
             "total_pages": total_pages,
             "text_count": text_count,
             "image_count": image_count,
+            "image_summary_count": image_summary_count,
             "table_count": table_count,
         })
 
@@ -257,6 +335,7 @@ class KnowledgeService:
             "total_pages": total_pages,
             "text_count": text_count,
             "image_count": image_count,
+            "image_summary_count": image_summary_count,
             "table_count": table_count,
             "sections": [
                 {
@@ -307,6 +386,30 @@ class KnowledgeService:
             "context_before": "",
             "context_after": "",
         }
+
+    def _mark_failed_import(
+        self,
+        document_id: str,
+        common_metadata: dict,
+        category: Optional[str],
+        tags: Optional[List[str]],
+        text_count: int,
+        image_count: int,
+        table_count: int,
+        image_summary_count: int,
+        error_message: str,
+    ) -> None:
+        self.vector_svc.put_document_manifest(document_id, {
+            **common_metadata,
+            "status": "failed",
+            "category": category,
+            "tags": tags or [],
+            "text_count": text_count,
+            "image_count": image_count,
+            "image_summary_count": image_summary_count,
+            "table_count": table_count,
+            "error_message": error_message,
+        })
 
 
 # 单例

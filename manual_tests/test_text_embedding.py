@@ -43,7 +43,11 @@ def auto_test():
         svc.redis.get.return_value = __import__("pickle").dumps(fake_vector(0.8))
         svc._call_api_sync = MagicMock(return_value=[fake_vector()])
         result = await svc.embed("相同文本")
-        return {"first": result[0], "api_calls": svc._call_api_sync.call_count}
+        return {
+            "first": result[0],
+            "api_calls": svc._call_api_sync.call_count,
+            "key": svc._get_cache_key("same")[:18],
+        }
 
     def singleton():
         with patch("embeddings.text_embedding.redis.Redis"):
@@ -68,9 +72,9 @@ def auto_test():
         {
             "name": "Redis 缓存命中时不调用 DashScope API",
             "input": "缓存已有相同文本向量",
-            "expected": {"api_calls": 0},
+            "expected": {"api_calls": 0, "key_prefix": "cache:emb:text:v2:"},
             "run": lambda: run_async(cache_hit()),
-            "check": lambda x: x["first"] == 0.8 and x["api_calls"] == 0,
+            "check": lambda x: x["first"] == 0.8 and x["api_calls"] == 0 and x["key"] == "cache:emb:text:v2:",
         },
         {
             "name": "get_text_embedding() 多次调用返回同一实例",

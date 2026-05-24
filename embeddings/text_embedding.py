@@ -40,7 +40,7 @@ class TextEmbedding:
         self.cache_ttl = self.settings.redis_ttl
 
     def _get_cache_key(self, text: str) -> str:
-        return f"emb:v2:{hashlib.md5(text.encode()).hexdigest()}"
+        return f"cache:emb:text:v2:{hashlib.md5(text.encode()).hexdigest()}"
 
     def _get_from_cache(self, text: str) -> Optional[List[float]]:
         data = self.redis.get(self._get_cache_key(text))
