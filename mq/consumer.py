@@ -76,6 +76,7 @@ async def handle_realtime(message: aio_pika.abc.AbstractIncomingMessage, channel
                 "type": "realtime_update",
                 "sessionId": session_id,
                 "userId": user_id,
+                "currentRound": body.get("currentRound"),
                 "success": True,
                 "data": result_data,
             })

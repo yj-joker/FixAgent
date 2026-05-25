@@ -134,6 +134,22 @@ class BaseAgent(ABC):
         """
         return []
 
+    def _customize_tool_kwargs(self, tool_name: str, kwargs: dict) -> dict:
+        """
+        为特定工具注入额外参数的钩子方法
+
+        在 ReAct 循环中，LLM 生成的工具调用参数会经过此方法处理，
+        子类可覆盖以注入上下文信息（如 user_id）到特定工具中。
+
+        Args:
+            tool_name: 被调用的工具名
+            kwargs: LLM 生成的原始参数
+
+        Returns:
+            处理后的参数字典
+        """
+        return kwargs
+
     def _build_messages(self, input_data: AgentInput) -> List[Dict[str, str]]:
         """
         构建LLM消息列表（支持多轮对话历史和结构化上下文）
@@ -354,6 +370,8 @@ class BaseAgent(ABC):
             for tool in tools:
                 def _make_handler(t):
                     async def handler(**kwargs):
+                        # 允许子类为特定工具注入额外参数
+                        kwargs = self._customize_tool_kwargs(t.name, kwargs)
                         result = await t.run(**kwargs)
                         if result.success:
                             return result.data if result.data is not None else {"result": "success"}

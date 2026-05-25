@@ -9,6 +9,7 @@ Agent 可调用的工具集合，每个工具封装一种外部能力。
 - FactRetrievalTool      — 历史事实批量检索（MemoryAgent 专用）
 - GraphSearchDeviceTool  — 图谱设备搜索
 - DocumentParserTool     — PDF/Word 文档解析
+- ConversationDetailTool — 对话细节召回（FixAgent 按需调用）
 """
 
 from .base_tool import BaseTool, ToolResult, ToolError, ToolException
@@ -19,6 +20,7 @@ from .graph_query_tool import (
     get_graph_search_device_tool,
 )
 from .document_tool import DocumentParserTool, get_document_parser
+from .conversation_detail_tool import ConversationDetailTool, get_conversation_detail_tool
 
 __all__ = [
     # 基类
@@ -38,4 +40,7 @@ __all__ = [
     # 文档解析
     "DocumentParserTool",
     "get_document_parser",
+    # 对话细节召回
+    "ConversationDetailTool",
+    "get_conversation_detail_tool",
 ]
