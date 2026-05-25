@@ -17,7 +17,10 @@ Services 是系统的**核心服务层**，封装与外部服务的交互：
 | `llm_service` | llm_service.py | 大模型对话 + function calling + ReAct 循环 | 阿里云百炼 DashScope |
 | `vector_service` | vector_service.py | 向量存储 / 检索 / 删除 / 计数 | Redis Stack (FT.SEARCH) |
 | `graph_service` | graph_service.py | Neo4j 只读查询 + Cypher 路径查询 | Neo4j |
-| `knowledge_service` | knowledge_service.py | 文档导入编排：解析→向量化→入库 | DocumentParserTool + TextEmbedding + VectorService |
+| `knowledge_service` | knowledge_service.py | 文档导入编排：解析→向量化→入库 | DocumentParserTool + TextEmbedding + ImageEmbedding + VectorService |
+| `file_storage` | file_storage.py | PDF/提取图片的本地静态文件或 MinIO URL 适配 | 本地文件系统 / MinIO |
+| `image_summary_service` | image_summary_service.py | 图片标题与语义摘要生成，支持多模态 LLM 和上下文回退 | LLMService |
+| `retrieval_policy` | retrieval_policy.py | 意图识别、轻量 rerank、类型多样性与置信度策略 | 无 |
 
 ## LLMService — 核心接口
 
@@ -98,7 +101,12 @@ result = await svc.import_document(
     file_url="/path/to/manual.pdf",
     file_type="pdf",
     category="维修手册",
-    tags=["电动机", "轴承"]
+    tags=["电动机", "轴承"],
+    document_id="motor-manual-v1",
+    device_type="motorcycle_engine",
+    manual_type="repair_manual",
+    document_version="v1",
+    replace_existing=True
 )
 # result: {
 #   "file_name": "...",
@@ -111,7 +119,20 @@ result = await svc.import_document(
 # }
 ```
 
-编排流程：DocumentParserTool 解析 → TextEmbedding 批量向量化 → VectorService 入库
+编排流程：
+
+1. `DocumentParserTool` 解析 PDF，产出文本块、表格和图片元数据。
+2. 文本块与表格走 `TextEmbedding` 后写入 `VectorService`。
+3. 本地模式把 PDF 和提取图片复制到静态目录，MinIO 模式上传或复用对象 URL，确保可展示的原文件引用存在。
+4. 图片带可访问 `image_url` 时走 `ImageEmbedding`，写入图片本体向量。
+5. 图片同时生成 `image_title` / `image_summary`，`image_summary` 另走文本向量入库。
+6. 图片没有可访问 URL 时保留回退逻辑，使用图注或“章节 + 第 X 页插图”文本走 `TextEmbedding`。
+
+图片记录会在 `metadata` 中保留 `image_name`、`local_path`、`image_url`、`caption`、`page` 和 `embedding_source`：
+
+- `embedding_source=image` 表示当前 Redis 记录使用图片本体向量。
+- `embedding_source=caption_text` 表示当前 Redis 记录使用图注/默认图片文本向量，通常出现在对象存储 URL 尚未接入的本地导入流程中。
+- 前端展示原图应使用 `metadata.image_url`；向量只用于检索，不能反向还原图片。
 
 ## 文件结构
 
@@ -121,7 +142,11 @@ services/
 ├── llm_service.py              # LLM 调用（chat / chat_with_tools / ReAct trace）
 ├── vector_service.py           # Redis 向量库（search / add_vector / add_vector_batch）
 ├── graph_service.py            # Neo4j 图数据库（find_diagnosis_paths 5分支 / find_* 只读查询 / 向量索引检索）
-└── knowledge_service.py        # 文档导入编排（import_document: 解析→向量化→入库）
+├── knowledge_service.py        # 文档导入编排（import_document: 解析→向量化→入库）
+├── file_storage.py             # 本地静态文件 / MinIO URL 与上传适配
+├── image_summary_service.py    # 图片语义摘要
+├── retrieval_policy.py         # 检索排序与置信度策略
+└── retrieval_eval.py           # 检索评测入口
 ```
 
 ## 日志输出点

@@ -15,7 +15,28 @@ from config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 
-def build_redis_filter(category: str = None, tags: List[str] = None) -> Optional[str]:
+_REDIS_TAG_ESCAPE_CHARS = set(r',.<>{}[]"\'`:;!@#$%^&*()-+=~|/ ')
+
+
+def escape_redis_tag_value(value: Any) -> str:
+    """Escape punctuation that RediSearch treats as TAG query syntax."""
+    escaped = []
+    for char in str(value):
+        if char == "\\" or char in _REDIS_TAG_ESCAPE_CHARS or char.isspace():
+            escaped.append("\\")
+        escaped.append(char)
+    return "".join(escaped)
+
+
+def build_redis_filter(
+    category: str = None,
+    tags: List[str] = None,
+    document_id: str = None,
+    chunk_type: str = None,
+    device_type: str = None,
+    document_version: str = None,
+    manual_type: str = None,
+) -> Optional[str]:
     """构建 RediSearch 过滤表达式，供 API 层和工具层复用。
 
     Args:
@@ -28,10 +49,20 @@ def build_redis_filter(category: str = None, tags: List[str] = None) -> Optional
     """
     filter_parts = []
     if category:
-        filter_parts.append(f"@category:{{{category}}}")
+        filter_parts.append(f"@category:{{{escape_redis_tag_value(category)}}}")
     if tags:
-        tag_str = "|".join(tags)
+        tag_str = "|".join(escape_redis_tag_value(tag) for tag in tags)
         filter_parts.append(f"@tags:{{{tag_str}}}")
+    if document_id:
+        filter_parts.append(f"@document_id:{{{escape_redis_tag_value(document_id)}}}")
+    if chunk_type:
+        filter_parts.append(f"@chunk_type:{{{escape_redis_tag_value(chunk_type)}}}")
+    if device_type:
+        filter_parts.append(f"@device_type:{{{escape_redis_tag_value(device_type)}}}")
+    if document_version:
+        filter_parts.append(f"@document_version:{{{escape_redis_tag_value(document_version)}}}")
+    if manual_type:
+        filter_parts.append(f"@manual_type:{{{escape_redis_tag_value(manual_type)}}}")
     if not filter_parts:
         return None
     return " ".join(f"({p})" for p in filter_parts)
@@ -45,7 +76,11 @@ class VectorService:
     使用 Redis Stack 的向量搜索能力（KNN搜索）
     """
 
-    INDEX_NAME = "knowledge_vectors"
+    INDEX_NAME = "knowledge_vectors_v2"
+    VECTOR_KEY_PREFIX = "doc:"
+    DOCUMENT_KEY_PREFIX = "document:"
+    TEXT_CACHE_PATTERNS = ("cache:emb:text:*", "emb:*")
+    IMAGE_CACHE_PATTERNS = ("cache:emb:image:*", "img_emb:*")
     VECTOR_DIM = 1024  # text-embedding-v4 输出维度
 
     def __init__(self):
@@ -69,6 +104,8 @@ class VectorService:
             self.redis.execute_command(
                 "FT.CREATE",
                 self.INDEX_NAME,
+                "ON", "HASH",
+                "PREFIX", "1", self.VECTOR_KEY_PREFIX,
                 "SCHEMA",
                 "id", "TEXT",
                 "text", "TEXT",
@@ -76,12 +113,17 @@ class VectorService:
                 "metadata", "TEXT",
                 "category", "TAG",
                 "tags", "TAG",
+                "document_id", "TAG",
+                "chunk_type", "TAG",
+                "device_type", "TAG",
+                "document_version", "TAG",
+                "manual_type", "TAG",
                 "created_at", "NUMERIC"
             )
 
     def _migrate_index(self):
         """为已有索引追加 category/tags TAG 字段（字段已存在时静默跳过）"""
-        for field_name in ("category", "tags"):
+        for field_name in ("category", "tags", "document_id", "chunk_type", "device_type", "document_version", "manual_type"):
             try:
                 self.redis.execute_command(
                     "FT.ALTER", self.INDEX_NAME, "SCHEMA", "ADD", field_name, "TAG"
@@ -117,7 +159,7 @@ class VectorService:
             是否添加成功
         """
         try:
-            key = f"doc:{doc_id}"
+            key = f"{self.VECTOR_KEY_PREFIX}{doc_id}"
             # ensure_ascii=False：保留中文原文，避免存入Redis后变成 \uXXXX 乱码
             metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else "{}"
 
@@ -132,6 +174,10 @@ class VectorService:
                 mapping["category"] = category
             if tags:
                 mapping["tags"] = ",".join(tags) if isinstance(tags, list) else tags
+            for field_name in ("document_id", "chunk_type", "device_type", "document_version", "manual_type"):
+                value = (metadata or {}).get(field_name)
+                if value:
+                    mapping[field_name] = value
 
             self.redis.hset(key, mapping=mapping)
             return True
@@ -235,6 +281,11 @@ class VectorService:
                         "doc_id": _decode(b"id"),
                         "score": float(field_dict.get(b"score", 0))
                     }
+                    from services.retrieval_policy import cosine_distance_to_relevance
+
+                    doc["raw_score"] = doc["score"]
+                    doc["raw_score_type"] = "cosine_distance"
+                    doc["relevance_score"] = cosine_distance_to_relevance(doc["score"])
                     if include_metadata:
                         doc["text"] = _decode(b"text")
 
@@ -249,6 +300,59 @@ class VectorService:
 
         except Exception as e:
             logger.error(f"向量搜索失败: {e}")
+            return []
+
+    def keyword_search(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        include_metadata: bool = True,
+        filter: str = None
+    ) -> List[Dict[str, Any]]:
+        """Run lexical recall over stored chunk text."""
+        if not query_text.strip():
+            return []
+        try:
+            query_body = " ".join(part for part in query_text.replace("-", " ").split() if part)
+            text_query = f"@text:({query_body})"
+            query = f"({filter}) {text_query}" if filter else text_query
+            results = self.redis.execute_command(
+                "FT.SEARCH",
+                self.INDEX_NAME,
+                query,
+                "RETURN", "3", "id", "text", "metadata",
+                "LIMIT", "0", str(top_k),
+                "DIALECT", "2"
+            )
+            docs = []
+            if results and len(results) > 1:
+                for rank, i in enumerate(range(1, len(results), 2), start=1):
+                    fields = results[i + 1]
+                    field_dict = {fields[j]: fields[j + 1] for j in range(0, len(fields), 2)}
+
+                    def _decode(field_name: bytes, default=""):
+                        val = field_dict.get(field_name)
+                        if val is None:
+                            return default
+                        return val.decode() if isinstance(val, bytes) else val
+
+                    doc = {
+                        "doc_id": _decode(b"id"),
+                        "score": float(rank),
+                        "raw_score": float(rank),
+                        "raw_score_type": "keyword_rank",
+                        "relevance_score": round(1.0 / rank, 6)
+                    }
+                    if include_metadata:
+                        doc["text"] = _decode(b"text")
+                        try:
+                            doc["metadata"] = json.loads(_decode(b"metadata", "{}"))
+                        except (json.JSONDecodeError, TypeError):
+                            doc["metadata"] = {}
+                    docs.append(doc)
+            return docs
+        except Exception as e:
+            logger.warning(f"keyword_search failed: {e}")
             return []
 
     async def search_by_text(
@@ -290,7 +394,7 @@ class VectorService:
             是否删除成功
         """
         try:
-            key = f"doc:{doc_id}"
+            key = f"{self.VECTOR_KEY_PREFIX}{doc_id}"
             result = self.redis.delete(key)
             if result:
                 logger.info(f"向量删除成功: {key}")
@@ -300,6 +404,96 @@ class VectorService:
         except Exception as e:
             logger.error(f"向量删除失败: {e}")
             return False
+
+    def delete_by_document(self, document_id: str) -> int:
+        """Delete all vector records that belong to one imported document."""
+        if not document_id:
+            return 0
+        try:
+            deleted = 0
+            query = build_redis_filter(document_id=document_id)
+            while True:
+                results = self.redis.execute_command(
+                    "FT.SEARCH",
+                    self.INDEX_NAME,
+                    query,
+                    "RETURN", "1", "id",
+                    "LIMIT", "0", "10000",
+                    "DIALECT", "2"
+                )
+                keys = [results[i] for i in range(1, len(results), 2)]
+                if not keys:
+                    break
+                for key in keys:
+                    if self.redis.delete(key):
+                        deleted += 1
+            return deleted
+        except Exception as e:
+            logger.error(f"delete_by_document failed: {e}")
+            return 0
+
+    def put_document_manifest(self, document_id: str, manifest: Dict[str, Any]) -> bool:
+        """Persist import lifecycle metadata outside individual chunk vectors."""
+        if not document_id:
+            return False
+        try:
+            self.redis.hset(
+                f"{self.DOCUMENT_KEY_PREFIX}{document_id}",
+                mapping={
+                    "document_id": document_id,
+                    "manifest": json.dumps(manifest, ensure_ascii=False),
+                    "updated_at": str(int(time.time())),
+                },
+            )
+            return True
+        except Exception as e:
+            logger.error(f"put_document_manifest failed: {e}")
+            return False
+
+    def get_document_manifest(self, document_id: str) -> Dict[str, Any]:
+        """Read document import metadata for status or rebuild workflows."""
+        try:
+            raw = self.redis.hget(f"{self.DOCUMENT_KEY_PREFIX}{document_id}", "manifest")
+            if raw is None:
+                return {}
+            text = raw.decode() if isinstance(raw, bytes) else raw
+            return json.loads(text)
+        except Exception as e:
+            logger.error(f"get_document_manifest failed: {e}")
+            return {}
+
+    def _count_keys(self, patterns) -> int:
+        keys = set()
+        for pattern in patterns:
+            keys.update(self.redis.scan_iter(match=pattern, count=1000))
+        return len(keys)
+
+    def get_storage_stats(self) -> Dict[str, Any]:
+        """Return separate counts for long-lived vectors, manifests and cache keys."""
+        text_cache = self._count_keys(self.TEXT_CACHE_PATTERNS)
+        image_cache = self._count_keys(self.IMAGE_CACHE_PATTERNS)
+        return {
+            "vector_records": self._count_keys((f"{self.VECTOR_KEY_PREFIX}*",)),
+            "indexed_vector_records": self.count(),
+            "document_manifests": self._count_keys((f"{self.DOCUMENT_KEY_PREFIX}*",)),
+            "cache": {
+                "text": text_cache,
+                "image": image_cache,
+                "total": text_cache + image_cache,
+            },
+        }
+
+    def clear_embedding_cache(self) -> Dict[str, int]:
+        """Delete only disposable embedding cache keys, never vectors or manifests."""
+        deleted = {"text_deleted": 0, "image_deleted": 0}
+        for pattern in self.TEXT_CACHE_PATTERNS:
+            for key in self.redis.scan_iter(match=pattern, count=1000):
+                deleted["text_deleted"] += int(bool(self.redis.delete(key)))
+        for pattern in self.IMAGE_CACHE_PATTERNS:
+            for key in self.redis.scan_iter(match=pattern, count=1000):
+                deleted["image_deleted"] += int(bool(self.redis.delete(key)))
+        deleted["total_deleted"] = deleted["text_deleted"] + deleted["image_deleted"]
+        return deleted
 
     def count(self) -> int:
         """
@@ -311,7 +505,8 @@ class VectorService:
         try:
             info = self.redis.execute_command("FT.INFO", self.INDEX_NAME)
             for i, field in enumerate(info):
-                if field == "num_docs":
+                field_name = field.decode() if isinstance(field, bytes) else field
+                if field_name == "num_docs":
                     return int(info[i + 1])
             return 0
         except:

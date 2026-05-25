@@ -10,7 +10,7 @@ Tools 是 Agent 的**能力扩展层**，将外部能力封装为统一接口，
 
 | 工具 | 文件 | 描述 | 归属 Agent |
 |------|------|------|-----------|
-| `knowledge_retrieval` | knowledge_retrieval_tool.py | 知识库向量检索，支持图文混合 | FixAgent |
+| `knowledge_retrieval` | knowledge_retrieval_tool.py | 多路知识检索，支持文本/表格/图片证据与图文混合 | FixAgent |
 | `graph_query_diagnosis_path` | graph_query_tool.py | Neo4j 图谱诊断路径查询（5分支+向量匹配） | FixAgent |
 | `graph_search_devices` | graph_query_tool.py | Neo4j 设备搜索 | FixAgent |
 | `search_similar_facts` | fact_retrieval_tool.py | 事实向量检索（冲突检测） | MemoryAgent |
@@ -55,6 +55,11 @@ class FixAgent(BaseAgent):
 ```
 
 FixAgent 持有全部工具，LLM 在 ReAct 循环中自主决定调用哪些工具、以什么顺序调用。
+
+`knowledge_retrieval` 当前会按查询意图组合文本向量、关键词、表格、图片本体和图片 summary 候选，
+再做候选合并、类型多样性控制和轻量 rerank。返回结果保留 `raw_score`、
+`relevance_score`、`rerank_score`、`retrieval_routes`、`retrieval_confidence`，
+图片证据通过 `metadata.image_url` 给前端展示原图。
 
 ## 文件结构
 

@@ -39,7 +39,7 @@ vecs = await emb.embed_batch(["文本1", "文本2"])
 
 **特性**：
 - Redis 缓存（MD5 key，TTL 可配），重复文本不调 API
-- 批量接口（最多 25 条/批，百炼限制）
+- 批量接口会复用缓存；`qwen2.5-vl-embedding` 的文本未命中项按单条请求，避免同一次多模态调用重复 `text` 类型
 - 单例模式：`get_text_embedding()`
 
 ### image_embedding.py — 图片向量化

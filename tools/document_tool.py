@@ -194,6 +194,10 @@ class DocumentParserTool(BaseTool):
                 else:
                     images = self._record_image_positions(page, page_num)
 
+                for image in images:
+                    image.setdefault("context_before", text[:300].strip())
+                    image.setdefault("context_after", text[-300:].strip())
+
                 pages_data.append({
                     "page": page_num,
                     "text": text,
@@ -344,6 +348,41 @@ class DocumentParserTool(BaseTool):
                 cleaned.append(rows)
         return cleaned
 
+    @staticmethod
+    def _split_page_text(text: str, page_num: int) -> list:
+        """Split a page into structured step chunks when numbered steps exist."""
+        page_text = text.strip()
+        if not page_text:
+            return []
+
+        step_pattern = re.compile(r'(?m)^\s*(\d+[.、]\s+[^\n]+)')
+        matches = list(step_pattern.finditer(page_text))
+        if not matches:
+            return [{
+                "text": page_text,
+                "page": page_num,
+                "chunk_label": "page",
+                "context_before": "",
+                "context_after": "",
+            }]
+
+        prefix = page_text[:matches[0].start()].strip()
+        chunks = []
+        for index, match in enumerate(matches):
+            start = match.start()
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(page_text)
+            chunk_text = page_text[start:end].strip()
+            if prefix:
+                chunk_text = f"{prefix}\n{chunk_text}"
+            chunks.append({
+                "text": chunk_text,
+                "page": page_num,
+                "chunk_label": "step",
+                "context_before": prefix,
+                "context_after": page_text[end:end + 300].strip(),
+            })
+        return chunks
+
     # ==================== 章节合并 ====================
 
     @staticmethod
@@ -387,7 +426,9 @@ class DocumentParserTool(BaseTool):
 
             # 将当前页内容归入当前章节
             if text.strip():
-                current_section["text_chunks"].append(text.strip())
+                current_section["text_chunks"].extend(
+                    DocumentParserTool._split_page_text(text, page_num)
+                )
             current_section["images"].extend(page_data["images"])
             for table in page_data["tables"]:
                 label = f"第{page_num}页表格"
@@ -418,6 +459,7 @@ class DocumentParserTool(BaseTool):
 
         下载的文件以 URL hash 命名，放在系统临时目录下。
         """
+        file_url = file_url.strip().strip('"')
         if file_url.startswith(("http://", "https://")):
             import tempfile
 

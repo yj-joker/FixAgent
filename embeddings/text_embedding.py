@@ -40,7 +40,7 @@ class TextEmbedding:
         self.cache_ttl = self.settings.redis_ttl
 
     def _get_cache_key(self, text: str) -> str:
-        return f"emb:v2:{hashlib.md5(text.encode()).hexdigest()}"
+        return f"cache:emb:text:v2:{hashlib.md5(text.encode()).hexdigest()}"
 
     def _get_from_cache(self, text: str) -> Optional[List[float]]:
         data = self.redis.get(self._get_cache_key(text))
@@ -87,10 +87,13 @@ class TextEmbedding:
         return result
 
     async def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """批量文本向量化，单次 API 调用。"""
+        """批量文本向量化。
+
+        qwen2.5-vl-embedding 的 MultiModalEmbedding 调用中同一种输入类型
+        不能重复出现，因此未命中缓存的文本需要逐条请求。
+        """
         results: List[Optional[List[float]]] = []
-        uncached_indices: List[int] = []
-        uncached_inputs: List[dict] = []
+        uncached_items: List[tuple[int, str]] = []
 
         for i, text in enumerate(texts):
             cached = self._get_from_cache(text)
@@ -98,16 +101,15 @@ class TextEmbedding:
                 results.append(cached)
             else:
                 results.append(None)
-                uncached_indices.append(i)
-                uncached_inputs.append({"text": text})
+                uncached_items.append((i, text))
 
-        if uncached_inputs:
+        for idx, text in uncached_items:
             new_embeddings = await asyncio.to_thread(
-                self._call_api_sync, uncached_inputs
+                self._call_api_sync, [{"text": text}]
             )
-            for idx, emb in zip(uncached_indices, new_embeddings):
-                results[idx] = emb
-                self._set_to_cache(texts[idx], emb)
+            emb = new_embeddings[0]
+            results[idx] = emb
+            self._set_to_cache(text, emb)
 
         return results
 

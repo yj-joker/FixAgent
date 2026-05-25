@@ -233,6 +233,11 @@ class KnowledgeSearchRequest(BaseModel):
     top_k: int = Field(default=10, ge=1, le=50, description="返回数量")
     category: Optional[str] = Field(default=None, description="分类过滤")
     tags: Optional[List[str]] = Field(default=None, description="标签过滤")
+    document_id: Optional[str] = Field(default=None, description="文档 ID 过滤")
+    chunk_type: Optional[str] = Field(default=None, description="text/table/image/image_summary 过滤")
+    device_type: Optional[str] = Field(default=None, description="设备类型过滤")
+    document_version: Optional[str] = Field(default=None, description="文档版本过滤")
+    manual_type: Optional[str] = Field(default=None, description="手册类型过滤")
 
 
 class KnowledgeImportRequest(BaseModel):
@@ -255,6 +260,11 @@ class KnowledgeImportRequest(BaseModel):
     file_type: str = Field(default="pdf", description="文件类型，目前仅支持 pdf")
     category: Optional[str] = Field(default=None, description="全局分类标签，覆盖章节自动分类")
     tags: Optional[List[str]] = Field(default=None, description="标签列表，用于过滤检索")
+    document_id: Optional[str] = Field(default=None, description="业务文档 ID，不传则自动生成")
+    device_type: Optional[str] = Field(default=None, description="设备类型")
+    manual_type: Optional[str] = Field(default=None, description="手册类型")
+    document_version: Optional[str] = Field(default=None, description="文档版本")
+    replace_existing: bool = Field(default=False, description="同文档 ID 时先删除旧向量")
 
 
 # ==================== 案例相关 ====================

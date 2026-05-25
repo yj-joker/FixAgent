@@ -334,6 +334,11 @@ class VectorSearchResult(BaseModel):
     score: float = Field(description="相似度分数")
     content: str = Field(description="关联内容")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="元数据")
+    raw_score: float | None = Field(default=None, description="底层检索原始分数")
+    raw_score_type: str | None = Field(default=None, description="底层分数类型")
+    relevance_score: float | None = Field(default=None, description="统一相关度分数，越大越相关")
+    retrieval_route: str | None = Field(default=None, description="召回路线")
+    rerank_score: float | None = Field(default=None, description="重排分数")
 
 
 class GraphNode(BaseModel):

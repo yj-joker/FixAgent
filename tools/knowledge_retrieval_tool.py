@@ -1,28 +1,27 @@
-"""
-知识库检索工具
+"""Knowledge retrieval tool for multimodal RAG evidence."""
 
-封装文本/多模态向量化 + Redis 向量检索流程，提供统一的知识检索能力。
-支持纯文本查询和图文混合查询。
+from __future__ import annotations
 
-【调用链】
-文本: query → TextEmbedding.embed() → 1024维向量 → VectorService.search()
-图文: query + image_urls → MultimodalEmbedding.embed() → 融合向量 → VectorService.search()
-"""
-
-from typing import List, Optional
 import logging
+from typing import Dict, List, Optional
 
-from tools.base_tool import BaseTool, ToolException
-from embeddings.text_embedding import get_text_embedding
 from embeddings.multimodal_embedding import get_multimodal_embedding
-from services.vector_service import get_vector_service
+from embeddings.text_embedding import get_text_embedding
 from schemas.models import VectorSearchResult
+from services.retrieval_policy import (
+    detect_query_intent,
+    diversify_candidates,
+    rerank_candidates,
+    summarize_confidence,
+)
+from services.vector_service import build_redis_filter, escape_redis_tag_value, get_vector_service
+from tools.base_tool import BaseTool, ToolException
 
 logger = logging.getLogger(__name__)
 
 
 class KnowledgeRetrievalTool(BaseTool):
-    """知识库向量检索工具，支持纯文本和图文混合查询。"""
+    """Retrieve text, table, and image evidence from the knowledge store."""
 
     @property
     def name(self) -> str:
@@ -31,57 +30,119 @@ class KnowledgeRetrievalTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "从向量知识库中检索与查询语义最相似的文档。"
-            "支持纯文本查询和图文混合查询。"
-            "支持按 category（分类）和 tags（标签）过滤。"
-            "适用场景：用户询问设备知识、故障原因、维修方法等需要查资料的情况。"
+            "Retrieve maintenance knowledge evidence from text, table, and image records. "
+            "Use it for fault causes, repair steps, parameters, diagrams, and image evidence."
         )
 
     def get_parameters_schema(self) -> dict:
         return {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "检索查询文本（自然语言描述）"
-                },
-                "top_k": {
-                    "type": "integer",
-                    "description": "返回文档数量，默认5",
-                    "default": 5
-                },
-                "category": {
-                    "type": "string",
-                    "description": "分类过滤，如 motor/pump/bearing 等"
-                },
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "标签过滤，如 ['bearing', 'overheat']，OR语义"
-                },
+                "query": {"type": "string", "description": "User retrieval query."},
+                "top_k": {"type": "integer", "default": 5, "description": "Final evidence count."},
+                "category": {"type": "string", "description": "Existing category filter."},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Existing tag filter."},
+                "document_id": {"type": "string", "description": "Restrict retrieval to one imported document."},
+                "chunk_type": {"type": "string", "description": "text/table/image/image_summary filter."},
+                "device_type": {"type": "string", "description": "Device type metadata filter."},
+                "document_version": {"type": "string", "description": "Document version metadata filter."},
+                "manual_type": {"type": "string", "description": "Manual type metadata filter."},
                 "image_urls": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "用户上传的图片URL列表，用于图文混合检索（可选）"
-                }
+                    "description": "Optional user images for multimodal query embedding.",
+                },
             },
-            "required": ["query"]
+            "required": ["query"],
         }
 
     @staticmethod
-    def _build_filter(category: str = None, tags: List[str] = None) -> Optional[str]:
-        parts = []
-        if category:
-            parts.append(f"@category:{{{category}}}")
-        if tags:
-            tags_expr = "|".join(tags)
-            parts.append(f"@tags:{{{tags_expr}}}")
+    def _build_filter(
+        category: str = None,
+        tags: List[str] = None,
+        document_id: str = None,
+        chunk_type: str = None,
+        device_type: str = None,
+        document_version: str = None,
+        manual_type: str = None,
+    ) -> Optional[str]:
+        if not any((document_id, chunk_type, device_type, document_version, manual_type)):
+            parts = []
+            if category:
+                parts.append(f"@category:{{{escape_redis_tag_value(category)}}}")
+            if tags:
+                parts.append(f"@tags:{{{'|'.join(escape_redis_tag_value(tag) for tag in tags)}}}")
+            if not parts:
+                return None
+            return parts[0] if len(parts) == 1 else f"({' '.join(parts)})"
+        return build_redis_filter(
+            category=category,
+            tags=tags,
+            document_id=document_id,
+            chunk_type=chunk_type,
+            device_type=device_type,
+            document_version=document_version,
+            manual_type=manual_type,
+        )
 
-        if not parts:
-            return None
-        if len(parts) == 1:
-            return parts[0]
-        return f"({' '.join(parts)})"
+    @staticmethod
+    def _canonical_id(doc: Dict) -> str:
+        doc_id = doc.get("doc_id", "")
+        metadata = doc.get("metadata") or {}
+        if metadata.get("source_image_id"):
+            return metadata["source_image_id"]
+        if metadata.get("chunk_type") == "image_summary":
+            return doc_id.replace(":ims:", ":img:")
+        return doc_id
+
+    @staticmethod
+    def _mark_route(doc: Dict, route: str) -> Dict:
+        item = dict(doc)
+        item["metadata"] = dict(item.get("metadata") or {})
+        if item.get("relevance_score") is None and item.get("score") is not None:
+            item["relevance_score"] = item["score"]
+        item["routes"] = sorted(set(item.get("routes") or []) | {route})
+        item["retrieval_route"] = route
+        return item
+
+    @classmethod
+    def _merge_candidates(cls, candidates: List[Dict]) -> List[Dict]:
+        merged: Dict[str, Dict] = {}
+        for candidate in candidates:
+            key = cls._canonical_id(candidate)
+            if key not in merged:
+                item = dict(candidate)
+                item["doc_id"] = key
+                merged[key] = item
+                continue
+            current = merged[key]
+            routes = sorted(set(current.get("routes") or []) | set(candidate.get("routes") or []))
+            if candidate.get("relevance_score", 0.0) > current.get("relevance_score", 0.0):
+                current.update(candidate)
+                current["doc_id"] = key
+            current["routes"] = routes
+            current_meta = current.setdefault("metadata", {})
+            current_meta.update(
+                {name: value for name, value in (candidate.get("metadata") or {}).items() if value not in ("", None)}
+            )
+        return list(merged.values())
+
+    async def _embed_query(self, query: str, image_urls: List[str] = None) -> List[float]:
+        try:
+            if image_urls:
+                result = await get_multimodal_embedding().embed(text=query, image_urls=image_urls)
+                vectors = []
+                if result.get("text_vector"):
+                    vectors.append(result["text_vector"])
+                vectors.extend(result.get("image_vectors", []))
+                if not vectors:
+                    raise ToolException(code="EMBEDDING_FAILED", message="multimodal embedding returned no vectors")
+                return [sum(values) / len(vectors) for values in zip(*vectors)]
+            return await get_text_embedding().embed(query)
+        except ToolException:
+            raise
+        except Exception as e:
+            raise ToolException(code="EMBEDDING_FAILED", message=f"embedding failed: {e}")
 
     async def _execute(
         self,
@@ -89,82 +150,105 @@ class KnowledgeRetrievalTool(BaseTool):
         top_k: int = 5,
         category: str = None,
         tags: List[str] = None,
-        image_urls: List[str] = None
+        image_urls: List[str] = None,
+        document_id: str = None,
+        chunk_type: str = None,
+        device_type: str = None,
+        document_version: str = None,
+        manual_type: str = None,
     ) -> List[VectorSearchResult]:
-        """
-        执行知识检索，支持纯文本和图文混合。
-
-        Args:
-            query: 查询文本
-            top_k: 返回文档数量
-            category: 分类过滤
-            tags: 标签过滤
-            image_urls: 图片URL列表（可选），提供时启用图文混合检索
-
-        Returns:
-            List[VectorSearchResult]: 按 score 降序排列的检索结果
-
-        Raises:
-            ToolException: EMBEDDING_FAILED / SEARCH_FAILED
-        """
-        try:
-            if image_urls:
-                # 图文混合检索：同时生成文本向量和图片向量，取平均融合
-                mm = get_multimodal_embedding()
-                result = await mm.embed(text=query, image_urls=image_urls)
-
-                text_vec = result.get("text_vector")
-                image_vecs = result.get("image_vectors", [])
-
-                all_vecs = []
-                if text_vec:
-                    all_vecs.append(text_vec)
-                all_vecs.extend(image_vecs)
-
-                if not all_vecs:
-                    raise ToolException(
-                        code="EMBEDDING_FAILED",
-                        message="图文向量化均失败"
-                    )
-
-                dim = len(all_vecs[0])
-                vector = [sum(col) / len(all_vecs) for col in zip(*all_vecs)]
-                logger.info(
-                    f"[knowledge_retrieval] 多模态检索: 文本 + {len(image_vecs)} 张图片 -> 融合为 {dim} 维向量"
-                )
-            else:
-                embedding_service = get_text_embedding()
-                vector = await embedding_service.embed(query)
-        except ToolException:
-            raise
-        except Exception as e:
-            raise ToolException(
-                code="EMBEDDING_FAILED",
-                message=f"向量化失败: {e}"
-            )
-
-        filter_expr = self._build_filter(category, tags)
+        vector = await self._embed_query(query, image_urls)
+        intent = detect_query_intent(query)
+        recall_k = max(top_k * 3, top_k)
+        base_filter = self._build_filter(
+            category=category,
+            tags=tags,
+            document_id=document_id,
+            chunk_type=chunk_type,
+            device_type=device_type,
+            document_version=document_version,
+            manual_type=manual_type,
+        )
 
         try:
             vector_service = get_vector_service()
-            docs = vector_service.search(
-                vector, top_k=top_k, include_metadata=True, filter=filter_expr
-            )
+            candidates = []
+            if chunk_type or intent != "image":
+                candidates.extend(
+                    self._mark_route(doc, "semantic")
+                    for doc in vector_service.search(
+                        vector, top_k=recall_k, include_metadata=True, filter=base_filter
+                    )
+                )
+            if hasattr(vector_service, "keyword_search") and (chunk_type or intent != "image"):
+                candidates.extend(
+                    self._mark_route(doc, "keyword")
+                    for doc in vector_service.keyword_search(
+                        query, top_k=recall_k, include_metadata=True, filter=base_filter
+                    )
+                )
+            if not chunk_type and intent in {"image", "mixed"}:
+                image_filter = self._build_filter(
+                    category, tags, document_id, "image", device_type, document_version, manual_type
+                )
+                summary_filter = self._build_filter(
+                    category, tags, document_id, "image_summary", device_type, document_version, manual_type
+                )
+                candidates.extend(
+                    self._mark_route(doc, "image_vector")
+                    for doc in vector_service.search(vector, top_k=recall_k, include_metadata=True, filter=image_filter)
+                )
+                candidates.extend(
+                    self._mark_route(doc, "image_summary")
+                    for doc in vector_service.search(vector, top_k=recall_k, include_metadata=True, filter=summary_filter)
+                )
+            if not chunk_type and intent in {"table", "mixed"}:
+                table_filter = self._build_filter(
+                    category, tags, document_id, "table", device_type, document_version, manual_type
+                )
+                candidates.extend(
+                    self._mark_route(doc, "table_vector")
+                    for doc in vector_service.search(vector, top_k=recall_k, include_metadata=True, filter=table_filter)
+                )
         except Exception as e:
-            raise ToolException(
-                code="SEARCH_FAILED",
-                message=f"向量检索失败: {e}"
-            )
+            raise ToolException(code="SEARCH_FAILED", message=f"retrieval search failed: {e}")
+
+        merged = self._merge_candidates(candidates)
+        ranked = rerank_candidates(query, merged, intent=intent)
+        selected = diversify_candidates(ranked, top_k=top_k, intent=intent)
+        confidence = summarize_confidence(selected, intent=intent)
 
         results: List[VectorSearchResult] = []
-        for doc in docs:
-            results.append(VectorSearchResult(
-                id=doc.get("doc_id", ""),
-                score=doc.get("score", 0.0),
-                content=doc.get("text", ""),
-                metadata=doc.get("metadata", {})
-            ))
-
+        for doc in selected:
+            metadata = dict(doc.get("metadata") or {})
+            if metadata.get("chunk_type") == "image_summary":
+                metadata["source_chunk_type"] = "image_summary"
+                metadata["chunk_type"] = "image"
+            routes = sorted(set(doc.get("routes") or []))
+            metadata["retrieval_routes"] = routes
+            metadata["matched_types"] = confidence["matched_types"]
+            metadata["retrieval_confidence"] = confidence["confidence"]
+            metadata["confidence_reason"] = {
+                "best_relevance_score": confidence["best_relevance_score"],
+                "candidate_count": confidence["candidate_count"],
+                "dual_image_hit": confidence["dual_image_hit"],
+                "intent": intent,
+            }
+            if confidence["confidence"] == "low":
+                metadata["answer_policy"] = "insufficient_evidence"
+            results.append(
+                VectorSearchResult(
+                    id=doc.get("doc_id", ""),
+                    score=doc.get("relevance_score", doc.get("score", 0.0)),
+                    content=doc.get("text", ""),
+                    metadata=metadata,
+                    raw_score=doc.get("raw_score"),
+                    raw_score_type=doc.get("raw_score_type"),
+                    relevance_score=doc.get("relevance_score"),
+                    retrieval_route=routes[0] if routes else doc.get("retrieval_route"),
+                    rerank_score=doc.get("rerank_score"),
+                )
+            )
         return results
 
 
