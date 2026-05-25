@@ -68,7 +68,7 @@ class ImageEmbedding:
             embeddings = sorted(resp.output["embeddings"], key=lambda x: x.get("index", 0))
             result = [e["embedding"] for e in embeddings]
             if result:
-                logger.debug(f"Image Embedding model={self.model} dim={len(result[0])}")
+                logger.debug(f"图片向量化完成 模型={self.model} 维度={len(result[0])}")
             return result
 
         raise ValueError(f"Embedding API 响应格式异常: {resp}")
@@ -84,6 +84,27 @@ class ImageEmbedding:
         )
         result = embeddings[0]
         self._set_to_cache(image_url, result)
+        return result
+
+    async def embed_text_as_multimodal(self, text: str) -> List[float]:
+        """
+        将纯文本通过多模态模型映射到 1024 维空间。
+        用于没有图片的实体生成多模态向量，确保它们也能被图片搜索命中。
+        输入格式: [{"text": "..."}]
+        """
+        cache_key = f"txt_mm_emb:v1:{hashlib.md5(text.encode()).hexdigest()}"
+        data = self.redis.get(cache_key)
+        if data:
+            import pickle
+            return pickle.loads(data)
+
+        embeddings = await asyncio.to_thread(
+            self._call_api_sync, [{"text": text}]
+        )
+        result = embeddings[0]
+
+        import pickle
+        self.redis.setex(cache_key, self.cache_ttl, pickle.dumps(result))
         return result
 
     async def embed_batch(self, image_urls: List[str]) -> List[List[float]]:

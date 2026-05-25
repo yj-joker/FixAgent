@@ -134,6 +134,22 @@ class BaseAgent(ABC):
         """
         return []
 
+    def _customize_tool_kwargs(self, tool_name: str, kwargs: dict) -> dict:
+        """
+        为特定工具注入额外参数的钩子方法
+
+        在 ReAct 循环中，LLM 生成的工具调用参数会经过此方法处理，
+        子类可覆盖以注入上下文信息（如 user_id）到特定工具中。
+
+        Args:
+            tool_name: 被调用的工具名
+            kwargs: LLM 生成的原始参数
+
+        Returns:
+            处理后的参数字典
+        """
+        return kwargs
+
     def _build_messages(self, input_data: AgentInput) -> List[Dict[str, str]]:
         """
         构建LLM消息列表（支持多轮对话历史和结构化上下文）
@@ -200,14 +216,18 @@ class BaseAgent(ABC):
         # ===== 3. 添加当前轮用户消息 =====
         user_content = input_data.user_message
 
-        # 添加图片信息（如有）
+        # 添加图片信息（如有）—— 使用多模态消息格式
         if input_data.images:
-            images_str = "\n\n## 用户上传的图片\n"
-            for i, img in enumerate(input_data.images):
-                images_str += f"- 图片{i+1}: {img}\n"
-            user_content += images_str
-
-        messages.append({"role": "user", "content": user_content})
+            # 构建多模态 content：[{"type":"text","text":"..."},{"type":"image_url","image_url":{"url":"data:..."}}]
+            content_parts = [{"type": "text", "text": user_content}]
+            for img in input_data.images:
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": img}
+                })
+            messages.append({"role": "user", "content": content_parts})
+        else:
+            messages.append({"role": "user", "content": user_content})
 
         return messages
 
@@ -350,6 +370,8 @@ class BaseAgent(ABC):
             for tool in tools:
                 def _make_handler(t):
                     async def handler(**kwargs):
+                        # 允许子类为特定工具注入额外参数
+                        kwargs = self._customize_tool_kwargs(t.name, kwargs)
                         result = await t.run(**kwargs)
                         if result.success:
                             return result.data if result.data is not None else {"result": "success"}
