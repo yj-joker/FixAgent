@@ -70,7 +70,7 @@ class LLMService:
             "Content-Type": "application/json"
         }
 
-        logger.debug(f"[llm] chat call model={self.model} stream={stream} msg_count={len(messages)}")
+        logger.debug(f"[llm] 对话调用 模型={self.model} 流式={stream} 消息数={len(messages)}")
         if stream:
             return self._stream_chat(self.client, headers, params)
         else:
@@ -216,7 +216,7 @@ class LLMService:
                     "duration_ms": step_duration_ms
                 })
                 response["trace"] = trace
-                logger.info(f"[llm] chat_with_tools finished iterations={i+1} last_step_duration_ms={step_duration_ms}")
+                logger.info(f"[llm] 工具调用完成 迭代次数={i+1} 最后一步耗时={step_duration_ms}ms")
                 return response
 
             # 收集本轮工具调用详情

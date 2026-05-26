@@ -17,11 +17,14 @@ class Settings:
     redis_db = int(os.getenv("REDIS_DB", "0"))
     redis_ttl = int(os.getenv("REDIS_TTL", "86400"))  # 缓存默认24小时过期
 
-    # Neo4j 图数据库配置
-    neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-    neo4j_username = os.getenv("NEO4J_USERNAME", "neo4j")
-    neo4j_password = os.getenv("NEO4J_PASSWORD", "password")
-    neo4j_database = os.getenv("NEO4J_DATABASE", "neo4j")
+    # Java 后端服务地址（图谱查询统一走 Java 端，Python 不再直连 Neo4j）
+    java_service_url = os.getenv("JAVA_SERVICE_URL", "http://localhost:8080")
+
+    # RabbitMQ 配置
+    rabbitmq_url = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+
+    # 内部服务鉴权令牌（与 Java 端 ai.internal-token 保持一致）
+    internal_token = os.getenv("INTERNAL_TOKEN", "fix-agent-internal-2026")
 
     file_storage_backend = os.getenv("FILE_STORAGE_BACKEND", "local")
     file_public_base_url = os.getenv("FILE_PUBLIC_BASE_URL", "/files")

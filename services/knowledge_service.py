@@ -51,7 +51,8 @@ class KnowledgeService:
         device_type: Optional[str] = None,
         manual_type: Optional[str] = None,
         document_version: Optional[str] = None,
-        replace_existing: bool = False
+        replace_existing: bool = False,
+        old_document_id: Optional[str] = None
     ) -> dict:
         try:
             return await self._import_document_impl(
@@ -64,6 +65,7 @@ class KnowledgeService:
                 manual_type=manual_type,
                 document_version=document_version,
                 replace_existing=replace_existing,
+                old_document_id=old_document_id,
             )
         except Exception as exc:
             if document_id:
@@ -87,7 +89,8 @@ class KnowledgeService:
         device_type: Optional[str] = None,
         manual_type: Optional[str] = None,
         document_version: Optional[str] = None,
-        replace_existing: bool = False
+        replace_existing: bool = False,
+        old_document_id: Optional[str] = None
     ) -> dict:
         """
         导入文档：解析 → 向量化 → 入库
@@ -135,8 +138,10 @@ class KnowledgeService:
             "manual_type": manual_type,
             "document_version": document_version,
         }
-        if replace_existing:
-            self.vector_svc.delete_by_document(document_id)
+        if replace_existing and old_document_id:
+            # 删除旧版本的向量数据，用旧版本的 document_id（而非当前新版本的）
+            logger.info("删除旧版本向量: old_document_id=%s", old_document_id)
+            self.vector_svc.delete_by_document(old_document_id)
         self.vector_svc.put_document_manifest(document_id, {
             **common_metadata,
             "status": "indexing",

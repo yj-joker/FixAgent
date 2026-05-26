@@ -39,10 +39,27 @@ logging.basicConfig(
 )
 
 
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    # 启动：开启 MQ 消费者
+    from mq.consumer import start_consumers
+    from mq.connection import close_connection
+    try:
+        await start_consumers()
+        logger.info("[启动] RabbitMQ 消费者已启动")
+    except Exception as e:
+        logger.warning("[启动] RabbitMQ 消费者启动失败（MQ不可用时降级为HTTP模式）: %s", e)
+    yield
+    # 关闭：断开 MQ 连接
+    await close_connection()
+
 app = FastAPI(
     title="FixAgent AI Module",
     version="2.0.0",
-    description="AI推理引擎：FixAgent 统一诊断 + 3层确定性校验"
+    description="AI推理引擎：FixAgent 统一诊断 + 3层确定性校验",
+    lifespan=lifespan,
 )
 
 _settings = get_settings()
@@ -69,7 +86,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     3. 返回最终结果（含校验标注和安全补充）
     """
     try:
-        logger.info(f"[chat] session={request.session_id} msg_len={len(request.message)}")
+        logger.info(f"[chat] 会话={request.session_id} 消息长度={len(request.message)}")
 
         input_data = AgentInput(
             user_message=request.message,
@@ -82,7 +99,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         fix_result = await get_fix_agent().run_with_react(input_data)
 
         if fix_result.metadata.get("status") == "error":
-            logger.warning(f"[chat] session={request.session_id} fix_agent error: {fix_result.metadata.get('error_detail')}")
+            logger.warning(f"[chat] 会话={request.session_id} 诊断Agent错误: {fix_result.metadata.get('error_detail')}")
             return ChatResponse(
                 session_id=request.session_id,
                 message=fix_result.message,
@@ -96,9 +113,9 @@ async def chat(request: ChatRequest) -> ChatResponse:
         has_issues = final_result.metadata.get("verification_has_issues", False)
 
         logger.info(
-            f"[chat] session={request.session_id} done "
-            f"issues={'yes' if has_issues else 'no'} "
-            f"latency={final_result.latency_ms}ms"
+            f"[chat] 会话={request.session_id} 完成 "
+            f"有问题={'是' if has_issues else '否'} "
+            f"耗时={final_result.latency_ms}ms"
         )
 
         return ChatResponse(
@@ -268,10 +285,10 @@ async def knowledge_import(request: KnowledgeImportRequest) -> KnowledgeImportRe
             document_version=request.document_version,
             replace_existing=request.replace_existing
         )
-        logger.info(f"[knowledge_import] file={result['file_name']} "
-                    f"pages={result['total_pages']} "
-                    f"text={result['text_count']} img={result['image_count']} tbl={result['table_count']} "
-                    f"latency={result['process_time_ms']}ms")
+        logger.info(f"[knowledge_import] 文件={result['file_name']} "
+                    f"页数={result['total_pages']} "
+                    f"文本={result['text_count']} 图片={result['image_count']} 表格={result['table_count']} "
+                    f"耗时={result['process_time_ms']}ms")
         return KnowledgeImportResponse(
             success=True,
             message=f"导入完成：{result['file_name']}，共 {result['total_pages']} 页",
@@ -322,7 +339,7 @@ async def knowledge_search(request: KnowledgeSearchRequest) -> KnowledgeSearchRe
     import time
 
     try:
-        logger.info(f"[knowledge_search] q={request.query[:50]} top_k={request.top_k}")
+        logger.info(f"[knowledge_search] 查询={request.query[:50]} 数量={request.top_k}")
         tool = get_knowledge_retrieval_tool()
 
         t0 = time.time()
@@ -353,7 +370,7 @@ async def knowledge_search(request: KnowledgeSearchRequest) -> KnowledgeSearchRe
         else:
             first_meta = {}
 
-        logger.info(f"[knowledge_search] found={len(data)} latency={query_time_ms}ms")
+        logger.info(f"[knowledge_search] 找到={len(data)}条 耗时={query_time_ms}ms")
         return KnowledgeSearchResponse(
             success=True,
             message=f"检索完成，找到 {len(data)} 条结果",
@@ -395,14 +412,14 @@ async def memory_consolidate(request: MemoryConsolidateRequest) -> MemoryConsoli
             }
         )
 
-        logger.info(f"[memory_consolidate] session={request.session_id} msg_count={len(request.memoryMessages)}")
+        logger.info(f"[memory_consolidate] 会话={request.session_id} 消息数={len(request.memoryMessages)}")
         result = await get_memory_agent().run(agent_input)
-        logger.info(f"[memory_consolidate] session={request.session_id} done latency={result.latency_ms}ms")
+        logger.info(f"[memory_consolidate] 会话={request.session_id} 完成 耗时={result.latency_ms}ms")
 
         if result.metadata.get("status") == "error":
             error_type = result.metadata.get("error_type", "UnknownError")
             error_detail = result.metadata.get("error_detail", "记忆整理失败")
-            logger.error(f"[memory_consolidate] session={request.session_id} agent_error=[{error_type}] {error_detail}")
+            logger.error(f"[memory_consolidate] 会话={request.session_id} 记忆Agent错误=[{error_type}] {error_detail}")
             # 返回200但带error状态，让Java端重试逻辑能解析
             return JSONResponse(content={
                 "status": "error",
@@ -427,7 +444,7 @@ async def memory_consolidate(request: MemoryConsolidateRequest) -> MemoryConsoli
 
 
 @app.post("/ai/memory/search_facts")
-async def search_facts(query: str, top_k: int = 5):
+async def search_facts(query: str, top_k: int = 5, session_ids: str = ""):
     """
     事实记忆向量检索接口
 
@@ -440,39 +457,49 @@ async def search_facts(query: str, top_k: int = 5):
     将事实注入上下文 → 发给 AI 生成回复
 
     【过滤逻辑】
-    只返回 metadata.type == "fact" 的向量记录，
-    排除知识库文档等其他类型的向量。
+    1. 只返回 metadata.type == "fact" 的向量记录
+    2. 按 session_ids 过滤，只返回属于当前用户会话的事实
 
     Args:
         query: 用户当前发送的消息文本，用于语义匹配
         top_k: 最多返回几条最相关的事实，默认5条
+        session_ids: 当前用户的会话ID列表，逗号分隔。用于过滤非本用户的事实
 
     Returns:
         {"facts": [{"doc_id": "fact:xxx", "content": "...", "score": 0.85, ...}, ...]}
     """
     import time
 
+    # 解析会话ID白名单
+    allowed_sessions = set()
+    if session_ids:
+        allowed_sessions = {sid.strip() for sid in session_ids.split(",") if sid.strip()}
+
     try:
         t0 = time.time()
         svc = get_vector_service()
-        # 用用户消息做向量检索，在所有向量中搜索最相似的
-        results = await svc.search_by_text(query, top_k=top_k * 2)
-        # 只保留 type=fact 的结果（向量库中还有知识库文档等其他类型）
+        # 多取一些，因为后续要按 session 过滤
+        results = await svc.search_by_text(query, top_k=top_k * 3)
         facts = []
         for r in results:
             metadata = r.get("metadata", {})
-            if metadata.get("type") == "fact":
-                facts.append({
-                    "content": r.get("text", ""),
-                    "score": round(r.get("score", 0), 4),
-                    "doc_id": r.get("doc_id", ""),
-                    "keywords": metadata.get("keywords", ""),
-                    "session_id": metadata.get("session_id", ""),
-                })
+            if metadata.get("type") != "fact":
+                continue
+            # 按会话ID过滤：只保留属于当前用户的事实
+            fact_session = metadata.get("session_id", "")
+            if allowed_sessions and fact_session not in allowed_sessions:
+                continue
+            facts.append({
+                "content": r.get("text", ""),
+                "score": round(r.get("score", 0), 4),
+                "doc_id": r.get("doc_id", ""),
+                "keywords": metadata.get("keywords", ""),
+                "session_id": fact_session,
+            })
         # 按相关度排序，只取 top_k 条
         facts = facts[:top_k]
         query_time_ms = int((time.time() - t0) * 1000)
-        logger.info(f"[search_facts] query={query[:50]} found={len(facts)} latency={query_time_ms}ms")
+        logger.info(f"[search_facts] 查询={query[:50]} 找到={len(facts)}条 耗时={query_time_ms}ms")
         return {"facts": facts, "query_time_ms": query_time_ms}
     except Exception as e:
         logger.exception(f"[search_facts] error")
@@ -554,9 +581,9 @@ async def realtime_memory_update(request: RealtimeUpdateRequest):
 
         result_data = result.metadata.get("result", {})
         logger.info(
-            f"[realtime_update] session={session_id} "
-            f"has_update={result_data.get('has_update', False)} "
-            f"latency={latency_ms}ms"
+            f"[realtime_update] 会话={session_id} "
+            f"有更新={result_data.get('has_update', False)} "
+            f"耗时={latency_ms}ms"
         )
 
         return {
@@ -577,6 +604,61 @@ async def realtime_memory_update(request: RealtimeUpdateRequest):
             "preference_changes": [],
             "error": str(e)
         }
+
+# ==================== 多模态向量化（文本或图片，不融合）====================
+
+class MultimodalEmbeddingRequest(BaseModel):
+    """多模态向量化请求 — 传 text 或 image_base64s 之一，不做融合"""
+    text: str = ""
+    image_base64s: list = []   # Java 端下载图片后转的 base64 data URI
+
+@app.post("/ai/embedding/multimodal")
+async def multimodal_embedding(req: MultimodalEmbeddingRequest):
+    """
+    使用多模态模型（qwen2.5-vl-embedding，1024维）向量化。
+    传 text 或 image_base64s 之一：
+    - 仅 text：返回文本在多模态空间的向量
+    - 仅 image_base64s：返回图片向量（多张取均值）
+    - 不做融合，调用方应分别调用
+
+    image_base64s 格式: ["data:image/jpeg;base64,/9j/4AAQ..."]
+    """
+    import numpy as np
+    from embeddings.image_embedding import get_image_embedding
+
+    has_text = bool(req.text and req.text.strip())
+    has_images = bool(req.image_base64s)
+
+    if not has_text and not has_images:
+        raise HTTPException(status_code=400, detail="text 和 image_base64s 不能同时为空")
+
+    try:
+        img_emb = get_image_embedding()
+
+        if has_images:
+            # 图片向量（多张取均值后归一化）
+            img_vecs = await img_emb.embed_batch(req.image_base64s)
+            vec = np.mean(img_vecs, axis=0)
+        else:
+            # 纯文本 → 通过多模态模型映射到 1024 维空间
+            vec = np.array(await img_emb.embed_text_as_multimodal(req.text.strip()))
+
+        # 归一化
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm
+
+        return {
+            "vector": vec.tolist(),
+            "dimension": len(vec),
+            "has_text": has_text,
+            "has_image": has_images
+        }
+
+    except Exception as e:
+        logger.exception("[multimodal_embedding] error")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):

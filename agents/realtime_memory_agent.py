@@ -241,6 +241,7 @@ class RealtimeMemoryAgent(BaseAgent):
         result_dict = result.model_dump()
         result_dict["superseded_fact_ids"] = superseded_fact_ids
         result_dict["new_fact_ids"] = new_fact_ids
+        result_dict["old_seq_ranges"] = correction_result.get("old_seq_ranges", []) if result.has_update and result.fact_corrections else []
 
         return AgentOutput(
             agent_name=self.name,
@@ -298,6 +299,7 @@ class RealtimeMemoryAgent(BaseAgent):
         embedding_service = get_text_embedding()
         superseded_ids = []  # 收集被替代的旧事实ID
         new_fact_ids = []    # 收集新写入的事实ID
+        old_seq_ranges = []  # 收集旧事实的sourceSeqRange，供Java端合并
 
         for correction in corrections:
             try:
@@ -306,16 +308,21 @@ class RealtimeMemoryAgent(BaseAgent):
                 old_results = vector_service.search(old_vector, top_k=3)
 
                 # 找到匹配的旧事实（score越低越相似，COSINE距离）
+                old_seq_range = ""
                 for old in old_results:
                     metadata = old.get("metadata", {})
                     if metadata.get("type") == "fact" and old.get("score", 1) < 0.3:
+                        # 记录旧事实的 sourceSeqRange（用于合并到纠正后的新事实）
+                        old_seq_range = metadata.get("source_seq_range", "")
                         # 删除旧事实向量
                         doc_id = old.get("doc_id", "")
                         if doc_id:
                             vector_service.delete(doc_id)
                             superseded_ids.append(doc_id)
-                            logger.info(f"[realtime] 删除旧事实向量: {doc_id}")
+                            logger.info(f"[realtime] 删除旧事实向量: {doc_id}, 旧seqRange: {old_seq_range}")
                         break
+
+                old_seq_ranges.append(old_seq_range)
 
                 # 2. 写入新的正确事实
                 search_text = f"{correction.keywords} {correction.correct_content}" if correction.keywords else correction.correct_content
@@ -340,7 +347,7 @@ class RealtimeMemoryAgent(BaseAgent):
             except Exception as e:
                 logger.error(f"[realtime] 事实纠正失败: {e}")
 
-        return {"superseded_ids": superseded_ids, "new_fact_ids": new_fact_ids}
+        return {"superseded_ids": superseded_ids, "new_fact_ids": new_fact_ids, "old_seq_ranges": old_seq_ranges}
 
 
 # ========== 单例 ==========

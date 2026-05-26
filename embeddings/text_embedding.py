@@ -68,7 +68,7 @@ class TextEmbedding:
             embeddings = sorted(resp.output["embeddings"], key=lambda x: x.get("index", 0))
             result = [e["embedding"] for e in embeddings]
             if result:
-                logger.debug(f"Embedding model={self.model} dim={len(result[0])}")
+                logger.debug(f"文本向量化完成 模型={self.model} 维度={len(result[0])}")
             return result
 
         raise ValueError(f"Embedding API 响应格式异常: {resp}")
