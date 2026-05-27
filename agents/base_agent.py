@@ -24,6 +24,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 from services.llm_service import LLMService
+from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +235,8 @@ class BaseAgent(ABC):
     async def _call_llm(
         self,
         messages: List[Dict[str, str]],
-        stream: bool = False
+        stream: bool = False,
+        model: Optional[str] = None
     ) -> Dict[str, Any] | AsyncIterator[str]:
         """
         调用LLM服务
@@ -242,12 +244,13 @@ class BaseAgent(ABC):
         Args:
             messages: 消息列表
             stream: 是否流式输出
+            model: 模型覆盖（有图片时传 VLM 模型）
 
         Returns:
             非流式：完整响应字典
             流式：异步生成器yield每个token
         """
-        return await self.llm_service.chat(messages, stream=stream)
+        return await self.llm_service.chat(messages, stream=stream, model=model)
 
     def _process_response(
         self,
@@ -302,8 +305,14 @@ class BaseAgent(ABC):
             # 1. 构建消息
             messages = self._build_messages(input_data)
 
-            # 2. 调用LLM
-            response = await self._call_llm(messages, stream=False)
+            # 2. 有图片时切换为视觉模型
+            model_override = None
+            if input_data.images:
+                model_override = get_settings().vlm_model
+                logger.info(f"[{self.name}] 检测到图片，切换模型: {model_override}")
+
+            # 3. 调用LLM
+            response = await self._call_llm(messages, stream=False, model=model_override)
 
             # 3. 处理输出
             intention = input_data.context.get("intention") if input_data.context else None
@@ -380,12 +389,19 @@ class BaseAgent(ABC):
                     return handler
                 tool_handlers[tool.name] = _make_handler(tool)
 
-            # 3. ReAct 循环（chat_with_tools 内部自动处理）
+            # 3. 有图片时自动切换为视觉模型
+            model_override = None
+            if input_data.images:
+                model_override = get_settings().vlm_model
+                logger.info(f"[{self.name}] 检测到图片，切换模型: {model_override}")
+
+            # 4. ReAct 循环（chat_with_tools 内部自动处理）
             response = await self.llm_service.chat_with_tools(
                 messages=messages,
                 tools=tool_schemas,
                 tool_handlers=tool_handlers,
-                max_iterations=max_iterations
+                max_iterations=max_iterations,
+                model=model_override
             )
 
             # 4. 记录使用的工具
@@ -518,7 +534,8 @@ class BaseAgent(ABC):
             每个token
         """
         messages = self._build_messages(input_data)
-        stream_iter = await self._call_llm(messages, stream=True)
+        model_override = get_settings().vlm_model if input_data.images else None
+        stream_iter = await self._call_llm(messages, stream=True, model=model_override)
 
         async for token in stream_iter:
             yield token

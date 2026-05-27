@@ -35,7 +35,8 @@ class LLMService:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         stream: bool = False,
-        response_format: Optional[Dict[str, str]] = None
+        response_format: Optional[Dict[str, str]] = None,
+        model: Optional[str] = None
     ) -> Dict[str, Any] | AsyncIterator[str]:
         """
         对话接口
@@ -46,13 +47,15 @@ class LLMService:
             max_tokens: 最大生成长度
             stream: 是否流式输出
             response_format: 输出格式约束，如 {"type": "json_object"}
+            model: 模型覆盖（有图片时传 VLM 模型）
 
         Returns:
             非流式：完整响应字典
             流式：异步生成器yield每个token
         """
+        use_model = model or self.model
         params = {
-            "model": self.model,
+            "model": use_model,
             "messages": messages,
             "temperature": temperature or self.settings.llm_temperature,
             "top_p": self.settings.llm_top_p,
@@ -70,7 +73,7 @@ class LLMService:
             "Content-Type": "application/json"
         }
 
-        logger.debug(f"[llm] 对话调用 模型={self.model} 流式={stream} 消息数={len(messages)}")
+        logger.debug(f"[llm] 对话调用 模型={use_model} 流式={stream} 消息数={len(messages)}")
         if stream:
             return self._stream_chat(self.client, headers, params)
         else:
@@ -158,7 +161,8 @@ class LLMService:
         tools: List[Dict[str, Any]],
         tool_handlers: Dict[str, Callable[..., Awaitable]],
         max_iterations: int = 10,
-        response_format: Optional[Dict[str, str]] = None
+        response_format: Optional[Dict[str, str]] = None,
+        model: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         带工具调用的对话
@@ -174,12 +178,14 @@ class LLMService:
             tool_handlers: {"工具名": async_handler} 映射
             max_iterations: 最大工具调用轮数
             response_format: 输出格式约束，如 {"type": "json_object"}
+            model: 模型覆盖（有图片时传 VLM 模型）
 
         Returns:
             最终响应字典，包含 content / usage / request_id / trace
         """
+        use_model = model or self.model
         params = {
-            "model": self.model,
+            "model": use_model,
             "messages": messages,
             "temperature": self.settings.llm_temperature,
             "top_p": self.settings.llm_top_p,
