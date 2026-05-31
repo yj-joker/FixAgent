@@ -287,11 +287,16 @@ async def handle_task_generate(message: aio_pika.abc.AbstractIncomingMessage, ch
             )
 
             if result.get("success"):
-                await publish_result(channel, {
+                msg_body = {
                     "taskId": task_id,
                     "success": True,
                     "steps": result["steps"],
-                }, exchange_name=TASK_EXCHANGE, routing_key=TASK_GENERATE_RESULT_KEY)
+                }
+                # 传递AI提取的图谱线索（用于知识沉淀）
+                if result.get("graphExtraction"):
+                    msg_body["graphExtraction"] = result["graphExtraction"]
+                await publish_result(channel, msg_body,
+                                     exchange_name=TASK_EXCHANGE, routing_key=TASK_GENERATE_RESULT_KEY)
                 logger.info("[MQ消费] 检修步骤生成成功, taskId=%s, 步骤数=%d",
                             task_id, len(result["steps"]))
             else:

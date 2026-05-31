@@ -166,7 +166,8 @@ class GraphJavaTool(BaseTool):
             return {
                 "paths_found": len(records),
                 "total": total,
-                "context": context
+                "context": context,
+                "raw_records": records,
             }
 
         except httpx.HTTPStatusError as e:

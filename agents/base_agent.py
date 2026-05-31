@@ -311,8 +311,25 @@ class BaseAgent(ABC):
                 model_override = get_settings().vlm_model
                 logger.info(f"[{self.name}] 检测到图片，切换模型: {model_override}")
 
-            # 3. 调用LLM
-            response = await self._call_llm(messages, stream=False, model=model_override)
+            # 3. 调用LLM（图片无效时降级为纯文本重试）
+            try:
+                response = await self._call_llm(messages, stream=False, model=model_override)
+            except Exception as llm_err:
+                if input_data.images and "400" in str(llm_err):
+                    logger.warning(f"[{self.name}] 多模态调用失败(可能图片URL无效)，降级为纯文本重试: {llm_err}")
+                    # 去掉图片，用纯文本消息重建
+                    input_data_fallback = AgentInput(
+                        user_message=input_data.user_message,
+                        session_id=input_data.session_id,
+                        images=None,  # 清除图片
+                        context=input_data.context,
+                        conversation_history=input_data.conversation_history,
+                    )
+                    messages = self._build_messages(input_data_fallback)
+                    model_override = None
+                    response = await self._call_llm(messages, stream=False, model=model_override)
+                else:
+                    raise
 
             # 3. 处理输出
             intention = input_data.context.get("intention") if input_data.context else None
