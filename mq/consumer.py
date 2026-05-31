@@ -199,8 +199,8 @@ async def handle_knowledge_import(message: aio_pika.abc.AbstractIncomingMessage,
             try:
                 from services.vector_service import get_vector_service
                 vector_svc = get_vector_service()
-                vector_svc.delete_by_document(document_id)
-                logger.info("[MQ消费] 向量删除完成, documentId=%s", document_id)
+                deleted_count = vector_svc.delete_by_document(document_id)
+                logger.info("[MQ消费] 向量删除完成, documentId=%s, 删除数量=%d", document_id, deleted_count)
             except Exception as e:
                 logger.error("[MQ消费] 向量删除失败, documentId=%s, 错误:%s", document_id, e, exc_info=True)
             return
