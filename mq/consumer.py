@@ -199,8 +199,8 @@ async def handle_knowledge_import(message: aio_pika.abc.AbstractIncomingMessage,
             try:
                 from services.vector_service import get_vector_service
                 vector_svc = get_vector_service()
-                vector_svc.delete_by_document(document_id)
-                logger.info("[MQ消费] 向量删除完成, documentId=%s", document_id)
+                deleted_count = vector_svc.delete_by_document(document_id)
+                logger.info("[MQ消费] 向量删除完成, documentId=%s, 删除数量=%d", document_id, deleted_count)
             except Exception as e:
                 logger.error("[MQ消费] 向量删除失败, documentId=%s, 错误:%s", document_id, e, exc_info=True)
             return
@@ -287,11 +287,16 @@ async def handle_task_generate(message: aio_pika.abc.AbstractIncomingMessage, ch
             )
 
             if result.get("success"):
-                await publish_result(channel, {
+                msg_body = {
                     "taskId": task_id,
                     "success": True,
                     "steps": result["steps"],
-                }, exchange_name=TASK_EXCHANGE, routing_key=TASK_GENERATE_RESULT_KEY)
+                }
+                # 传递AI提取的图谱线索（用于知识沉淀）
+                if result.get("graphExtraction"):
+                    msg_body["graphExtraction"] = result["graphExtraction"]
+                await publish_result(channel, msg_body,
+                                     exchange_name=TASK_EXCHANGE, routing_key=TASK_GENERATE_RESULT_KEY)
                 logger.info("[MQ消费] 检修步骤生成成功, taskId=%s, 步骤数=%d",
                             task_id, len(result["steps"]))
             else:

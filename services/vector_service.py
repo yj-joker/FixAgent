@@ -410,6 +410,9 @@ class VectorService:
         if not document_id:
             return 0
         try:
+            # 确保索引存在（Redis 重启后 RediSearch 索引可能丢失）
+            self._ensure_index()
+
             deleted = 0
             query = build_redis_filter(document_id=document_id)
             while True:
@@ -427,9 +430,10 @@ class VectorService:
                 for key in keys:
                     if self.redis.delete(key):
                         deleted += 1
+            logger.info(f"delete_by_document 完成: document_id={document_id}, deleted={deleted}")
             return deleted
         except Exception as e:
-            logger.error(f"delete_by_document failed: {e}")
+            logger.error(f"delete_by_document failed: {e}", exc_info=True)
             return 0
 
     def put_document_manifest(self, document_id: str, manifest: Dict[str, Any]) -> bool:
