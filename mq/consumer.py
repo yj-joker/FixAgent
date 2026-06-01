@@ -77,7 +77,7 @@ async def handle_realtime(message: aio_pika.abc.AbstractIncomingMessage, channel
                 context={
                     "user_message": body["userMessage"],
                     "ai_response": body.get("aiResponse", ""),
-                    "recent_facts": [],
+                    "recent_facts": body.get("recentFacts", []),
                 },
             )
             result = await agent.run(input_data)

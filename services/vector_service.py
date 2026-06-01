@@ -405,6 +405,14 @@ class VectorService:
             logger.error(f"向量删除失败: {e}")
             return False
 
+    def delete_batch(self, doc_ids: List[str]) -> int:
+        """批量删除向量，返回成功删除的数量"""
+        deleted = 0
+        for doc_id in doc_ids:
+            if self.delete(doc_id):
+                deleted += 1
+        return deleted
+
     def delete_by_document(self, document_id: str) -> int:
         """Delete all vector records that belong to one imported document."""
         if not document_id:
