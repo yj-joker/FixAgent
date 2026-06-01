@@ -485,6 +485,9 @@ async def search_facts(query: str, top_k: int = 5, session_ids: str = ""):
             metadata = r.get("metadata", {})
             if metadata.get("type") != "fact":
                 continue
+            # 过滤已废弃的事实（双重保障：即使旧向量未被删除，也不会返回）
+            if metadata.get("status") and metadata.get("status") != "active":
+                continue
             # 按会话ID过滤：只保留属于当前用户的事实
             fact_session = metadata.get("session_id", "")
             if allowed_sessions and fact_session not in allowed_sessions:
@@ -504,6 +507,25 @@ async def search_facts(query: str, top_k: int = 5, session_ids: str = ""):
     except Exception as e:
         logger.exception(f"[search_facts] error")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class DeleteFactsRequest(BaseModel):
+    fact_ids: list[str]
+
+
+@app.post("/ai/memory/delete_facts")
+async def delete_facts(request: DeleteFactsRequest):
+    """
+    删除 Redis 向量库中的旧事实。
+    Java 端整合产生 supersededIds 后调用此接口同步清理向量库。
+    """
+    if not request.fact_ids:
+        return {"deleted": 0}
+
+    svc = get_vector_service()
+    deleted = svc.delete_batch(request.fact_ids)
+    logger.info(f"[delete_facts] 删除旧事实向量 {deleted}/{len(request.fact_ids)} 条")
+    return {"deleted": deleted}
 
 
 class RealtimeUpdateRequest(BaseModel):

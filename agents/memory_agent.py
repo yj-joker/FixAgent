@@ -355,6 +355,7 @@ class MemoryAgent(BaseAgent):
                 vector=vector,
                 metadata={
                     "type": "fact",
+                    "status": "active",
                     "session_id": session_id,
                     "keywords": keywords,
                     "source_seq_range": fact.get("source_seq_range", ""),

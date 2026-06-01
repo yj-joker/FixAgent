@@ -336,6 +336,7 @@ class RealtimeMemoryAgent(BaseAgent):
                     vector=new_vector,
                     metadata={
                         "type": "fact",
+                        "status": "active",
                         "session_id": session_id,
                         "keywords": correction.keywords,
                         "source": "realtime_correction"
