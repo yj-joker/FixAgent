@@ -30,6 +30,8 @@ class FactItem(BaseModel):
     content: str = Field(description="自包含的事实描述")
     keywords: str = Field(default="", description="检索用关键词，逗号分隔")
     source_seq_range: str = Field(default="", description="来源对话序号范围，如 '3-5'")
+    importance: int = Field(default=5, ge=1, le=10, description="重要度1-10: 1-3临时, 4-6中等, 7-9重要, 10核心")
+    confidence: float = Field(default=0.80, ge=0.0, le=1.0, description="置信度0-1: 1.0明确陈述, 0.8默认, <0.5低置信")
 
 
 class PreferenceItem(BaseModel):

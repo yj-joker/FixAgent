@@ -339,7 +339,10 @@ class RealtimeMemoryAgent(BaseAgent):
                         "status": "active",
                         "session_id": session_id,
                         "keywords": correction.keywords,
-                        "source": "realtime_correction"
+                        "source": "realtime_correction",
+                        "importance": 7,       # 纠正事实默认较高重要度
+                        "confidence": 0.95,    # 用户主动纠正，置信度高
+                        "created_at": batch_ts
                     }
                 )
                 new_fact_ids.append(new_doc_id)

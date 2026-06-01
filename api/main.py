@@ -446,7 +446,7 @@ async def memory_consolidate(request: MemoryConsolidateRequest) -> MemoryConsoli
 @app.post("/ai/memory/search_facts")
 async def search_facts(query: str, top_k: int = 5, session_ids: str = ""):
     """
-    事实记忆向量检索接口
+    事实记忆向量检索接口 — 带多因子重排序
 
     Java 端在组装对话上下文时调用此接口，
     用当前用户消息作为 query 去向量库中检索最相关的历史事实。
@@ -456,9 +456,9 @@ async def search_facts(query: str, top_k: int = 5, session_ids: str = ""):
     用户发消息 → Java 端收到 → 调用本接口检索相关事实 →
     将事实注入上下文 → 发给 AI 生成回复
 
-    【过滤逻辑】
-    1. 只返回 metadata.type == "fact" 的向量记录
-    2. 按 session_ids 过滤，只返回属于当前用户会话的事实
+    【两阶段排序】
+    1. 粗筛：Redis KNN 取 top_k * 3 候选
+    2. 精排：FactReranker 多因子综合排序（语义 + 新近性 + 重要度 + 频率 + 置信度）
 
     Args:
         query: 用户当前发送的消息文本，用于语义匹配
@@ -466,9 +466,10 @@ async def search_facts(query: str, top_k: int = 5, session_ids: str = ""):
         session_ids: 当前用户的会话ID列表，逗号分隔。用于过滤非本用户的事实
 
     Returns:
-        {"facts": [{"doc_id": "fact:xxx", "content": "...", "score": 0.85, ...}, ...]}
+        {"facts": [{"doc_id": "fact:xxx", "content": "...", "score": 0.85, "final_score": 0.72, ...}, ...]}
     """
-    import time
+    import time as t
+    from services.fact_reranker import rerank
 
     # 解析会话ID白名单
     allowed_sessions = set()
@@ -476,11 +477,13 @@ async def search_facts(query: str, top_k: int = 5, session_ids: str = ""):
         allowed_sessions = {sid.strip() for sid in session_ids.split(",") if sid.strip()}
 
     try:
-        t0 = time.time()
+        t0 = t.time()
         svc = get_vector_service()
-        # 多取一些，因为后续要按 session 过滤
+        # 粗筛：多取候选，留给 reranker 精排
         results = await svc.search_by_text(query, top_k=top_k * 3)
-        facts = []
+
+        # 过滤：只保留 type=fact, status=active, 属于当前用户
+        candidates = []
         for r in results:
             metadata = r.get("metadata", {})
             if metadata.get("type") != "fact":
@@ -492,17 +495,27 @@ async def search_facts(query: str, top_k: int = 5, session_ids: str = ""):
             fact_session = metadata.get("session_id", "")
             if allowed_sessions and fact_session not in allowed_sessions:
                 continue
+            candidates.append(r)
+
+        # 精排：多因子重排序
+        ranked = rerank(candidates, top_k=top_k)
+
+        # 格式化输出
+        facts = []
+        for r in ranked:
+            metadata = r.get("metadata", {})
             facts.append({
                 "content": r.get("text", ""),
                 "score": round(r.get("score", 0), 4),
+                "final_score": r.get("final_score", 0),
+                "score_breakdown": r.get("score_breakdown", {}),
                 "doc_id": r.get("doc_id", ""),
                 "keywords": metadata.get("keywords", ""),
-                "session_id": fact_session,
+                "session_id": metadata.get("session_id", ""),
             })
-        # 按相关度排序，只取 top_k 条
-        facts = facts[:top_k]
-        query_time_ms = int((time.time() - t0) * 1000)
-        logger.info(f"[search_facts] 查询={query[:50]} 找到={len(facts)}条 耗时={query_time_ms}ms")
+
+        query_time_ms = int((t.time() - t0) * 1000)
+        logger.info(f"[search_facts] 查询={query[:50]} 候选={len(candidates)} 精排后={len(facts)} 耗时={query_time_ms}ms")
         return {"facts": facts, "query_time_ms": query_time_ms}
     except Exception as e:
         logger.exception(f"[search_facts] error")
