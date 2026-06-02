@@ -17,6 +17,7 @@ Agent基类模块
 import time
 import asyncio
 import logging
+import json
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, AsyncIterator
 from datetime import datetime
@@ -150,6 +151,36 @@ class BaseAgent(ABC):
             处理后的参数字典
         """
         return kwargs
+
+    @staticmethod
+    def _summarize_for_log(value: Any, max_length: int = 500) -> str:
+        """Return a compact, safe summary for console tool-call logs."""
+        sensitive_keys = {"api_key", "token", "password", "secret", "authorization", "x-internal-token"}
+
+        def sanitize(item):
+            if isinstance(item, dict):
+                cleaned = {}
+                for key, val in item.items():
+                    key_text = str(key)
+                    if key_text.lower() in sensitive_keys or any(part in key_text.lower() for part in sensitive_keys):
+                        cleaned[key_text] = "***"
+                    else:
+                        cleaned[key_text] = sanitize(val)
+                return cleaned
+            if isinstance(item, list):
+                return [sanitize(val) for val in item[:5]]
+            if hasattr(item, "model_dump"):
+                return sanitize(item.model_dump())
+            return item
+
+        try:
+            summary = json.dumps(sanitize(value), ensure_ascii=False, default=str)
+        except Exception:
+            summary = str(value)
+
+        if len(summary) > max_length:
+            return summary[:max_length] + "...(truncated)"
+        return summary
 
     def _build_messages(self, input_data: AgentInput) -> List[Dict[str, str]]:
         """
@@ -404,10 +435,43 @@ class BaseAgent(ABC):
                     async def handler(**kwargs):
                         # 允许子类为特定工具注入额外参数
                         kwargs = self._customize_tool_kwargs(t.name, kwargs)
-                        result = await t.run(**kwargs)
+                        tool_start = time.time()
+                        logger.info(
+                            "[%s][tool_start] tool=%s args=%s",
+                            self.name,
+                            t.name,
+                            self._summarize_for_log(kwargs),
+                        )
+                        try:
+                            result = await t.run(**kwargs)
+                        except Exception:
+                            duration_ms = int((time.time() - tool_start) * 1000)
+                            logger.exception(
+                                "[%s][tool_exception] tool=%s duration_ms=%s",
+                                self.name,
+                                t.name,
+                                duration_ms,
+                            )
+                            raise
+
+                        duration_ms = int((time.time() - tool_start) * 1000)
                         if result.success:
+                            logger.info(
+                                "[%s][tool_success] tool=%s duration_ms=%s result=%s",
+                                self.name,
+                                t.name,
+                                duration_ms,
+                                self._summarize_for_log(result.data),
+                            )
                             return result.data if result.data is not None else {"result": "success"}
                         else:
+                            logger.warning(
+                                "[%s][tool_failure] tool=%s duration_ms=%s error=%s",
+                                self.name,
+                                t.name,
+                                duration_ms,
+                                self._summarize_for_log(result.error),
+                            )
                             return {"error": result.error.message if result.error else "unknown error"}
                     return handler
                 tool_handlers[tool.name] = _make_handler(tool)
