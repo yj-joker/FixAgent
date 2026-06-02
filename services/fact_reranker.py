@@ -2,29 +2,31 @@
 事实多因子重排序服务
 
 对 Redis KNN 粗筛的候选事实做精排，综合考虑：
-- 语义相关度（向量距离，权重 0.40）
-- 新近性衰减（created_at 越新越好，权重 0.20）
-- 重要性（importance 1-10，权重 0.15）
-- 使用频率（usage_count，权重 0.10）
-- 置信度（confidence，权重 0.15）
+- 语义相关度（向量距离，权重 0.35）
+- 新近性衰减（created_at 越新越好，权重 0.18）
+- 重要性（importance 1-10，权重 0.13）
+- 使用频率（usage_count，权重 0.09）
+- 置信度（confidence，权重 0.13）
+- 业务匹配（device_type/equipment_id/site_id/task_id，权重 0.12）
 
 公式：
-finalScore = semantic * 0.40 + recency * 0.20 + importance * 0.15 + frequency * 0.10 + confidence * 0.15
+finalScore = semantic*0.35 + recency*0.18 + importance*0.13 + frequency*0.09 + confidence*0.13 + business*0.12
 """
 
 import logging
 import math
 import time
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# 权重配置
-WEIGHT_SEMANTIC = 0.40
-WEIGHT_RECENCY = 0.20
-WEIGHT_IMPORTANCE = 0.15
-WEIGHT_FREQUENCY = 0.10
-WEIGHT_CONFIDENCE = 0.15
+# 权重配置（总和 = 1.0）
+WEIGHT_SEMANTIC = 0.35
+WEIGHT_RECENCY = 0.18
+WEIGHT_IMPORTANCE = 0.13
+WEIGHT_FREQUENCY = 0.09
+WEIGHT_CONFIDENCE = 0.13
+WEIGHT_BUSINESS = 0.12
 
 # 新近性衰减半衰期（秒）：7天，即7天前的事实新近性分数为0.5
 RECENCY_HALF_LIFE = 7 * 24 * 3600
@@ -75,13 +77,56 @@ def _confidence_score(confidence: float) -> float:
     return max(0.0, min(1.0, confidence))
 
 
-def rerank(candidates: List[Dict[str, Any]], top_k: int = 5) -> List[Dict[str, Any]]:
+def _business_match_score(metadata: dict, context: Optional[dict]) -> float:
+    """
+    计算事实与当前业务上下文的匹配度。
+
+    匹配规则：
+    - device_type 完全匹配：+0.4
+    - equipment_id 完全匹配：+0.3
+    - site_id 完全匹配：+0.2
+    - task_id 完全匹配：+0.1
+    全部不匹配返回 0.0，全部匹配返回 1.0
+    """
+    if not context:
+        return 0.5  # 无业务上下文时，不加分也不扣分
+
+    score = 0.0
+    ctx_device = context.get("device_type", "")
+    ctx_equipment = context.get("equipment_id", "")
+    ctx_site = context.get("site_id", "")
+    ctx_task = context.get("task_id", "")
+
+    fact_device = str(metadata.get("device_type", ""))
+    fact_equipment = str(metadata.get("equipment_id", ""))
+    fact_site = str(metadata.get("site_id", ""))
+    fact_task = str(metadata.get("task_id", ""))
+
+    if ctx_device and fact_device and ctx_device == fact_device:
+        score += 0.4
+    if ctx_equipment and fact_equipment and str(ctx_equipment) == str(fact_equipment):
+        score += 0.3
+    if ctx_site and fact_site and str(ctx_site) == str(fact_site):
+        score += 0.2
+    if ctx_task and fact_task and str(ctx_task) == str(fact_task):
+        score += 0.1
+
+    # 如果有业务上下文但事实完全无关联（所有业务字段都空），不惩罚太多
+    if not fact_device and not fact_equipment and not fact_site and not fact_task:
+        return 0.3  # 通用事实给一个基础分
+
+    return score
+
+
+def rerank(candidates: List[Dict[str, Any]], top_k: int = 5,
+           business_context: Optional[dict] = None) -> List[Dict[str, Any]]:
     """
     对候选事实做多因子重排序。
 
     Args:
         candidates: KNN 返回的候选列表，每条包含 score/metadata/text/doc_id
         top_k: 最终返回数量
+        business_context: 业务上下文（可选），包含 device_type/equipment_id/site_id/task_id
 
     Returns:
         重排序后的 top_k 结果，每条增加 final_score 和 score_breakdown 字段
@@ -95,6 +140,7 @@ def rerank(candidates: List[Dict[str, Any]], top_k: int = 5) -> List[Dict[str, A
         importance = _importance_score(int(metadata.get("importance", 5)))
         frequency = _frequency_score(int(metadata.get("usage_count", 0)))
         confidence = _confidence_score(float(metadata.get("confidence", 0.80)))
+        business = _business_match_score(metadata, business_context)
 
         final_score = (
             semantic * WEIGHT_SEMANTIC
@@ -102,6 +148,7 @@ def rerank(candidates: List[Dict[str, Any]], top_k: int = 5) -> List[Dict[str, A
             + importance * WEIGHT_IMPORTANCE
             + frequency * WEIGHT_FREQUENCY
             + confidence * WEIGHT_CONFIDENCE
+            + business * WEIGHT_BUSINESS
         )
 
         scored.append({
@@ -113,6 +160,7 @@ def rerank(candidates: List[Dict[str, Any]], top_k: int = 5) -> List[Dict[str, A
                 "importance": round(importance, 4),
                 "frequency": round(frequency, 4),
                 "confidence": round(confidence, 4),
+                "business_match": round(business, 4),
             }
         })
 

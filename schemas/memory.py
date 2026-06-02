@@ -32,6 +32,10 @@ class FactItem(BaseModel):
     source_seq_range: str = Field(default="", description="来源对话序号范围，如 '3-5'")
     importance: int = Field(default=5, ge=1, le=10, description="重要度1-10: 1-3临时, 4-6中等, 7-9重要, 10核心")
     confidence: float = Field(default=0.80, ge=0.0, le=1.0, description="置信度0-1: 1.0明确陈述, 0.8默认, <0.5低置信")
+    device_type: str = Field(default="", description="关联设备类型，如'液压泵'、'电动机'，无关则留空")
+    equipment_id: str = Field(default="", description="关联设备ID，无关则留空")
+    site_id: str = Field(default="", description="关联场地ID，无关则留空")
+    task_id: str = Field(default="", description="关联检修任务ID，无关则留空")
 
 
 class PreferenceItem(BaseModel):

@@ -242,6 +242,7 @@ class RealtimeMemoryAgent(BaseAgent):
         result_dict["superseded_fact_ids"] = superseded_fact_ids
         result_dict["new_fact_ids"] = new_fact_ids
         result_dict["old_seq_ranges"] = correction_result.get("old_seq_ranges", []) if result.has_update and result.fact_corrections else []
+        result_dict["conflict_pending_ids"] = correction_result.get("conflict_pending_ids", []) if result.has_update and result.fact_corrections else []
 
         return AgentOutput(
             agent_name=self.name,
@@ -301,6 +302,8 @@ class RealtimeMemoryAgent(BaseAgent):
         new_fact_ids = []    # 收集新写入的事实ID
         old_seq_ranges = []  # 收集旧事实的sourceSeqRange，供Java端合并
 
+        conflict_pending_ids = []  # 高置信冲突的新事实ID
+
         for correction in corrections:
             try:
                 # 1. 用错误内容的语义去检索旧事实
@@ -309,20 +312,56 @@ class RealtimeMemoryAgent(BaseAgent):
 
                 # 找到匹配的旧事实（score越低越相似，COSINE距离）
                 old_seq_range = ""
+                matched_old = None
                 for old in old_results:
                     metadata = old.get("metadata", {})
                     if metadata.get("type") == "fact" and old.get("score", 1) < 0.3:
-                        # 记录旧事实的 sourceSeqRange（用于合并到纠正后的新事实）
+                        matched_old = old
                         old_seq_range = metadata.get("source_seq_range", "")
-                        # 删除旧事实向量
-                        doc_id = old.get("doc_id", "")
-                        if doc_id:
-                            vector_service.delete(doc_id)
-                            superseded_ids.append(doc_id)
-                            logger.info(f"[realtime] 删除旧事实向量: {doc_id}, 旧seqRange: {old_seq_range}")
                         break
 
                 old_seq_ranges.append(old_seq_range)
+
+                if matched_old:
+                    old_confidence = float(matched_old.get("metadata", {}).get("confidence", 0.80))
+
+                    # 如果旧事实置信度很高（>0.9），标记为 conflict_pending 而非直接替代
+                    if old_confidence > 0.90:
+                        doc_id = matched_old.get("doc_id", "")
+                        superseded_ids.append(doc_id)
+
+                        search_text = f"{correction.keywords} {correction.correct_content}" if correction.keywords else correction.correct_content
+                        new_vector = await embedding_service.embed(search_text)
+                        batch_ts = str(int(time.time() * 1000))
+                        new_doc_id = f"fact:{session_id}:conflict_{batch_ts}"
+
+                        vector_service.add_vector(
+                            doc_id=new_doc_id,
+                            text=correction.correct_content,
+                            vector=new_vector,
+                            metadata={
+                                "type": "fact",
+                                "status": "conflict_pending",
+                                "session_id": session_id,
+                                "keywords": correction.keywords,
+                                "source": "realtime_correction",
+                                "importance": 7,
+                                "confidence": 0.95,
+                                "conflicting_fact_id": doc_id,
+                                "created_at": batch_ts
+                            }
+                        )
+                        new_fact_ids.append(new_doc_id)
+                        conflict_pending_ids.append(new_doc_id)
+                        logger.info(f"[realtime] 高置信冲突，标记为conflict_pending: old={doc_id}, new={new_doc_id}")
+                        continue
+
+                    # 正常置信度：直接替代
+                    doc_id = matched_old.get("doc_id", "")
+                    if doc_id:
+                        vector_service.delete(doc_id)
+                        superseded_ids.append(doc_id)
+                        logger.info(f"[realtime] 删除旧事实向量: {doc_id}, 旧seqRange: {old_seq_range}")
 
                 # 2. 写入新的正确事实
                 search_text = f"{correction.keywords} {correction.correct_content}" if correction.keywords else correction.correct_content
@@ -340,8 +379,8 @@ class RealtimeMemoryAgent(BaseAgent):
                         "session_id": session_id,
                         "keywords": correction.keywords,
                         "source": "realtime_correction",
-                        "importance": 7,       # 纠正事实默认较高重要度
-                        "confidence": 0.95,    # 用户主动纠正，置信度高
+                        "importance": 7,
+                        "confidence": 0.95,
                         "created_at": batch_ts
                     }
                 )
@@ -351,7 +390,12 @@ class RealtimeMemoryAgent(BaseAgent):
             except Exception as e:
                 logger.error(f"[realtime] 事实纠正失败: {e}")
 
-        return {"superseded_ids": superseded_ids, "new_fact_ids": new_fact_ids, "old_seq_ranges": old_seq_ranges}
+        return {
+            "superseded_ids": superseded_ids,
+            "new_fact_ids": new_fact_ids,
+            "old_seq_ranges": old_seq_ranges,
+            "conflict_pending_ids": conflict_pending_ids,
+        }
 
 
 # ========== 单例 ==========
