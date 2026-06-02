@@ -61,6 +61,10 @@ async def lifespan(application: FastAPI):
         from mq.connection import close_connection
         await start_consumers()
         logger.info("[启动] RabbitMQ 消费者已启动")
+        import asyncio
+        from services.kg_retry_sweeper import start_kg_retry_sweeper
+        asyncio.create_task(start_kg_retry_sweeper())
+        logger.info("[启动] KG重试sweeper已启动")
     except Exception as e:
         logger.warning("[启动] RabbitMQ 消费者启动失败（MQ不可用时降级为HTTP模式）: %s", e)
     yield
