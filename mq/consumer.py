@@ -282,6 +282,22 @@ async def handle_knowledge_import(message: aio_pika.abc.AbstractIncomingMessage,
             }, exchange_name=KNOWLEDGE_EXCHANGE, routing_key=KNOWLEDGE_RESULT_KEY)
 
 
+async def handle_kg_extract(message: aio_pika.abc.AbstractIncomingMessage,
+                            channel: aio_pika.abc.AbstractChannel):
+    async with message.process(requeue=False):
+        body = json.loads(message.body)
+        manual_id = body.get("manualId")
+        document_id = body.get("documentId")
+        device_type = body.get("deviceType")
+        logger.info("[MQ消费] KG抽取开始 manualId=%s doc=%s", manual_id, document_id)
+        try:
+            from services.manual_graph_ingest import run_kg_extraction
+            await run_kg_extraction(manual_id, document_id, device_type)
+            logger.info("[MQ消费] KG抽取完成 doc=%s", document_id)
+        except Exception as e:
+            logger.error("[MQ消费] KG抽取失败 doc=%s err=%s", document_id, e, exc_info=True)
+
+
 async def handle_task_generate(message: aio_pika.abc.AbstractIncomingMessage, channel: aio_pika.abc.AbstractChannel):
     """消费检修任务生成请求，调用 MaintenanceAgent 生成步骤"""
     async with message.process(requeue=False):
@@ -579,6 +595,14 @@ async def start_consumers():
     knowledge_queue = await knowledge_channel.get_queue(KNOWLEDGE_IMPORT_QUEUE)
     await knowledge_queue.consume(
         lambda msg: handle_knowledge_import(msg, knowledge_channel)
+    )
+
+    # KG 图谱抽取通道（prefetch=1，LLM抽取+回写耗时长，串行处理）
+    kg_extract_channel = await connection.channel()
+    await kg_extract_channel.set_qos(prefetch_count=1)
+    kg_extract_queue = await kg_extract_channel.get_queue(KNOWLEDGE_KG_EXTRACT_QUEUE)
+    await kg_extract_queue.consume(
+        lambda msg: handle_kg_extract(msg, kg_extract_channel)
     )
 
     # 检修任务生成通道（prefetch=1，LLM推理耗时长，串行处理）
