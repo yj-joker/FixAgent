@@ -45,6 +45,11 @@ TASK_STEP_VERIFY_QUEUE = "task.step.verify.queue"
 TASK_STEP_VERIFY_RESULT_KEY = "task.step.verify.result"
 TASK_STEP_VERIFY_RESULT_QUEUE = "task.step.verify.result.queue"
 
+# ===== 记忆反思队列 =====
+REFLECTION_QUEUE = "memory.reflection.queue"
+REFLECTION_RESULT_KEY = "memory.reflection.result"
+REFLECTION_RESULT_QUEUE = "memory.reflection.result.queue"
+
 
 async def publish_result(channel: aio_pika.abc.AbstractChannel, data: dict,
                          exchange_name: str = EXCHANGE_NAME, routing_key: str = RESULT_KEY):
@@ -361,6 +366,66 @@ async def handle_step_verify(message: aio_pika.abc.AbstractIncomingMessage, chan
             }, exchange_name=TASK_EXCHANGE, routing_key=TASK_STEP_VERIFY_RESULT_KEY)
 
 
+async def handle_reflection(message: aio_pika.abc.AbstractIncomingMessage, channel: aio_pika.abc.AbstractChannel):
+    """消费反思任务，从 Java 拉取用户事实，调用 ReflectionAgent 生成画像"""
+    async with message.process(requeue=False):
+        body = json.loads(message.body)
+        user_id = body["userId"]
+        logger.info("[MQ消费] 用户画像反思开始, userId:%s", user_id)
+
+        try:
+            settings = get_settings()
+
+            # 从 Java 拉取用户全部 active 事实
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{settings.java_service_url}/weixiu/memory/user-facts",
+                    params={"userId": user_id},
+                    headers={"X-Internal-Token": settings.internal_token},
+                )
+                resp.raise_for_status()
+                api_result = resp.json()
+
+            facts = api_result.get("data", [])
+            if not facts:
+                logger.info("[MQ消费] 用户无事实，跳过反思, userId:%s", user_id)
+                return
+
+            from agents.reflection_agent import get_reflection_agent
+            from agents.base_agent import AgentInput
+
+            agent = get_reflection_agent()
+            result = await agent.run(AgentInput(
+                user_message="请分析用户画像",
+                session_id=str(user_id),
+                context={"facts": facts, "user_id": user_id}
+            ))
+
+            if result.metadata.get("status") == "ok":
+                await publish_result(channel, {
+                    "type": "reflection",
+                    "userId": user_id,
+                    "success": True,
+                    "data": {
+                        "reflections": result.metadata.get("reflections", []),
+                        "factCount": result.metadata.get("fact_count", 0),
+                    },
+                })
+                logger.info("[MQ消费] 用户画像反思完成, userId:%s", user_id)
+            else:
+                raise RuntimeError(result.metadata.get("error", "反思失败"))
+
+        except Exception as e:
+            logger.error("[MQ消费] 用户画像反思失败, userId:%s, 错误:%s", user_id, e, exc_info=True)
+            await publish_result(channel, {
+                "type": "reflection",
+                "userId": user_id,
+                "success": False,
+                "error": str(e),
+                "data": {},
+            })
+
+
 async def _declare_topology(channel: aio_pika.abc.AbstractChannel):
     """
     声明 Exchange / Queue / Binding，与 Java 端 RabbitMQConfig 保持一致。
@@ -448,7 +513,22 @@ async def _declare_topology(channel: aio_pika.abc.AbstractChannel):
     )
     await step_verify_result_q.bind(task_exchange, "task.step.verify.result")
 
-    return realtime_q, consolidate_q, knowledge_import_q, task_generate_q, step_verify_q
+    # ===== 记忆反思拓扑 =====
+
+    # 反思队列（TTL 10min）
+    reflection_q = await channel.declare_queue(
+        REFLECTION_QUEUE, durable=True,
+        arguments={"x-message-ttl": 600_000, "x-dead-letter-exchange": "memory.dlx"},
+    )
+    await reflection_q.bind(exchange, "memory.reflection")
+
+    # 反思结果队列
+    reflection_result_q = await channel.declare_queue(
+        REFLECTION_RESULT_QUEUE, durable=True,
+    )
+    await reflection_result_q.bind(exchange, "memory.reflection.result")
+
+    return realtime_q, consolidate_q, knowledge_import_q, task_generate_q, step_verify_q, reflection_q
 
 
 async def start_consumers():
@@ -456,7 +536,7 @@ async def start_consumers():
 
     # 先用一个临时通道声明拓扑
     init_channel = await connection.channel()
-    realtime_q, consolidate_q, knowledge_import_q, task_generate_q, step_verify_q = await _declare_topology(init_channel)
+    realtime_q, consolidate_q, knowledge_import_q, task_generate_q, step_verify_q, reflection_q = await _declare_topology(init_channel)
     await init_channel.close()
 
     # 实时更新通道（prefetch=5，允许并发处理多条）
@@ -499,6 +579,14 @@ async def start_consumers():
         lambda msg: handle_step_verify(msg, step_verify_channel)
     )
 
-    logger.info("[MQ消费] 消费者启动完成，监听 %s, %s, %s, %s, %s",
+    # 记忆反思通道（prefetch=1，LLM归纳耗时，串行处理）
+    reflection_channel = await connection.channel()
+    await reflection_channel.set_qos(prefetch_count=1)
+    reflection_queue = await reflection_channel.get_queue(REFLECTION_QUEUE)
+    await reflection_queue.consume(
+        lambda msg: handle_reflection(msg, reflection_channel)
+    )
+
+    logger.info("[MQ消费] 消费者启动完成，监听 %s, %s, %s, %s, %s, %s",
                 REALTIME_QUEUE, CONSOLIDATE_QUEUE, KNOWLEDGE_IMPORT_QUEUE,
-                TASK_GENERATE_QUEUE, TASK_STEP_VERIFY_QUEUE)
+                TASK_GENERATE_QUEUE, TASK_STEP_VERIFY_QUEUE, REFLECTION_QUEUE)

@@ -201,6 +201,12 @@ class BaseAgent(ABC):
                 items_str = "\n".join(f"- [{i.get('type', '未知')}] {i.get('content', i) if isinstance(i, dict) else i}" for i in items)
                 context_parts.append(f"## 待解决事项\n{items_str}")
 
+            # 用户画像
+            if input_data.context.get("user_profile"):
+                profiles = input_data.context["user_profile"]
+                profile_str = "\n".join(f"- **{p.get('type', '未知')}**: {p.get('content', '')}" for p in profiles)
+                context_parts.append(f"## 用户画像\n{profile_str}")
+
             if context_parts:
                 system_content += "\n\n---\n以下是当前对话的背景信息，请据此回答用户问题：\n\n" + "\n\n".join(context_parts)
 
