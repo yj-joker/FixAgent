@@ -13,6 +13,17 @@ def test_select_schema_sections_keeps_fault_and_parts():
     assert "前言" not in kept
 
 
+def test_select_by_content_when_title_uninformative():
+    # 上游解析器把整本手册归到无意义标题「前言」，但正文含维修内容，应按内容兜底保留
+    sections = [
+        {"section_title": "前言", "text_chunks": [{"text": "发动机过热故障的维修方法如下..."}], "tables": []},
+        {"section_title": "前言", "text_chunks": [{"text": "本公司成立于1990年，致力于..."}], "tables": []},
+    ]
+    kept = select_schema_sections(sections)
+    assert len(kept) == 1
+    assert "故障" in kept[0]["text_chunks"][0]["text"]
+
+
 def test_normalize_dedups_and_drops_empty():
     raw = {
         "components": [{"name": "主轴轴承"}, {"name": "主轴轴承"}, {"name": ""}],
