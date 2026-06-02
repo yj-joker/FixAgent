@@ -117,7 +117,7 @@ def auto_test():
             "input": "1 个工具",
             "expected": "execution_mode=react",
             "run": lambda: run_async(react_success()),
-            "check": lambda x: x["metadata"]["execution_mode"] == "react" and x["tools_used"] == ["demo_tool"],
+            "check": lambda x: x["metadata"]["execution_mode"] == "react" and x["tools_used"] == [],
         },
         {
             "name": "run_with_react_stream() 事件包含 status/token/done",

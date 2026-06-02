@@ -509,6 +509,30 @@ class ReviewAgent:
         return "输出审核：3层确定性校验（检索依据/图谱路径/安全规则）"
 
     @staticmethod
+    def _skipped_grounding() -> Dict[str, Any]:
+        return {
+            "skipped": True,
+            "reason": "review_level skips grounding check",
+            "unverified_claims": [],
+            "verified_claims": [],
+            "total_claims": 0,
+            "verified_count": 0,
+            "unverified_count": 0,
+        }
+
+    @staticmethod
+    def _skipped_graph() -> Dict[str, Any]:
+        return {
+            "skipped": True,
+            "reason": "review_level skips graph check",
+            "unverified_paths": [],
+            "verified_paths": [],
+            "total_paths": 0,
+            "verified_count": 0,
+            "unverified_count": 0,
+        }
+
+    @staticmethod
     def _move_unverified_critical_lines(message: str, grounding: Dict[str, Any]) -> tuple[str, List[str]]:
         """Remove unsupported high-risk lines from formal guidance for separate display."""
         targets = [
@@ -552,7 +576,7 @@ class ReviewAgent:
                     values.append(value)
         return values
 
-    async def review(self, fix_output: AgentOutput) -> AgentOutput:
+    async def review(self, fix_output: AgentOutput, level: str = "full") -> AgentOutput:
         """
         对 FixAgent 输出执行 3 层校验。
 
@@ -563,13 +587,22 @@ class ReviewAgent:
         t0 = time.time()
         message = fix_output.message
         trace = fix_output.metadata.get("react_trace", [])
+        review_level = (level or "full").lower()
 
-        # 第1层和第2层可并行（互相不依赖），第3层纯 CPU 可同步
-        grounding = await _GroundingCheck.run(message, trace)
-        graph = await _GraphCheck.run(message, trace)
+        if review_level == "light":
+            grounding = self._skipped_grounding()
+            graph = self._skipped_graph()
+        elif review_level == "standard":
+            grounding = await _GroundingCheck.run(message, trace)
+            graph = self._skipped_graph()
+        else:
+            review_level = "full"
+            grounding = await _GroundingCheck.run(message, trace)
+            graph = await _GraphCheck.run(message, trace)
         safety = _SafetyCheck.run(message)
 
         verification = {
+            "review_level": review_level,
             "grounding": grounding,
             "graph": graph,
             "safety": safety,
@@ -611,7 +644,8 @@ class ReviewAgent:
 
         latency = verification["verification_latency_ms"]
         logger.info(
-            f"[review] 依据校验={grounding.get('unverified_count', 0)}/"
+            f"[review] level={review_level} "
+            f"依据校验={grounding.get('unverified_count', 0)}/"
             f"{grounding.get('total_claims', 0)} "
             f"图谱校验={graph.get('unverified_count', 0)}/"
             f"{graph.get('total_paths', 0)} "

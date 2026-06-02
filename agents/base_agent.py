@@ -182,6 +182,21 @@ class BaseAgent(ABC):
             return summary[:max_length] + "...(truncated)"
         return summary
 
+    @staticmethod
+    def _extract_tools_used_from_trace(react_trace: List[Dict[str, Any]]) -> List[str]:
+        """Extract actual tool calls from ReAct trace, preserving first-use order."""
+        tools_used: List[str] = []
+        seen = set()
+        for step in react_trace or []:
+            if step.get("action") != "tool_call":
+                continue
+            for tool_call in step.get("tool_calls") or []:
+                tool_name = tool_call.get("name")
+                if tool_name and tool_name not in seen:
+                    tools_used.append(tool_name)
+                    seen.add(tool_name)
+        return tools_used
+
     def _build_messages(self, input_data: AgentInput) -> List[Dict[str, str]]:
         """
         构建LLM消息列表（支持多轮对话历史和结构化上下文）
@@ -491,12 +506,10 @@ class BaseAgent(ABC):
                 model=model_override
             )
 
-            # 4. 记录使用的工具
-            tools_used = [t.name for t in tools]
-
             # 5. 处理响应
             intention = input_data.context.get("intention") if input_data.context else None
             react_trace = response.get("trace", [])
+            tools_used = self._extract_tools_used_from_trace(react_trace)
             output = self._process_response(
                 raw_response=response,
                 tools_used=tools_used,

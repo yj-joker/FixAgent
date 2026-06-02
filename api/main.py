@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 from functools import partial
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -34,9 +35,11 @@ from agents.review_agent import get_review_agent
 from agents.memory_agent import get_memory_agent
 from agents.base_agent import AgentInput, AgentOutput
 from services.vector_service import get_vector_service
+from services.llm_service import get_llm_service
 from tools.knowledge_retrieval_tool import get_knowledge_retrieval_tool
 from services.temporary_plan_service import get_temporary_plan_service
 from config.settings import get_settings
+from schemas.models import AgentMode
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +88,118 @@ app.add_middleware(
 )
 
 
+def _should_use_rag_fast_path(request: ChatRequest) -> bool:
+    """保守触发简单 RAG 快速路径，避免普通诊断问题误绕过 ReAct。"""
+    if request.images:
+        return False
+    context = request.context or {}
+    if context.get("disable_fast_path") or context.get("force_react"):
+        return False
+    if request.mode == AgentMode.RETRIEVAL:
+        return True
+    message = request.message or ""
+    return any(
+        keyword in message
+        for keyword in ("根据知识库", "查知识库", "知识库回答", "只查资料", "根据资料", "根据手册")
+    )
+
+
+def _evidence_item_to_text(item, index: int) -> str:
+    data = item.model_dump() if hasattr(item, "model_dump") else item
+    metadata = data.get("metadata") or {}
+    source = data.get("id") or metadata.get("document_id") or f"evidence-{index}"
+    score = data.get("score", "")
+    content = data.get("content") or data.get("text") or ""
+    page = metadata.get("page_number") or metadata.get("page")
+    page_text = f", page={page}" if page else ""
+    return f"[证据{index}] source={source}, score={score}{page_text}\n{content}"
+
+
+async def _run_rag_fast_path(request: ChatRequest) -> AgentOutput | None:
+    """执行 RAG -> 单次 LLM 生成的轻量链路；失败时返回 None 交给 ReAct 回退。"""
+    total_t0 = time.time()
+    retrieval_t0 = time.time()
+    retrieval = await get_knowledge_retrieval_tool().run(
+        query=request.message,
+        top_k=5,
+    )
+    retrieval_ms = int((time.time() - retrieval_t0) * 1000)
+    if not retrieval.success or not retrieval.data:
+        logger.warning(
+            "[chat][fast_path] session=%s retrieval failed_or_empty duration_ms=%s error=%s",
+            request.session_id,
+            retrieval_ms,
+            retrieval.error,
+        )
+        return None
+
+    evidence_items = retrieval.data
+    evidence_text = "\n\n".join(
+        _evidence_item_to_text(item, idx)
+        for idx, item in enumerate(evidence_items, start=1)
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是设备检修知识库问答助手。必须基于给定知识库证据回答；"
+                "证据不足时明确说明不足，不要编造参数、型号或操作步骤。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"用户问题：{request.message}\n\n"
+                f"知识库证据：\n{evidence_text}\n\n"
+                "请用中文回答，必要时列出依据和不确定点。"
+            ),
+        },
+    ]
+
+    llm_t0 = time.time()
+    response = await get_llm_service().chat(messages=messages, temperature=0.1)
+    llm_ms = int((time.time() - llm_t0) * 1000)
+    total_ms = int((time.time() - total_t0) * 1000)
+
+    trace = [{
+        "iteration": 1,
+        "action": "tool_call",
+        "duration_ms": retrieval_ms,
+        "tool_calls": [{
+            "name": "knowledge_retrieval",
+            "arguments": {"query": request.message, "top_k": 5},
+            "result_summary": str(evidence_items)[:200],
+            "result_data": [item.model_dump() if hasattr(item, "model_dump") else item for item in evidence_items],
+        }],
+    }]
+    logger.info(
+        "[chat][fast_path] session=%s retrieval_ms=%s llm_ms=%s total_ms=%s evidence_count=%s",
+        request.session_id,
+        retrieval_ms,
+        llm_ms,
+        total_ms,
+        len(evidence_items),
+    )
+
+    return AgentOutput(
+        agent_name="fix_agent",
+        message=response.get("content", ""),
+        tools_used=["knowledge_retrieval"],
+        metadata={
+            "execution_mode": "rag_fast_path",
+            "react_trace": trace,
+            "react_iterations": 1,
+            "phase_timings_ms": {
+                "retrieval": retrieval_ms,
+                "llm_generation": llm_ms,
+                "fast_path_total": total_ms,
+            },
+        },
+        latency_ms=total_ms,
+        raw_response=response,
+    )
+
+
 @app.post("/ai/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
     """
@@ -96,6 +211,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     3. 返回最终结果（含校验标注和安全补充）
     """
     try:
+        chat_t0 = time.time()
         logger.info(f"[chat] 会话={request.session_id} 消息长度={len(request.message)}")
 
         input_data = AgentInput(
@@ -106,7 +222,24 @@ async def chat(request: ChatRequest) -> ChatResponse:
             context=request.context
         )
 
-        fix_result = await get_fix_agent().run_with_react(input_data)
+        fix_t0 = time.time()
+        fix_result = None
+        review_level = "full"
+        if _should_use_rag_fast_path(request):
+            fix_result = await _run_rag_fast_path(request)
+            if fix_result is not None:
+                review_level = "light"
+
+        if fix_result is None:
+            fix_result = await get_fix_agent().run_with_react(input_data)
+        fix_phase_ms = int((time.time() - fix_t0) * 1000)
+        logger.info(
+            "[chat][phase] session=%s execution_mode=%s fix_phase_ms=%s tools=%s",
+            request.session_id,
+            fix_result.metadata.get("execution_mode"),
+            fix_phase_ms,
+            fix_result.tools_used,
+        )
 
         if fix_result.metadata.get("status") == "error":
             logger.warning(f"[chat] 会话={request.session_id} 诊断Agent错误: {fix_result.metadata.get('error_detail')}")
@@ -122,15 +255,20 @@ async def chat(request: ChatRequest) -> ChatResponse:
                 ).model_dump()
             )
 
-        final_result = await get_review_agent().review(fix_result)
+        review_t0 = time.time()
+        final_result = await get_review_agent().review(fix_result, level=review_level)
+        review_phase_ms = int((time.time() - review_t0) * 1000)
 
         verification = final_result.metadata.get("verification", {})
         has_issues = final_result.metadata.get("verification_has_issues", False)
+        total_phase_ms = int((time.time() - chat_t0) * 1000)
 
         logger.info(
             f"[chat] 会话={request.session_id} 完成 "
             f"有问题={'是' if has_issues else '否'} "
-            f"耗时={final_result.latency_ms}ms"
+            f"review_level={review_level} "
+            f"fix_phase={fix_phase_ms}ms review_phase={review_phase_ms}ms total={total_phase_ms}ms "
+            f"返回耗时={final_result.latency_ms}ms"
         )
 
         return ChatResponse(
