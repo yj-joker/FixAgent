@@ -469,26 +469,28 @@ async def memory_consolidate(request: MemoryConsolidateRequest) -> MemoryConsoli
 
 
 @app.post("/ai/memory/search_facts")
-async def search_facts(query: str, top_k: int = 5, session_ids: str = ""):
+async def search_facts(query: str, top_k: int = 5, session_ids: str = "",
+                       device_type: str = "", equipment_id: str = "",
+                       site_id: str = "", task_id: str = ""):
     """
-    事实记忆向量检索接口 — 带多因子重排序
+    事实记忆向量检索接口 — 带多因子重排序 + 业务维度感知
 
     Java 端在组装对话上下文时调用此接口，
     用当前用户消息作为 query 去向量库中检索最相关的历史事实。
     检索结果会被注入到 AI 对话上下文中，让 AI 能"记住"之前的事实。
 
-    【调用链路】
-    用户发消息 → Java 端收到 → 调用本接口检索相关事实 →
-    将事实注入上下文 → 发给 AI 生成回复
-
     【两阶段排序】
     1. 粗筛：Redis KNN 取 top_k * 3 候选
-    2. 精排：FactReranker 多因子综合排序（语义 + 新近性 + 重要度 + 频率 + 置信度）
+    2. 精排：FactReranker 多因子综合排序（语义 + 新近性 + 重要度 + 频率 + 置信度 + 业务匹配）
 
     Args:
         query: 用户当前发送的消息文本，用于语义匹配
         top_k: 最多返回几条最相关的事实，默认5条
         session_ids: 当前用户的会话ID列表，逗号分隔。用于过滤非本用户的事实
+        device_type: 当前设备类型（可选，用于业务维度加权）
+        equipment_id: 当前设备ID（可选）
+        site_id: 当前场地ID（可选）
+        task_id: 当前检修任务ID（可选）
 
     Returns:
         {"facts": [{"doc_id": "fact:xxx", "content": "...", "score": 0.85, "final_score": 0.72, ...}, ...]}
@@ -522,8 +524,20 @@ async def search_facts(query: str, top_k: int = 5, session_ids: str = ""):
                 continue
             candidates.append(r)
 
-        # 精排：多因子重排序
-        ranked = rerank(candidates, top_k=top_k)
+        # 构建业务上下文
+        business_context = {}
+        if device_type:
+            business_context["device_type"] = device_type
+        if equipment_id:
+            business_context["equipment_id"] = equipment_id
+        if site_id:
+            business_context["site_id"] = site_id
+        if task_id:
+            business_context["task_id"] = task_id
+
+        # 精排：多因子重排序（含业务维度）
+        ranked = rerank(candidates, top_k=top_k,
+                        business_context=business_context or None)
 
         # 格式化输出
         facts = []
