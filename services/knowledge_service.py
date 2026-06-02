@@ -23,6 +23,7 @@ from embeddings.image_embedding import get_image_embedding
 from services.file_storage import get_file_storage
 from services.image_summary_service import get_image_summary_service
 from services.vector_service import get_vector_service
+from services.manual_graph_extractor import select_schema_sections
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,8 @@ class KnowledgeService:
         manual_type: Optional[str] = None,
         document_version: Optional[str] = None,
         replace_existing: bool = False,
-        old_document_id: Optional[str] = None
+        old_document_id: Optional[str] = None,
+        manual_id: Optional[int] = None
     ) -> dict:
         try:
             return await self._import_document_impl(
@@ -66,6 +68,7 @@ class KnowledgeService:
                 document_version=document_version,
                 replace_existing=replace_existing,
                 old_document_id=old_document_id,
+                manual_id=manual_id,
             )
         except Exception as exc:
             if document_id:
@@ -90,7 +93,8 @@ class KnowledgeService:
         manual_type: Optional[str] = None,
         document_version: Optional[str] = None,
         replace_existing: bool = False,
-        old_document_id: Optional[str] = None
+        old_document_id: Optional[str] = None,
+        manual_id: Optional[int] = None
     ) -> dict:
         """
         导入文档：解析 → 向量化 → 入库
@@ -320,6 +324,17 @@ class KnowledgeService:
                 image_count += 1
 
         t1 = time.time()
+        kg_sections = [
+            {
+                "section_title": s.get("section_title", ""),
+                "text_chunks": [
+                    {"text": (c.get("text") if isinstance(c, dict) else str(c))}
+                    for c in s.get("text_chunks", [])
+                ],
+                "tables": [{"rows": t.get("rows", [])} for t in s.get("tables", [])],
+            }
+            for s in select_schema_sections(sections)
+        ]
         self.vector_svc.put_document_manifest(document_id, {
             **common_metadata,
             "status": "ready",
@@ -330,6 +345,9 @@ class KnowledgeService:
             "image_count": image_count,
             "image_summary_count": image_summary_count,
             "table_count": table_count,
+            "kg_status": "pending",
+            "kg_sections": kg_sections,
+            "manual_id": manual_id,
         })
 
         return {

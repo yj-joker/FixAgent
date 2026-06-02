@@ -33,6 +33,8 @@ KNOWLEDGE_EXCHANGE = "knowledge.exchange"
 KNOWLEDGE_IMPORT_QUEUE = "knowledge.import.queue"
 KNOWLEDGE_RESULT_KEY = "knowledge.result"
 KNOWLEDGE_RESULT_QUEUE = "knowledge.result.queue"
+KNOWLEDGE_KG_EXTRACT_KEY = "knowledge.kg.extract"
+KNOWLEDGE_KG_EXTRACT_QUEUE = "knowledge.kg.extract.queue"
 
 # ===== 检修任务队列 =====
 TASK_EXCHANGE = "task.exchange"
@@ -221,6 +223,7 @@ async def handle_knowledge_import(message: aio_pika.abc.AbstractIncomingMessage,
         manual_type = body.get("manualType")
         old_document_id = body.get("oldDocumentId")
         replace_existing = body.get("replaceExisting", False)
+        manual_id = body.get("manualId")
         logger.info("[MQ消费] 知识导入开始, documentId=%s, oldDocumentId=%s, version=%s",
                     document_id, old_document_id, document_version)
 
@@ -238,6 +241,7 @@ async def handle_knowledge_import(message: aio_pika.abc.AbstractIncomingMessage,
                 document_version=document_version,
                 replace_existing=replace_existing,
                 old_document_id=old_document_id,
+                manual_id=manual_id,
             )
 
             await publish_result(channel, {
@@ -258,6 +262,13 @@ async def handle_knowledge_import(message: aio_pika.abc.AbstractIncomingMessage,
             logger.info("[MQ消费] 知识导入完成, documentId=%s, text=%s, image=%s, table=%s",
                         document_id, result.get("text_count", 0),
                         result.get("image_count", 0), result.get("table_count", 0))
+
+            if manual_id is not None:
+                await publish_result(channel, {
+                    "manualId": manual_id,
+                    "documentId": document_id,
+                    "deviceType": device_type,
+                }, exchange_name=KNOWLEDGE_EXCHANGE, routing_key=KNOWLEDGE_KG_EXTRACT_KEY)
 
         except Exception as e:
             logger.error("[MQ消费] 知识导入失败, documentId=%s, 错误:%s", document_id, e, exc_info=True)
@@ -479,6 +490,13 @@ async def _declare_topology(channel: aio_pika.abc.AbstractChannel):
         KNOWLEDGE_RESULT_QUEUE, durable=True,
     )
     await knowledge_result_q.bind(knowledge_exchange, "knowledge.result")
+
+    # KG 图谱抽取队列（TTL 30min，抽取+回写耗时长）
+    knowledge_kg_extract_q = await channel.declare_queue(
+        KNOWLEDGE_KG_EXTRACT_QUEUE, durable=True,
+        arguments={"x-message-ttl": 1_800_000, "x-dead-letter-exchange": "memory.dlx"},
+    )
+    await knowledge_kg_extract_q.bind(knowledge_exchange, KNOWLEDGE_KG_EXTRACT_KEY)
 
     # ===== 检修任务拓扑 =====
     task_exchange = await channel.declare_exchange(
