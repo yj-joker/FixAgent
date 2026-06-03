@@ -1,4 +1,24 @@
-from services.manual_graph_extractor import select_schema_sections, normalize_graph_data
+import asyncio
+
+from services.manual_graph_extractor import (
+    select_schema_sections, normalize_graph_data, extract_graph_data,
+)
+
+
+class _FakeLLM:
+    """模拟 llm_service.chat() 的非流式返回（dict，含 content 字段）。"""
+
+    async def chat(self, messages):
+        return {"content": '{"components":[{"name":"气缸"}],"faults":[],"solutions":[]}', "usage": {}}
+
+
+def test_extract_handles_dict_chat_return():
+    # chat() 返回 dict 而非字符串时，抽取仍应取出 content 并解析出实体
+    sections = [{"section_title": "拆装说明",
+                 "text_chunks": [{"text": "气缸的维修与拆卸方法：先拆卸故障部件再安装新件。" * 2}],
+                 "tables": []}]
+    gd = asyncio.run(extract_graph_data(_FakeLLM(), sections, manual_id=1, document_id="d", device_names=[]))
+    assert any(c["name"] == "气缸" for c in gd["components"])
 
 
 def test_select_schema_sections_keeps_fault_and_parts():

@@ -77,9 +77,11 @@ async def _extract_content(llm_service, title: str, content: str) -> Dict[str, A
         {"role": "user", "content": f"【章节】{title}\n{content}"},
     ]
     resp = await llm_service.chat(messages)
+    # chat() 非流式返回 dict({"content":...})，流式/其他实现可能直接返回字符串，两者都兼容
+    text = resp.get("content", "") if isinstance(resp, dict) else (resp or "")
     try:
-        start, end = resp.find("{"), resp.rfind("}")
-        return json.loads(resp[start:end + 1])
+        start, end = text.find("{"), text.rfind("}")
+        return json.loads(text[start:end + 1])
     except Exception as e:
         logger.warning("抽取JSON解析失败 section=%s err=%s", title, e)
         return {"components": [], "faults": [], "solutions": []}
