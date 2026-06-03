@@ -474,6 +474,21 @@ class VectorService:
             logger.error(f"get_document_manifest failed: {e}")
             return {}
 
+    def list_documents_by_kg_status(self, status: str) -> List[str]:
+        """扫描 document:* manifest，返回 kg_status 命中的 document_id 列表。"""
+        ids = []
+        for key in self.redis.scan_iter(match=f"{self.DOCUMENT_KEY_PREFIX}*", count=1000):
+            raw = self.redis.hget(key, "manifest")
+            if not raw:
+                continue
+            try:
+                m = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            except Exception:
+                continue
+            if m.get("kg_status") == status:
+                ids.append(m.get("document_id"))
+        return [i for i in ids if i]
+
     def _count_keys(self, patterns) -> int:
         keys = set()
         for pattern in patterns:
