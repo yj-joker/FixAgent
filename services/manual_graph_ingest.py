@@ -33,7 +33,9 @@ async def run_kg_extraction(manual_id, document_id: str, device_type=None) -> di
     try:
         graph_data = await extract_graph_data(
             get_llm_service(), sections, manual_id, document_id, device_names)
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # Java 入库需为每个部件/故障逐个生成向量(调百炼),大批量手册耗时可达数分钟,
+        # 超时给足，避免实际已入库却被误判失败、触发 sweeper 无谓重试
+        async with httpx.AsyncClient(timeout=300.0) as client:
             resp = await client.post(
                 f"{settings.java_service_url}/weixiu/graph/ingest",
                 json=graph_data,
