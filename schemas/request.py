@@ -46,7 +46,7 @@ ChatRequest request = ChatRequest.builder()
 """
 
 from typing import Optional, List
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 from schemas.models import AgentMode, CaseStatus
 
 
@@ -98,7 +98,7 @@ class ChatRequest(BaseModel):
     ```
     """
     session_id: str = Field(..., description="会话ID，用于追踪对话历史")
-    message: str = Field(..., min_length=1, max_length=50000, description="用户消息（当前轮纯文本）")
+    message: str = Field(default="", max_length=50000, description="用户消息（当前轮纯文本，可在仅上传图片时为空）")
     mode: AgentMode = Field(default=AgentMode.CHAT, description="运行模式")
     images: Optional[List[str]] = Field(default=None, description="图片URL列表")
     stream: bool = Field(default=True, description="是否启用流式输出")
@@ -112,6 +112,13 @@ class ChatRequest(BaseModel):
         if v and len(v) > 10:
             raise ValueError("最多支持10张图片")
         return v
+
+    @model_validator(mode="after")
+    def validate_message_or_images(self):
+        """允许纯图片提问，但不允许文本和图片同时为空。"""
+        if not (self.message or "").strip() and not self.images:
+            raise ValueError("message 和 images 不能同时为空")
+        return self
 
     model_config = ConfigDict(json_schema_extra={
         "example": {

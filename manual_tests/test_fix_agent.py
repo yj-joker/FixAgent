@@ -1,6 +1,172 @@
 from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock
 
 from test_runner import print_json, run_async, run_auto_cases, run_menu
+
+
+def test_fix_agent_injects_images_and_enhanced_query_into_retrieval_tools():
+    from agents.fix_agent import FixAgent
+
+    agent = FixAgent(MagicMock())
+    agent._current_images = ["img://spark-plug"]
+    agent._current_enhanced_query = "火花塞 电极间隙 摩托车发动机"
+
+    retrieval_kwargs = agent._customize_tool_kwargs(
+        "knowledge_retrieval",
+        {"query": "这个是什么", "top_k": 5},
+    )
+    graph_kwargs = agent._customize_tool_kwargs(
+        "graph_search_java",
+        {"fault_description": "无法启动"},
+    )
+
+    assert retrieval_kwargs["image_urls"] == ["img://spark-plug"]
+    assert "这个是什么" in retrieval_kwargs["query"]
+    assert "火花塞 电极间隙" in retrieval_kwargs["query"]
+    assert graph_kwargs["image_urls"] == ["img://spark-plug"]
+
+
+def test_fix_agent_filters_tools_by_intent_decision():
+    from agents.fix_agent import FixAgent
+
+    agent = FixAgent(MagicMock())
+    tools = []
+    for name in ["knowledge_retrieval", "graph_search_java", "procedure_recommend"]:
+        tool = MagicMock()
+        tool.name = name
+        tools.append(tool)
+    agent._tools = tools
+    agent._current_allowed_tools = ["knowledge_retrieval"]
+
+    assert [tool.name for tool in agent.get_tools()] == ["knowledge_retrieval"]
+
+    agent._current_allowed_tools = []
+    assert agent.get_tools() == []
+
+
+def test_fix_agent_reruns_once_when_tool_scope_is_insufficient():
+    from agents.base_agent import AgentInput
+    from agents.fix_agent import FixAgent
+
+    llm = MagicMock()
+    llm.chat_with_tools = AsyncMock(side_effect=[
+        {"content": "NEEDS_MORE_TOOLS: 需要图谱工具", "trace": []},
+        {"content": "已补充图谱检索后回答。", "trace": []},
+    ])
+    agent = FixAgent(llm)
+    knowledge_tool = MagicMock()
+    knowledge_tool.name = "knowledge_retrieval"
+    knowledge_tool.to_openai_schema.return_value = {"type": "function", "function": {"name": "knowledge_retrieval"}}
+    graph_tool = MagicMock()
+    graph_tool.name = "graph_search_java"
+    graph_tool.to_openai_schema.return_value = {"type": "function", "function": {"name": "graph_search_java"}}
+    agent._tools = [knowledge_tool, graph_tool]
+
+    result = run_async(agent.run_with_react(AgentInput(
+        user_message="帮我分析故障",
+        session_id="s1",
+        context={
+            "intent_decision": {
+                "intent": "knowledge_query",
+                "answer_style": "plain_conversational",
+                "allowed_tools": ["knowledge_retrieval"],
+            }
+        },
+    )))
+
+    assert result.message == "已补充图谱检索后回答。"
+    assert result.metadata["intent_rerun_with_full_tools"] is True
+    assert llm.chat_with_tools.call_count == 2
+
+
+def test_fix_agent_reruns_once_for_structured_needs_more_tools_status():
+    from agents.base_agent import AgentInput
+    from agents.fix_agent import FixAgent
+
+    llm = MagicMock()
+    llm.chat_with_tools = AsyncMock(side_effect=[
+        {
+            "content": (
+                '{"status":"needs_more_tools",'
+                '"needed_tools":["graph_search_java"],'
+                '"reason":"需要图谱确认部件和故障路径"}'
+            ),
+            "trace": [],
+        },
+        {"content": "已使用扩展工具完成回答。", "trace": []},
+    ])
+    agent = FixAgent(llm)
+    knowledge_tool = MagicMock()
+    knowledge_tool.name = "knowledge_retrieval"
+    knowledge_tool.to_openai_schema.return_value = {"type": "function", "function": {"name": "knowledge_retrieval"}}
+    graph_tool = MagicMock()
+    graph_tool.name = "graph_search_java"
+    graph_tool.to_openai_schema.return_value = {"type": "function", "function": {"name": "graph_search_java"}}
+    agent._tools = [knowledge_tool, graph_tool]
+
+    result = run_async(agent.run_with_react(AgentInput(
+        user_message="启动不了怎么处理",
+        session_id="s1",
+        context={
+            "intent_decision": {
+                "intent": "maintenance_guidance",
+                "task_action": "repair_guidance",
+                "policy": {
+                    "tool_scope": ["knowledge_retrieval"],
+                    "response_style": "step_guidance",
+                    "evidence_level": "required",
+                    "safety_level": "operation",
+                },
+            }
+        },
+    )))
+
+    assert result.message == "已使用扩展工具完成回答。"
+    assert result.metadata["intent_rerun_with_full_tools"] is True
+    assert result.metadata["react_status_before_rerun"]["needed_tools"] == ["graph_search_java"]
+    assert "图谱确认" in result.metadata["intent_rerun_reason"]
+
+
+def test_fix_agent_formats_structured_user_clarification_status():
+    from agents.base_agent import AgentInput
+    from agents.fix_agent import FixAgent
+
+    llm = MagicMock()
+    llm.chat_with_tools = AsyncMock(return_value={
+        "content": (
+            '{"status":"needs_user_clarification",'
+            '"answer_mode":"general_then_ask",'
+            '"general_answer":"可以先从外观、启动、燃油、点火和压缩这几项做通用排查。",'
+            '"questions":["摩托车型号或发动机型号是什么？","主要故障现象是启动不了、异响、漏油还是过热？"],'
+            '"reason":"缺少车型和故障现象，无法生成可靠检修步骤"}'
+        ),
+        "trace": [],
+    })
+    agent = FixAgent(llm)
+    agent._tools = []
+
+    result = run_async(agent.run_with_react(AgentInput(
+        user_message="发动机坏了怎么修",
+        session_id="s1",
+        context={
+            "intent_decision": {
+                "intent": "maintenance_guidance",
+                "task_action": "repair_guidance",
+                "policy": {
+                    "tool_scope": [],
+                    "response_style": "step_guidance",
+                    "evidence_level": "required",
+                    "safety_level": "operation",
+                },
+            }
+        },
+    )))
+
+    assert result.metadata["react_status"]["status"] == "needs_user_clarification"
+    assert "可以先从外观、启动、燃油、点火和压缩" in result.message
+    assert "摩托车型号或发动机型号是什么" in result.message
+    assert "主要故障现象" in result.message
+    assert '"status"' not in result.message
 
 
 def auto_test():

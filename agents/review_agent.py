@@ -455,11 +455,35 @@ class _SafetyCheck:
         },
     ]
 
+    _OPERATION_REQUEST_PATTERNS = (
+        re.compile(r"(怎么|如何|怎样|帮我|给我|需要|要不要|能不能).{0,12}(拆|拆卸|装|安装|更换|换|维修|检修|修理|保养|诊断|排查|测量|调整|调节|清洗|处理)"),
+        re.compile(r"(拆卸|安装|更换|检修|维修|保养|诊断|排查|测量|调整|调节|清洗).{0,8}(步骤|流程|方法|教程|怎么做|怎么弄)"),
+        re.compile(r"(操作步骤|维修步骤|安装步骤|拆卸步骤|更换步骤|检修流程|标准作业|作业指引)"),
+        re.compile(r"(扭矩|力矩|通电|断电|泄压|冷却|高压线).{0,12}(怎么|如何|步骤|操作|检查|测量|拆|装|换)"),
+    )
+
     @classmethod
-    def run(cls, answer: str) -> Dict[str, Any]:
+    def _has_operation_intent(cls, text: str) -> bool:
+        return any(pattern.search(text or "") for pattern in cls._OPERATION_REQUEST_PATTERNS)
+
+    @classmethod
+    def run(cls, answer: str, user_query: Optional[str] = None) -> Dict[str, Any]:
         triggered: List[str] = []
         missing: List[Dict] = []
         append_parts: List[str] = []
+
+        intent_text = answer if user_query is None else user_query
+        if not cls._has_operation_intent(intent_text):
+            return {
+                "triggered_rules": [],
+                "missing_warnings": [],
+                "appended_text": "",
+                "checked_rules": len(cls._RULES),
+                "triggered_count": 0,
+                "missing_count": 0,
+                "skipped": True,
+                "reason": "no operation or maintenance intent",
+            }
 
         for rule in cls._RULES:
             hits = [t for t in rule["trigger"] if t in answer]
@@ -471,7 +495,8 @@ class _SafetyCheck:
                 missing.append({"rule": rule["name"], "triggered_by": hits, "missing_keywords": lacked})
                 append_parts.append(rule["warning"])
 
-        appended = "\n\n".join(append_parts) if append_parts else ""
+        max_warnings = 2
+        appended = "\n\n".join(append_parts[:max_warnings]) if append_parts else ""
         logger.info(f"[safety] 触发规则={len(triggered)} 缺失警告={len(missing)}")
         return {
             "triggered_rules": triggered,
@@ -533,6 +558,212 @@ class ReviewAgent:
         }
 
     @staticmethod
+    def _skipped_safety() -> Dict[str, Any]:
+        return {
+            "skipped": True,
+            "reason": "intent does not require safety notice",
+            "triggered_rules": [],
+            "triggered_count": 0,
+            "missing_rules": [],
+            "missing_count": 0,
+            "appended_text": "",
+        }
+
+    _UNSUPPORTED_SOURCE_MARKERS = (
+        "根据维修手册知识库检索结果",
+        "根据知识库检索结果",
+        "根据维修手册",
+        "根据《",
+        "手册第",
+        "维修手册",
+        "Honda Service Manual",
+        "Yamaha Technical Training",
+        "行业通用标准",
+        "行业标准",
+        "原厂手册",
+    )
+
+    _UNSUPPORTED_SOURCE_PATTERNS = (
+        re.compile(r"根据《[^》]+》[^。；;\n]*(?:第\s*\d+\s*页|章节|内容|原文)"),
+        re.compile(r"《[^》]+》\s*第\s*\d+\s*页"),
+        re.compile(r"(?:第\s*\d+\s*页|章节)[^。；;\n]*(?:手册|原文|内容)"),
+    )
+
+    _IDENTIFICATION_QUERY_KEYWORDS = (
+        "是什么", "认识", "识别", "这个是", "这是什么", "是不是", "什么部件",
+        "叫什么", "看一下", "帮我看看", "这是", "是啥", "像什么",
+        "一样的东西", "一样吗", "同一个东西", "同一类", "相同吗",
+        "配件吗", "部件吗", "零件吗", "属于", "上的配件", "上的部件",
+    )
+
+    _FORMAL_GUIDANCE_KEYWORDS = (
+        "正式检修结论", "装配清单", "参数值", "步骤化作业指引", "操作步骤",
+        "维修步骤", "安装步骤", "拆卸步骤", "标准化操作流程", "维修建议",
+    )
+
+    _PARAMETER_QUERY_KEYWORDS = (
+        "多少", "标准", "参数", "扭矩", "力矩", "间隙", "规格", "型号",
+        "周期", "多久", "几公里", "机油量", "电压", "压力", "温度",
+    )
+
+    _REPAIR_GUIDANCE_SECTION_PATTERN = re.compile(
+        r"(?:^|\n)#{2,4}\s*(?:[^\n]*?(?:维修建议|操作步骤|维修步骤|更换步骤|安装步骤|拆卸步骤)[^\n]*|Step\s*\d+[^\n]*)[\s\S]*$",
+        re.IGNORECASE,
+    )
+
+    _LEAKED_TOOL_JSON_KEYS = (
+        '"image_urls"',
+        '"top_k"',
+        '"component_description"',
+        '"fault_description"',
+        '"keyword"',
+        '"limit"',
+        '"category"',
+    )
+
+    _TRANSIENT_TOOL_PLANNING_PATTERNS = (
+        re.compile(r"我已收到您上传的图片[^。\n]*[。.]?(?:请稍等[。.]?)?", re.MULTILINE),
+        re.compile(r"首先，?我将使用[^。\n]*(?:检索|识别|判断)[^。\n]*[。.]?", re.MULTILINE),
+        re.compile(r"我将使用[^。\n]*(?:检索|识别|判断)[^。\n]*[。.]?", re.MULTILINE),
+    )
+
+    @classmethod
+    def _strip_leaked_tool_arguments(cls, message: str) -> str:
+        def replace_block(match: re.Match) -> str:
+            block = match.group(0)
+            if any(key in block for key in cls._LEAKED_TOOL_JSON_KEYS):
+                return ""
+            return block
+
+        cleaned = re.sub(r"```json\s*[\s\S]*?```", replace_block, message or "", flags=re.IGNORECASE)
+        for pattern in cls._TRANSIENT_TOOL_PLANNING_PATTERNS:
+            cleaned = pattern.sub("", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    @classmethod
+    def _has_retrieval_evidence(cls, trace: List[Dict]) -> bool:
+        return bool(_GroundingCheck._collect_evidence(trace))
+
+    @classmethod
+    def _is_identification_query(cls, user_message: str) -> bool:
+        return any(keyword in (user_message or "") for keyword in cls._IDENTIFICATION_QUERY_KEYWORDS)
+
+    @classmethod
+    def _requests_formal_guidance(cls, text: str) -> bool:
+        return any(keyword in (text or "") for keyword in cls._FORMAL_GUIDANCE_KEYWORDS)
+
+    @classmethod
+    def _requires_strict_evidence(cls, user_message: str, answer: str) -> bool:
+        if _SafetyCheck._has_operation_intent(user_message):
+            return True
+        if any(keyword in (user_message or "") for keyword in cls._PARAMETER_QUERY_KEYWORDS):
+            return True
+        if cls._requests_formal_guidance(answer):
+            return True
+        return False
+
+    @classmethod
+    def _strip_unsolicited_repair_guidance(cls, message: str, user_message: str) -> str:
+        if not cls._is_identification_query(user_message):
+            return message
+        if _SafetyCheck._has_operation_intent(user_message):
+            return message
+        cleaned = cls._REPAIR_GUIDANCE_SECTION_PATTERN.sub("", message or "").strip()
+        return cleaned or message
+
+    @classmethod
+    def _should_block_for_insufficient_evidence(
+        cls,
+        grounding: Dict[str, Any],
+        trace: List[Dict],
+        user_message: str = "",
+        answer: str = "",
+    ) -> bool:
+        total_claims = grounding.get("total_claims", 0) or 0
+        if total_claims <= 0:
+            return False
+        if cls._has_retrieval_evidence(trace):
+            return False
+        if cls._is_identification_query(user_message):
+            return False
+        if not cls._requires_strict_evidence(user_message, answer):
+            return False
+        return grounding.get("unverified_count", 0) >= total_claims
+
+    @staticmethod
+    def _clean_pending_text(text: str) -> str:
+        value = (text or "").strip()
+        value = re.sub(r"^[\-*#>\s]+", "", value)
+        value = re.sub(r"\*\*([^*]+)\*\*", r"\1", value)
+        value = re.sub(r"`([^`]+)`", r"\1", value)
+        value = re.sub(r"\s+", " ", value).strip()
+        return value[:140] + "..." if len(value) > 140 else value
+
+    @classmethod
+    def _format_pending_items(cls, items: List[str], max_items: int = 3) -> str:
+        cleaned: List[str] = []
+        for item in items:
+            text = cls._clean_pending_text(item)
+            if text and text not in cleaned:
+                cleaned.append(text)
+        if not cleaned:
+            return ""
+        visible = cleaned[:max_items]
+        lines = [f"- {text}" for text in visible]
+        hidden = len(cleaned) - len(visible)
+        if hidden > 0:
+            lines.append(f"- 另有 {hidden} 条未展示")
+        return "\n".join(lines)
+
+    @classmethod
+    def _should_show_pending_section(cls, user_message: str, answer: str, held_items: List[str]) -> bool:
+        if not held_items:
+            return False
+        return cls._requires_strict_evidence(user_message, answer)
+
+    @staticmethod
+    def _insufficient_evidence_message() -> str:
+        return (
+            "当前知识库未检索到可支撑该回答的维修手册依据，暂不能生成正式检修结论、"
+            "装配清单、参数值或步骤化作业指引。\n\n"
+            "请补充具体设备型号、发动机型号，或上传对应维修手册后再查询。"
+        )
+
+    @classmethod
+    def _is_unsupported_source_claim(cls, sentence: str) -> bool:
+        return (
+            any(marker in sentence for marker in cls._UNSUPPORTED_SOURCE_MARKERS)
+            or any(pattern.search(sentence) for pattern in cls._UNSUPPORTED_SOURCE_PATTERNS)
+        )
+
+    @classmethod
+    def _move_unverified_source_claims(cls, message: str, grounding: Dict[str, Any]) -> tuple[str, List[str]]:
+        """Remove unsupported source-attribution sentences from formal output."""
+        targets = [
+            item.get("sentence", "").strip()
+            for item in grounding.get("unverified_claims", [])
+            if cls._is_unsupported_source_claim(item.get("sentence", ""))
+        ]
+        if not targets:
+            return message, []
+
+        updated = message
+        removed: List[str] = []
+        for target in targets:
+            if not target:
+                continue
+            pattern = re.escape(target) + r"[。；;]?"
+            updated_next = re.sub(pattern, "", updated, count=1).strip()
+            if updated_next != updated:
+                clean = target.strip().lstrip("-* ").strip()
+                if clean not in removed:
+                    removed.append(clean)
+                updated = updated_next
+
+        return updated.strip(), removed
+
+    @staticmethod
     def _move_unverified_critical_lines(message: str, grounding: Dict[str, Any]) -> tuple[str, List[str]]:
         """Remove unsupported high-risk lines from formal guidance for separate display."""
         targets = [
@@ -585,21 +816,45 @@ class ReviewAgent:
             metadata.verification 包含3层完整结果。
         """
         t0 = time.time()
-        message = fix_output.message
+        message = _OutputSanitizer.sanitize(fix_output.message)
         trace = fix_output.metadata.get("react_trace", [])
+        user_message = fix_output.metadata.get("user_message", "") or fix_output.metadata.get("query", "")
+        intent_decision = fix_output.metadata.get("intent_decision") or {}
+        intent_policy = intent_decision.get("policy") or {}
         review_level = (level or "full").lower()
+        intent_name = intent_decision.get("intent")
+        intent_requires_manual_evidence = intent_decision.get("requires_manual_evidence")
+        intent_requires_safety_notice = intent_decision.get("requires_safety_notice")
+        evidence_level = intent_policy.get("evidence_level")
+        safety_level = intent_policy.get("safety_level")
+        strict_evidence_required = (
+            evidence_level == "required"
+            if evidence_level is not None
+            else bool(intent_requires_manual_evidence)
+            if intent_requires_manual_evidence is not None
+            else self._requires_strict_evidence(user_message, message)
+        )
+        safety_required = (
+            safety_level != "none"
+            if safety_level is not None
+            else bool(intent_requires_safety_notice)
+            if intent_requires_safety_notice is not None
+            else True
+        )
+        skip_grounding_for_intent = intent_name == "chat_social"
 
-        if review_level == "light":
-            grounding = self._skipped_grounding()
-            graph = self._skipped_graph()
-        elif review_level == "standard":
-            grounding = await _GroundingCheck.run(message, trace)
-            graph = self._skipped_graph()
-        else:
-            review_level = "full"
-            grounding = await _GroundingCheck.run(message, trace)
-            graph = await _GraphCheck.run(message, trace)
-        safety = _SafetyCheck.run(message)
+        evidence = await _EvidenceVerifier.verify(
+            message,
+            trace,
+            review_level=review_level,
+            skip_grounding=skip_grounding_for_intent,
+        )
+        review_level = evidence["review_level"]
+        grounding = evidence["grounding"]
+        graph = evidence["graph"]
+        safety = _SafetyReviewer.review(message, user_message=user_message, policy=intent_policy)
+        if not safety_required:
+            safety = self._skipped_safety()
 
         verification = {
             "review_level": review_level,
@@ -615,32 +870,42 @@ class ReviewAgent:
             safety.get("missing_count", 0) > 0
         )
 
-        final_message, held_for_confirmation = self._move_unverified_critical_lines(message, grounding)
-        sections = [final_message]
-        confirmed_values = self._confirmed_critical_values(grounding)
-        if confirmed_values:
-            confirmed_lines = "\n".join(f"- {value}" for value in confirmed_values)
-            sections.append(
-                "## 已核对关键值\n"
-                "以下数值或型号可在当前知识依据中找到明确匹配：\n"
-                f"{confirmed_lines}"
+        blocked_for_insufficient_evidence = False
+        if strict_evidence_required:
+            blocked_for_insufficient_evidence = self._should_block_for_insufficient_evidence(
+                grounding,
+                trace,
+                user_message=user_message,
+                answer=message,
             )
-        if held_for_confirmation:
-            pending_lines = "\n".join(f"- {text}" for text in held_for_confirmation)
-            sections.append(
-                "## 待确认信息\n"
-                "以下关键内容未在当前知识依据中找到明确出处，已从正式指引中移出：\n"
-                f"{pending_lines}"
-            )
+        if blocked_for_insufficient_evidence:
+            final_message = self._insufficient_evidence_message()
+            held_for_confirmation = [
+                item.get("sentence", "").strip()
+                for item in grounding.get("unverified_claims", [])
+                if item.get("sentence", "").strip()
+            ]
+        else:
+            final_message = self._strip_unsolicited_repair_guidance(message, user_message)
+            final_message, source_held = self._move_unverified_source_claims(final_message, grounding)
+            final_message, critical_held = self._move_unverified_critical_lines(final_message, grounding)
+            held_for_confirmation = source_held + [
+                item for item in critical_held if item not in source_held
+            ]
+        confirmed_values = self._confirmed_critical_values(grounding) if strict_evidence_required else []
+        pending_lines = ""
+        if strict_evidence_required and held_for_confirmation:
+            pending_lines = self._format_pending_items(held_for_confirmation)
+            if not self._should_show_pending_section(user_message, message, held_for_confirmation):
+                pending_lines = ""
 
-        appended = safety.get("appended_text", "")
-        if appended:
-            sections.append(
-                "## 系统通用安全提醒\n"
-                "以下提醒来自系统预设安全规则，不代表当前手册原文：\n\n"
-                f"{appended}"
-            )
-        final_message = "\n\n".join(section for section in sections if section)
+        final_message = _ResponseComposer.compose(
+            base_message=final_message,
+            safety=safety,
+            policy=intent_policy,
+            confirmed_values=confirmed_values,
+            pending_lines=pending_lines,
+        )
 
         latency = verification["verification_latency_ms"]
         logger.info(
@@ -663,6 +928,7 @@ class ReviewAgent:
                 **fix_output.metadata,
                 "verification": verification,
                 "verification_has_issues": has_issues,
+                "blocked_for_insufficient_evidence": blocked_for_insufficient_evidence,
                 "held_for_confirmation": held_for_confirmation,
                 "total_latency_ms": fix_output.latency_ms + latency,
             },
@@ -723,6 +989,121 @@ class ReviewAgent:
 
         markers.sort(key=lambda m: m["char_pos"])
         return markers
+
+
+class _OutputSanitizer:
+    """Clean model output before verification and composition."""
+
+    @staticmethod
+    def sanitize(message: str) -> str:
+        return ReviewAgent._strip_leaked_tool_arguments(message or "")
+
+
+class _SafetyReviewer:
+    """Apply deterministic safety rules only when policy requires them."""
+
+    @staticmethod
+    def review(answer: str, user_message: str, policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        policy = policy or {}
+        if policy.get("safety_level") == "none":
+            return ReviewAgent._skipped_safety()
+        return _SafetyCheck.run(answer, user_query=user_message)
+
+
+class _EvidenceVerifier:
+    """Run evidence verification according to review level."""
+
+    @staticmethod
+    def _skipped_grounding() -> Dict[str, Any]:
+        return ReviewAgent._skipped_grounding()
+
+    @staticmethod
+    def _skipped_graph() -> Dict[str, Any]:
+        return ReviewAgent._skipped_graph()
+
+    @classmethod
+    async def verify(
+        cls,
+        answer: str,
+        trace: List[Dict[str, Any]],
+        review_level: str = "full",
+        skip_grounding: bool = False,
+    ) -> Dict[str, Any]:
+        level = (review_level or "full").lower()
+        if level == "light" or skip_grounding:
+            grounding = cls._skipped_grounding()
+            graph = cls._skipped_graph()
+        elif level == "standard":
+            grounding = await _GroundingCheck.run(answer, trace)
+            graph = cls._skipped_graph()
+        else:
+            level = "full"
+            grounding = await _GroundingCheck.run(answer, trace)
+            graph = await _GraphCheck.run(answer, trace)
+        return {
+            "review_level": level,
+            "grounding": grounding,
+            "graph": graph,
+        }
+
+
+class _ResponseComposer:
+    """Compose the final user-visible response from reviewed sections."""
+
+    @staticmethod
+    def compose(
+        base_message: str,
+        safety: Optional[Dict[str, Any]] = None,
+        policy: Optional[Dict[str, Any]] = None,
+        confirmed_values: Optional[List[str]] = None,
+        pending_lines: str = "",
+    ) -> str:
+        policy = policy or {}
+        base_message = _ResponseComposer._format_base_message(base_message, policy)
+        sections = [base_message]
+        confirmed_values = confirmed_values or []
+        if confirmed_values:
+            confirmed_lines = "\n".join(f"- {value}" for value in confirmed_values)
+            sections.append(
+                "## 已核对关键值\n"
+                "以下数值或型号可在当前知识依据中找到明确匹配：\n"
+                f"{confirmed_lines}"
+            )
+        if pending_lines:
+            sections.append("待确认信息：\n" f"{pending_lines}")
+
+        appended = (safety or {}).get("appended_text", "")
+        if appended:
+            sections.append("安全提醒：\n" f"{appended}")
+
+        return "\n\n".join(section for section in sections if section)
+
+    @staticmethod
+    def _format_base_message(message: str, policy: Dict[str, Any]) -> str:
+        style = policy.get("response_style") or "plain_conversational"
+        text = (message or "").strip()
+        if style not in {"plain_conversational", "document_explanation"}:
+            return text
+
+        lines: List[str] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            line = re.sub(r"^#{1,6}\s*", "", line)
+            line = re.sub(r"^[\-*]\s*", "", line)
+            line = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
+            line = re.sub(r"`([^`]+)`", r"\1", line)
+            if line:
+                lines.append(line)
+
+        if not lines:
+            return ""
+        if style == "plain_conversational":
+            compact = " ".join(lines)
+            compact = re.sub(r"\s+", " ", compact).strip()
+            return compact
+        return "\n".join(lines)
 
 
 # ====================================================================

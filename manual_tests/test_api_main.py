@@ -4,6 +4,100 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from test_runner import ask, print_json, run_async, run_auto_cases, run_menu
 
 
+def test_chat_request_allows_image_only_and_rejects_empty_request():
+    import pytest
+    from pydantic import ValidationError
+    from schemas.request import ChatRequest
+
+    request = ChatRequest(session_id="s1", message="", images=["data:image/png;base64,abc"])
+
+    assert request.message == ""
+    assert request.images == ["data:image/png;base64,abc"]
+
+    with pytest.raises(ValidationError):
+        ChatRequest(session_id="s1", message="", images=[])
+
+
+def test_chat_image_only_uses_default_prompt_and_enhanced_query():
+    import api.main as main
+    from agents.base_agent import AgentOutput
+    from schemas.request import ChatRequest
+
+    captured = {}
+
+    image_summary_service = MagicMock()
+    image_summary_service.understand_user_image = AsyncMock(
+        return_value={
+            "image_title": "火花塞结构图",
+            "image_summary": "图片中是摩托车发动机火花塞，标注 a 表示电极间隙。",
+            "keywords": ["火花塞", "电极间隙", "摩托车发动机"],
+            "summary_source": "multimodal_llm",
+        }
+    )
+    image_summary_service.summarize = AsyncMock(return_value={})
+
+    fix_agent = MagicMock()
+
+    async def run_with_react(input_data):
+        captured["input_data"] = input_data
+        return AgentOutput(
+            agent_name="fix_agent",
+            message="从图片看，这是火花塞。",
+            tools_used=["knowledge_retrieval"],
+            metadata={"status": "ok"},
+            latency_ms=10,
+        )
+
+    fix_agent.run_with_react = run_with_react
+    review_agent = MagicMock()
+    review_agent.review = AsyncMock(
+        return_value=AgentOutput(
+            agent_name="review_agent",
+            message="从图片看，这是火花塞。",
+            tools_used=["knowledge_retrieval"],
+            metadata={"verification_has_issues": False, "verification": {}},
+            latency_ms=20,
+        )
+    )
+
+    router = MagicMock()
+    router.classify = AsyncMock(return_value=MagicMock(
+        requires_image_understanding=True,
+        intent="visual_identification",
+        model_dump=lambda: {
+            "intent": "visual_identification",
+            "requires_image_understanding": True,
+            "requires_manual_evidence": False,
+            "requires_safety_notice": False,
+            "allowed_tools": ["knowledge_retrieval", "graph_search_java"],
+        },
+    ))
+
+    with patch.object(main, "get_intent_router", return_value=router), patch.object(
+        main, "get_image_summary_service", return_value=image_summary_service
+    ), patch.object(
+        main, "get_fix_agent", return_value=fix_agent
+    ), patch.object(main, "get_review_agent", return_value=review_agent):
+        response = run_async(main.chat(ChatRequest(session_id="s1", message="", images=["img://spark-plug"])))
+
+    input_data = captured["input_data"]
+    assert "请识别图片中的设备或部件" in input_data.user_message
+    assert input_data.images == ["img://spark-plug"]
+    assert "火花塞" in input_data.context["enhanced_retrieval_query"]
+    assert input_data.context["intent_decision"]["intent"] == "visual_identification"
+    assert input_data.context["image_understanding"]["summaries"][0]["image_title"] == "火花塞结构图"
+    assert response.message == "从图片看，这是火花塞。"
+
+
+def test_search_facts_empty_query_returns_empty_result_without_embedding_call():
+    import api.main as main
+
+    response = run_async(main.search_facts(query="", top_k=5))
+
+    assert response["facts"] == []
+    assert response["query_time_ms"] == 0
+
+
 def auto_test():
     import api.main as main
     from agents.base_agent import AgentOutput

@@ -23,8 +23,9 @@ api/main.py → FixAgent.run_with_react() → chat_with_tools() → 工具调用
 - 下游：ReviewAgent 对输出做最终校验
 """
 
+import json
 import logging
-from typing import List, Any
+from typing import List, Any, Optional, Dict
 
 from agents.base_agent import BaseAgent, AgentInput, AgentOutput
 
@@ -160,6 +161,9 @@ FIX_AGENT_SYSTEM_PROMPT = """你是一名专业的设备检修AI助手，具备�
 - 调用 graph_search_java 时必须将图片URL通过 image_urls 参数传入，启用图片向量检索
 - 调用 knowledge_retrieval 时也必须将图片URL通过 image_urls 参数传入，启用图文混合检索
 - 同时结合图片内容和文本描述进行综合分析
+- 工具调用必须通过系统提供的 function calling 完成，禁止在最终回答中展示工具参数 JSON、image_urls、top_k、component_description 等内部调用参数。
+- 当用户只是在问“这是什么 / 是否同一类 / 是否是某设备配件”时，只回答识别、对比和所属系统；不要主动生成拆装步骤、维修建议、扭矩、间隙标准或更换周期，除非用户明确追问。
+- 当用户是寒暄、自我介绍、学习交流或职业转型聊天时，用自然短段落回答，最多给一个追问；不要输出表格、大标题、长项目符号清单或系统安全提醒。只有用户明确要求检修步骤、参数表或正式方案时，才使用结构化标题和列表。
 """
 
 
@@ -177,6 +181,8 @@ class FixAgent(BaseAgent):
     def __init__(self, llm_service):
         super().__init__(llm_service)
         self._tools = None
+        self._current_intent_decision: Optional[Dict[str, Any]] = None
+        self._current_allowed_tools: Optional[List[str]] = None
 
     @property
     def name(self) -> str:
@@ -187,7 +193,25 @@ class FixAgent(BaseAgent):
         return "设备检修AI助手：知识检索、故障诊断、维修指引"
 
     def get_system_prompt(self) -> str:
-        return FIX_AGENT_SYSTEM_PROMPT
+        prompt = FIX_AGENT_SYSTEM_PROMPT
+        decision = self._current_intent_decision or {}
+        policy = decision.get("policy") or {}
+        if decision:
+            prompt += (
+                "\n\n## 当前意图路由\n"
+                f"- intent: {decision.get('intent')}\n"
+                f"- task_action: {decision.get('task_action')}\n"
+                f"- response_style: {policy.get('response_style') or decision.get('answer_style')}\n"
+                f"- evidence_level: {policy.get('evidence_level')}\n"
+                f"- safety_level: {policy.get('safety_level')}\n"
+                f"- allow_visual_answer_without_manual: "
+                f"{policy.get('allow_visual_answer_without_manual', decision.get('allow_visual_answer_without_manual'))}\n"
+                "\n请按当前意图调整回答风格。若当前工具不足以完成用户问题，"
+                "输出 JSON："
+                "`{\"status\":\"needs_more_tools\",\"needed_tools\":[\"工具名\"],\"reason\":\"原因\"}`。"
+                "不要编造工具结果。"
+            )
+        return prompt
 
     def get_tools(self) -> List[Any]:
         if self._tools is None:
@@ -204,12 +228,25 @@ class FixAgent(BaseAgent):
                 get_conversation_detail_tool(),
                 get_procedure_recommend_tool(),
             ]
-        return self._tools
+        allowed = self._current_allowed_tools
+        if allowed is None:
+            return self._tools
+        allowed_set = set(allowed)
+        return [tool for tool in self._tools if tool.name in allowed_set]
 
     def _customize_tool_kwargs(self, tool_name: str, kwargs: dict) -> dict:
         """为 recall_conversation_detail 注入 user_id"""
         if tool_name == "recall_conversation_detail" and hasattr(self, "_current_user_id"):
             kwargs["user_id"] = self._current_user_id or ""
+        if tool_name in ("knowledge_retrieval", "graph_search_java"):
+            images = getattr(self, "_current_images", None)
+            if images and not kwargs.get("image_urls"):
+                kwargs["image_urls"] = images
+        if tool_name == "knowledge_retrieval":
+            enhanced_query = getattr(self, "_current_enhanced_query", None)
+            if enhanced_query:
+                query = str(kwargs.get("query") or "").strip()
+                kwargs["query"] = enhanced_query if not query else f"{query} {enhanced_query}"
         return kwargs
 
     async def run_with_react(self, input_data: AgentInput, max_iterations: int = 10) -> AgentOutput:
@@ -217,19 +254,116 @@ class FixAgent(BaseAgent):
         重写 ReAct 入口，提取 user_id 供 recall_conversation_detail 工具使用。
         """
         self._current_user_id = None
+        self._current_images = input_data.images or []
+        self._current_enhanced_query = None
+        self._current_intent_decision = None
+        self._current_allowed_tools = None
         if input_data.context and input_data.context.get("user_id"):
             self._current_user_id = str(input_data.context["user_id"])
+        if input_data.context and input_data.context.get("enhanced_retrieval_query"):
+            self._current_enhanced_query = str(input_data.context["enhanced_retrieval_query"])
+        if input_data.context and input_data.context.get("intent_decision"):
+            self._current_intent_decision = dict(input_data.context["intent_decision"])
+            policy = self._current_intent_decision.get("policy") or {}
+            allowed_tools = policy.get("tool_scope") or self._current_intent_decision.get("allowed_tools")
+            if isinstance(allowed_tools, list):
+                self._current_allowed_tools = [str(name) for name in allowed_tools]
 
-        return await super().run_with_react(input_data, max_iterations)
+        output = await super().run_with_react(input_data, max_iterations)
+        if self._current_intent_decision:
+            output.metadata["intent_decision"] = self._current_intent_decision
+
+        react_status = self._parse_react_status(output.message)
+        if react_status:
+            output.metadata["react_status"] = react_status
+            if react_status.get("status") == "needs_user_clarification":
+                output.message = self._format_user_clarification_message(react_status)
+
+        if self._needs_more_tools(output) and self._current_allowed_tools is not None:
+            logger.info("[fix_agent] intent tool scope insufficient, rerunning once with full tools")
+            self._current_allowed_tools = None
+            rerun = await super().run_with_react(input_data, max_iterations)
+            rerun.metadata["intent_decision"] = self._current_intent_decision or {}
+            rerun.metadata["intent_rerun_reason"] = react_status.get("reason") if react_status else output.message
+            if react_status:
+                rerun.metadata["react_status_before_rerun"] = react_status
+            rerun.metadata["intent_rerun_with_full_tools"] = True
+            return rerun
+
+        return output
 
     async def run_with_react_stream(self, input_data: AgentInput, max_iterations: int = 10):
         """重写流式 ReAct 入口，同样提取 user_id"""
         self._current_user_id = None
+        self._current_images = input_data.images or []
+        self._current_enhanced_query = None
+        self._current_intent_decision = None
+        self._current_allowed_tools = None
         if input_data.context and input_data.context.get("user_id"):
             self._current_user_id = str(input_data.context["user_id"])
+        if input_data.context and input_data.context.get("enhanced_retrieval_query"):
+            self._current_enhanced_query = str(input_data.context["enhanced_retrieval_query"])
+        if input_data.context and input_data.context.get("intent_decision"):
+            self._current_intent_decision = dict(input_data.context["intent_decision"])
+            policy = self._current_intent_decision.get("policy") or {}
+            allowed_tools = policy.get("tool_scope") or self._current_intent_decision.get("allowed_tools")
+            if isinstance(allowed_tools, list):
+                self._current_allowed_tools = [str(name) for name in allowed_tools]
 
         async for event in super().run_with_react_stream(input_data, max_iterations):
             yield event
+
+    @staticmethod
+    def _needs_more_tools(output: AgentOutput) -> bool:
+        status = output.metadata.get("react_status") or FixAgent._parse_react_status(output.message)
+        if status and status.get("status") == "needs_more_tools":
+            return True
+        message = (output.message or "").strip()
+        return message.startswith("NEEDS_MORE_TOOLS:")
+
+    @staticmethod
+    def _parse_react_status(message: str) -> Optional[Dict[str, Any]]:
+        text = (message or "").strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        status = data.get("status")
+        if status not in {"needs_more_tools", "needs_user_clarification", "final_answer"}:
+            return None
+        needed_tools = data.get("needed_tools")
+        if needed_tools is not None and not isinstance(needed_tools, list):
+            data["needed_tools"] = [str(needed_tools)]
+        return data
+
+    @staticmethod
+    def _format_user_clarification_message(status: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        general_answer = str(status.get("general_answer") or "").strip()
+        if general_answer:
+            parts.append(general_answer)
+
+        questions = status.get("questions") or []
+        if questions:
+            question_lines = []
+            for question in questions[:3]:
+                text = str(question or "").strip()
+                if text:
+                    question_lines.append(f"- {text}")
+            if question_lines:
+                parts.append("为了进一步查询知识库并给出更准确的判断，请补充：\n" + "\n".join(question_lines))
+
+        if not parts:
+            reason = str(status.get("reason") or "").strip()
+            if reason:
+                parts.append(f"还需要补充信息后才能继续判断：{reason}")
+            else:
+                parts.append("还需要补充车型、部件型号或故障现象后，我才能继续判断。")
+        return "\n\n".join(parts)
 
 
 # 单例

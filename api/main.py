@@ -36,6 +36,8 @@ from agents.memory_agent import get_memory_agent
 from agents.base_agent import AgentInput, AgentOutput
 from services.vector_service import get_vector_service
 from services.llm_service import get_llm_service
+from services.image_summary_service import get_image_summary_service
+from services.intent_router import get_intent_router
 from tools.knowledge_retrieval_tool import get_knowledge_retrieval_tool
 from services.temporary_plan_service import get_temporary_plan_service
 from config.settings import get_settings
@@ -105,6 +107,90 @@ def _should_use_rag_fast_path(request: ChatRequest) -> bool:
     return any(
         keyword in message
         for keyword in ("根据知识库", "查知识库", "知识库回答", "只查资料", "根据资料", "根据手册")
+    )
+
+
+IMAGE_ONLY_DEFAULT_MESSAGE = "请识别图片中的设备或部件，并结合知识库判断它可能属于什么系统。"
+
+
+def _compact_text(parts: list[str]) -> str:
+    seen = set()
+    compacted = []
+    for part in parts:
+        text = " ".join(str(part or "").split())
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        compacted.append(text)
+    return " ".join(compacted)
+
+
+async def _build_image_understanding(images: list[str], user_message: str) -> dict:
+    summaries = []
+    for image_url in images:
+        try:
+            summary = await get_image_summary_service().understand_user_image(image_url, user_message=user_message)
+            if not summary:
+                summary = await get_image_summary_service().summarize(
+                    image_url=image_url,
+                    caption=user_message,
+                    context_before="",
+                    context_after="",
+                    section_title="用户上传图片",
+                )
+        except Exception as exc:
+            logger.warning("[chat][image_understanding] image summary failed: %s", exc)
+            summary = {
+                "image_title": "用户上传图片",
+                "image_summary": "用户上传了一张待识别的设备或部件图片。",
+                "summary_source": "fallback_error",
+            }
+        summaries.append({"image_url": image_url, **summary})
+
+    enhanced_query = _compact_text(
+        [user_message]
+        + [
+            " ".join(
+                str(item.get(key, ""))
+                for key in ("image_title", "image_summary")
+                if item.get(key)
+            )
+            + " "
+            + " ".join(str(keyword) for keyword in item.get("keywords", []) if keyword)
+            for item in summaries
+        ]
+    )
+    return {
+        "summaries": summaries,
+        "enhanced_query": enhanced_query or IMAGE_ONLY_DEFAULT_MESSAGE,
+    }
+
+
+async def _prepare_chat_agent_input(request: ChatRequest) -> AgentInput:
+    raw_message = request.message or ""
+    effective_message = raw_message.strip() or IMAGE_ONLY_DEFAULT_MESSAGE
+    context = dict(request.context or {})
+
+    intent_decision = await get_intent_router().classify(
+        raw_message,
+        images=request.images,
+        context=context,
+    )
+    context["intent_decision"] = intent_decision.model_dump()
+    context["intention"] = intent_decision.intent
+
+    if request.images and intent_decision.requires_image_understanding:
+        image_understanding = await _build_image_understanding(request.images, effective_message)
+        context["image_understanding"] = image_understanding
+        context["enhanced_retrieval_query"] = image_understanding["enhanced_query"]
+        context["original_user_message"] = raw_message
+
+    return AgentInput(
+        user_message=effective_message,
+        session_id=request.session_id,
+        images=request.images,
+        conversation_history=request.conversation_history,
+        context=context,
     )
 
 
@@ -218,13 +304,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         chat_t0 = time.time()
         logger.info(f"[chat] 会话={request.session_id} 消息长度={len(request.message)}")
 
-        input_data = AgentInput(
-            user_message=request.message,
-            session_id=request.session_id,
-            images=request.images,
-            conversation_history=request.conversation_history,
-            context=request.context
-        )
+        input_data = await _prepare_chat_agent_input(request)
 
         fix_t0 = time.time()
         fix_result = None
@@ -236,6 +316,10 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
         if fix_result is None:
             fix_result = await get_fix_agent().run_with_react(input_data)
+        fix_result.metadata["user_message"] = input_data.user_message
+        fix_result.metadata["original_user_message"] = request.message
+        if input_data.context and input_data.context.get("intent_decision"):
+            fix_result.metadata["intent_decision"] = input_data.context["intent_decision"]
         fix_phase_ms = int((time.time() - fix_t0) * 1000)
         logger.info(
             "[chat][phase] session=%s execution_mode=%s fix_phase_ms=%s tools=%s",
@@ -308,13 +392,7 @@ async def chat_stream(request: ChatRequest):
     async def event_generator():
         yield f"data: {json_dumps({'event': 'session_id', 'data': {'session_id': request.session_id}})}\n\n"
 
-        input_data = AgentInput(
-            user_message=request.message,
-            session_id=request.session_id,
-            images=request.images,
-            conversation_history=request.conversation_history,
-            context=request.context
-        )
+        input_data = await _prepare_chat_agent_input(request)
 
         try:
             fix_agent = get_fix_agent()
@@ -357,7 +435,12 @@ async def chat_stream(request: ChatRequest):
                 message=full_message,
                 intention=None,
                 tools_used=tools_in_stream if tools_in_stream else stream_tools_used,
-                metadata={"react_trace": stream_react_trace},
+                metadata={
+                    "react_trace": stream_react_trace,
+                    "user_message": input_data.user_message,
+                    "original_user_message": request.message,
+                    "intent_decision": (input_data.context or {}).get("intent_decision"),
+                },
                 latency_ms=fix_latency
             )
 
@@ -639,6 +722,10 @@ async def search_facts(query: str, top_k: int = 5, session_ids: str = "",
     """
     import time as t
     from services.fact_reranker import rerank
+
+    if not (query or "").strip():
+        logger.info("[search_facts] empty query, skip fact vector search")
+        return {"facts": [], "query_time_ms": 0}
 
     # 解析会话ID白名单
     allowed_sessions = set()

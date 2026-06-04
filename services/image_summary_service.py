@@ -12,6 +12,49 @@ from services.llm_service import get_llm_service
 class ImageSummaryService:
     """Generate retrieval-friendly text for an extracted image."""
 
+    async def understand_user_image(self, image_url: str, user_message: str = "") -> dict:
+        """Generate retrieval-friendly understanding for a user-uploaded chat image."""
+        prompt = (
+            "请识别用户上传的维修/设备图片，并返回 JSON。"
+            "字段仅包含 image_title、image_summary、keywords。"
+            "image_title 用一句话说明图中主体；"
+            "image_summary 说明可见部件、标注、可能所属系统；"
+            "keywords 是用于知识库检索的中文关键词数组。"
+            f"\n用户文字：{user_message or '用户未输入文字，仅上传图片'}"
+        )
+        try:
+            response = await get_llm_service().chat(
+                [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }],
+                temperature=0.1,
+                max_tokens=500,
+                model=get_settings().vlm_model,
+                response_format={"type": "json_object"},
+            )
+            payload = json.loads(response.get("content") or "{}")
+            title = str(payload.get("image_title") or "").strip()
+            summary = str(payload.get("image_summary") or "").strip()
+            raw_keywords = payload.get("keywords") or []
+            if isinstance(raw_keywords, str):
+                keywords = [item.strip() for item in raw_keywords.replace("，", ",").split(",") if item.strip()]
+            else:
+                keywords = [str(item).strip() for item in raw_keywords if str(item).strip()]
+            if title or summary or keywords:
+                return {
+                    "image_title": title or "用户上传图片",
+                    "image_summary": summary or title,
+                    "keywords": keywords,
+                    "summary_source": "user_image_vlm",
+                }
+        except Exception:
+            return {}
+        return {}
+
     async def summarize(
         self,
         image_url: str,
