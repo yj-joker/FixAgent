@@ -701,7 +701,7 @@ class ReviewAgent:
         return value[:140] + "..." if len(value) > 140 else value
 
     @classmethod
-    def _format_pending_items(cls, items: List[str], max_items: int = 3) -> str:
+    def _format_pending_items(cls, items: List[str]) -> str:
         cleaned: List[str] = []
         for item in items:
             text = cls._clean_pending_text(item)
@@ -709,12 +709,7 @@ class ReviewAgent:
                 cleaned.append(text)
         if not cleaned:
             return ""
-        visible = cleaned[:max_items]
-        lines = [f"- {text}" for text in visible]
-        hidden = len(cleaned) - len(visible)
-        if hidden > 0:
-            lines.append(f"- 另有 {hidden} 条未展示")
-        return "\n".join(lines)
+        return "\n".join(f"- {text}" for text in cleaned)
 
     @classmethod
     def _should_show_pending_section(cls, user_message: str, answer: str, held_items: List[str]) -> bool:
@@ -1070,7 +1065,7 @@ class _ResponseComposer:
                 f"{confirmed_lines}"
             )
         if pending_lines:
-            sections.append("待确认信息：\n" f"{pending_lines}")
+            sections.append("以下信息暂未经过知识库验证，请仔细甄别：\n" f"{pending_lines}")
 
         appended = (safety or {}).get("appended_text", "")
         if appended:

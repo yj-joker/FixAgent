@@ -11,6 +11,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
+from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,7 @@ class IntentRouter:
 
     def __init__(self, llm_service):
         self.llm_service = llm_service
+        self.settings = get_settings()
 
     async def classify(
         self,
@@ -244,8 +246,9 @@ class IntentRouter:
                 {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
             ],
             temperature=0,
-            max_tokens=300,
+            max_tokens=120,
             response_format={"type": "json_object"},
+            model=self.settings.intent_router_model,
         )
         data = json.loads(response.get("content") or "{}")
         intent = data.get("intent")

@@ -6,6 +6,7 @@ load_dotenv()
 class Settings:
     dashscope_api_key = os.getenv("DASHSCOPE_API_KEY")
     llm_model = os.getenv("LLM_MODEL", "qwen-plus")
+    intent_router_model = os.getenv("INTENT_ROUTER_MODEL", "qwen-turbo")
     vlm_model = os.getenv("VLM_MODEL", "qwen-vl-max")
     llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
     llm_top_p = float(os.getenv("LLM_TOP_P", "0.9"))
