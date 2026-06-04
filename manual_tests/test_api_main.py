@@ -89,6 +89,110 @@ def test_chat_image_only_uses_default_prompt_and_enhanced_query():
     assert response.message == "从图片看，这是火花塞。"
 
 
+def test_chat_extracts_diagnosis_items_from_reviewed_json_message():
+    import api.main as main
+    from agents.base_agent import AgentOutput
+    from schemas.request import ChatRequest
+
+    fix_agent = MagicMock()
+    fix_agent.run_with_react = AsyncMock(
+        return_value=AgentOutput(
+            agent_name="fix_agent",
+            message="{}",
+            tools_used=["knowledge_retrieval"],
+            metadata={"status": "ok"},
+            latency_ms=10,
+        )
+    )
+    review_agent = MagicMock()
+    review_agent.review = AsyncMock(
+        return_value=AgentOutput(
+            agent_name="review_agent",
+            message=json.dumps(
+                {
+                    "message": "已生成结构化诊断结果",
+                    "diagnosisItems": [
+                        {
+                            "priority": "一级",
+                            "faultPart": "火花塞状态异常",
+                            "rootCause": "冷态点火不稳定",
+                            "knowledgeBasis": "手册第3页",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            tools_used=["knowledge_retrieval"],
+            metadata={"verification_has_issues": False, "verification": {}},
+            latency_ms=20,
+        )
+    )
+
+    with patch.object(main, "get_fix_agent", return_value=fix_agent), patch.object(
+        main, "get_review_agent", return_value=review_agent
+    ):
+        response = run_async(main.chat(ChatRequest(session_id="s1", message="冷车启动熄火", stream=False)))
+
+    data = response.model_dump(by_alias=True, exclude_none=True)
+    assert data["message"] == "已生成结构化诊断结果"
+    assert data["diagnosisItems"][0]["faultPart"] == "火花塞状态异常"
+
+
+def test_chat_stream_moves_diagnosis_items_to_done_event():
+    import api.main as main
+    from agents.base_agent import AgentOutput
+    from schemas.request import ChatRequest
+
+    async def events(_input):
+        yield {"event": "token", "data": {"content": "{}"}}
+        yield {"event": "done", "data": {"tools_used": ["knowledge"], "latency_ms": 12}}
+
+    fix_agent = MagicMock()
+    fix_agent.run_with_react_stream = events
+    review_agent = MagicMock()
+    review_agent.review = AsyncMock(
+        return_value=AgentOutput(
+            agent_name="review_agent",
+            message=json.dumps(
+                {
+                    "message": "已生成结构化诊断结果",
+                    "diagnosisItems": [
+                        {
+                            "priority": "一级",
+                            "faultPart": "火花塞状态异常",
+                            "rootCause": "冷态点火不稳定",
+                            "knowledgeBasis": "手册第3页",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            tools_used=["knowledge"],
+            metadata={"verification_has_issues": False, "verification": {}},
+            latency_ms=18,
+        )
+    )
+    review_agent.get_inline_markers.return_value = []
+
+    with patch.object(main, "get_fix_agent", return_value=fix_agent), patch.object(
+        main, "get_review_agent", return_value=review_agent
+    ):
+        response = run_async(main.chat_stream(ChatRequest(session_id="s1", message="stream", stream=True)))
+
+        async def collect():
+            chunks = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+            return "".join(chunks)
+
+        body = run_async(collect())
+
+    assert '"content": "已"' in body
+    assert '"content": "{' not in body
+    assert '"diagnosisItems"' in body
+    assert '"faultPart": "火花塞状态异常"' in body
+
+
 def test_search_facts_empty_query_returns_empty_result_without_embedding_call():
     import api.main as main
 

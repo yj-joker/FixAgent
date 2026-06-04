@@ -54,6 +54,60 @@ logging.basicConfig(
 
 from contextlib import asynccontextmanager
 
+
+def _normalize_diagnosis_item(item: dict) -> dict:
+    return {
+        "priority": item.get("priority", ""),
+        "fault_part": item.get("faultPart", item.get("fault_part", "")),
+        "root_cause": item.get("rootCause", item.get("root_cause", "")),
+        "knowledge_basis": item.get("knowledgeBasis", item.get("knowledge_basis", "")),
+    }
+
+
+def _serialize_diagnosis_items(items: list[dict]) -> list[dict]:
+    return [
+        {
+            "priority": item.get("priority", ""),
+            "faultPart": item.get("fault_part", item.get("faultPart", "")),
+            "rootCause": item.get("root_cause", item.get("rootCause", "")),
+            "knowledgeBasis": item.get("knowledge_basis", item.get("knowledgeBasis", "")),
+        }
+        for item in items
+    ]
+
+
+def _extract_structured_chat_payload(message: str) -> tuple[str, list[dict] | None]:
+    """
+    从模型最终文本中提取结构化诊断结果。
+
+    兼容两种形式：
+    1. 纯 JSON：{"message":"...","diagnosisItems":[...]}
+    2. 普通文本：原样返回，不填 diagnosisItems
+    """
+    text = (message or "").strip()
+    if not text:
+        return message, None
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return message, None
+
+    if not isinstance(payload, dict):
+        return message, None
+
+    raw_items = payload.get("diagnosisItems") or payload.get("diagnosis_items")
+    if not isinstance(raw_items, list):
+        return payload.get("message", message), None
+
+    diagnosis_items = [
+        _normalize_diagnosis_item(item)
+        for item in raw_items
+        if isinstance(item, dict)
+    ]
+
+    return payload.get("message", message), diagnosis_items or None
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     # 启动：开启 MQ 消费者
@@ -359,12 +413,15 @@ async def chat(request: ChatRequest) -> ChatResponse:
             f"返回耗时={final_result.latency_ms}ms"
         )
 
+        response_message, diagnosis_items = _extract_structured_chat_payload(final_result.message)
+
         return ChatResponse(
             session_id=request.session_id,
-            message=final_result.message,
+            message=response_message,
             tools_used=final_result.tools_used if final_result.tools_used else None,
             latency_ms=final_result.latency_ms,
-            verification=verification if has_issues else None
+            verification=verification if has_issues else None,
+            diagnosis_items=diagnosis_items,
         )
     except Exception as e:
         logger.exception(f"[chat] session={request.session_id} error")
@@ -448,10 +505,10 @@ async def chat_stream(request: ChatRequest):
             verified_output = await get_review_agent().review(fix_output)
             verification = verified_output.metadata.get("verification", {})
             has_issues = verified_output.metadata.get("verification_has_issues", False)
-            markers = get_review_agent().get_inline_markers(verified_output.message, verification)
 
             # 流式输出最终回答（逐字），在未验证语句前插入 marker 事件
-            final_message = verified_output.message
+            final_message, diagnosis_items = _extract_structured_chat_payload(verified_output.message)
+            markers = get_review_agent().get_inline_markers(final_message, verification)
             marker_idx = 0
             for i, char in enumerate(final_message):
                 while marker_idx < len(markers) and markers[marker_idx]["char_pos"] <= i:
@@ -491,6 +548,8 @@ async def chat_stream(request: ChatRequest):
                     "latency_ms": verified_output.latency_ms
                 }
             }
+            if diagnosis_items:
+                final_done["data"]["diagnosisItems"] = _serialize_diagnosis_items(diagnosis_items)
             yield f"data: {json_dumps(final_done)}\n\n"
 
         except Exception as e:

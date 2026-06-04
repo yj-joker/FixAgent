@@ -22,6 +22,24 @@ def auto_test():
             "check": lambda x: "verification" not in x,
         },
         {
+            "name": "ChatResponse diagnosisItems 使用 camelCase 输出",
+            "input": "diagnosis_items=[dict]",
+            "expected": "diagnosisItems 存在且包含排查字段",
+            "run": lambda: ChatResponse(
+                session_id="s1",
+                message="诊断结果见 diagnosisItems",
+                diagnosis_items=[
+                    {
+                        "priority": "一级",
+                        "fault_part": "火花塞状态异常",
+                        "root_cause": "冷态点火不稳定",
+                        "knowledge_basis": "手册第3页",
+                    }
+                ],
+            ).model_dump(by_alias=True, exclude_none=True),
+            "check": lambda x: x["diagnosisItems"][0]["faultPart"] == "火花塞状态异常",
+        },
+        {
             "name": "KnowledgeSearchResponse data 为 VectorSearchResult 列表时正确序列化",
             "input": "1条向量检索结果",
             "expected": "data[0].id=doc1",
