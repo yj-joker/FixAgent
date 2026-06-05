@@ -219,6 +219,46 @@ class BaseAgent(ABC):
         if input_data.context:
             context_parts = []
 
+            # 检修任务场景上下文（步骤助手）—— 让 AI 知道工人当前在做哪个任务、哪一步
+            m = input_data.context.get("maintenance")
+            if isinstance(m, dict):
+                lines = []
+                t = m.get("task") or {}
+                lines.append(
+                    f"设备：{t.get('deviceName', '') or '未知'}；"
+                    f"故障：{t.get('faultDescription', '') or '未填写'}；"
+                    f"检修等级：{t.get('maintenanceLevel', '') or '-'}"
+                )
+                prog = m.get("progress") or {}
+                if prog:
+                    lines.append(
+                        f"进度：当前第 {prog.get('current', '?')} 步 / 共 {prog.get('total', '?')} 步，"
+                        f"已完成 {prog.get('done', 0)} 步"
+                    )
+                fs = m.get("focusedStep")
+                if isinstance(fs, dict):
+                    lines.append(f"\n【当前聚焦：第 {fs.get('sortOrder', '?')} 步】{fs.get('title', '')}")
+                    if fs.get("content"):
+                        lines.append(f"操作内容：{fs.get('content')}")
+                    if fs.get("safetyNote"):
+                        lines.append(f"安全提示：{fs.get('safetyNote')}")
+                    if fs.get("checkpointItems"):
+                        lines.append("检查点：" + "；".join(fs.get("checkpointItems") or []))
+                    if fs.get("sources"):
+                        lines.append(f"该步参考依据：{fs.get('sources')}")
+                ov = m.get("overview")
+                if ov:
+                    lines.append("\n【全部步骤一览】\n" + "\n".join(f"- {s}" for s in ov))
+                context_parts.append(
+                    "## 当前检修任务\n" + "\n".join(lines)
+                    + "\n\n你是现场检修助手，正在与工人进行【连续的现场对话】。"
+                    "请结合上面的任务背景、当前聚焦步骤、以及前面的对话内容来回答；"
+                    "当工人追问「还不行怎么办 / 下一步呢」时，要承接前文继续给出可操作的排查与处置建议，必要时引用其它步骤。"
+                    "即使知识库未直接命中，也应基于检修常识与现场情境给出务实、安全的建议，"
+                    "不要简单回复「资料不足」；仅在涉及不确定的关键技术参数时提示「需现场确认」。"
+                    "安全第一，简明可操作。"
+                )
+
             # 之前的对话摘要
             if input_data.context.get("previous_summary"):
                 context_parts.append(f"## 之前的对话摘要\n{input_data.context['previous_summary']}")
