@@ -10,7 +10,7 @@ class Settings:
     vlm_model = os.getenv("VLM_MODEL", "qwen-vl-max")
     llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
     llm_top_p = float(os.getenv("LLM_TOP_P", "0.9"))
-    llm_max_tokens = int(os.getenv("LLM_MAX_TOKENS", "2000"))
+    llm_max_tokens = int(os.getenv("LLM_MAX_TOKENS", "4000"))
 
     # Redis 配置
     redis_host = os.getenv("REDIS_HOST", "localhost")

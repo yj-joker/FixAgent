@@ -316,6 +316,9 @@ async def handle_task_generate(message: aio_pika.abc.AbstractIncomingMessage, ch
                 device_name=body.get("deviceName"),
                 urgency_level=body.get("urgencyLevel", 1),
                 report_images=body.get("reportImages"),
+                procedure_steps=body.get("procedureSteps"),
+                procedure_id=body.get("procedureId"),
+                procedure_name=body.get("procedureName"),
             )
 
             if result.get("success"):
