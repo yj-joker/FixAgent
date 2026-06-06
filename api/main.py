@@ -428,6 +428,124 @@ async def chat(request: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== 检修助手出口兜底 ====================
+
+_MAINT_REFUSAL_HINTS = (
+    "暂不能生成", "无法形成可确认", "无法给出", "资料不足以",
+    "未检索到可支撑", "当前知识库未检索到", "当前资料不足",
+)
+
+# 最终硬保险话术：模型与兜底都翻车时，至少给工人一句安全、可操作的人话（绝不漏 JSON/冷拒答）
+_MAINT_SAFE_FALLBACK_LINE = (
+    "目前手册和图谱里还没有完全匹配这一情形的内容。请先确保安全、停止任何可能造成损伤的强行操作；"
+    "如方便，请补充故障的具体部位与现象，或拍一张现场照片发我，我据此给你更针对性的下一步。"
+)
+
+
+def _render_maintenance_block(m: dict) -> str:
+    """把 Java 注入的检修上下文渲染成纯文本背景块（兜底单轮对话用）。"""
+    if not isinstance(m, dict):
+        return ""
+    lines = []
+    t = m.get("task") or {}
+    lines.append(
+        f"设备：{t.get('deviceName', '') or '未知'}；"
+        f"故障：{t.get('faultDescription', '') or '未填写'}；"
+        f"检修等级：{t.get('maintenanceLevel', '') or '-'}"
+    )
+    prog = m.get("progress") or {}
+    if prog:
+        lines.append(
+            f"进度：当前第 {prog.get('current', '?')} 步 / 共 {prog.get('total', '?')} 步，"
+            f"已完成 {prog.get('done', 0)} 步"
+        )
+    fs = m.get("focusedStep")
+    if isinstance(fs, dict):
+        lines.append(f"【当前聚焦：第 {fs.get('sortOrder', '?')} 步】{fs.get('title', '')}")
+        if fs.get("content"):
+            lines.append(f"操作内容：{fs.get('content')}")
+        if fs.get("safetyNote"):
+            lines.append(f"安全提示：{fs.get('safetyNote')}")
+        if fs.get("sources"):
+            lines.append(f"该步参考依据：{fs.get('sources')}")
+    ov = m.get("overview")
+    if ov:
+        lines.append("全部步骤：" + "；".join(ov))
+    return "【任务背景】\n" + "\n".join(lines)
+
+
+def _is_unhelpful_maintenance_reply(message: str) -> bool:
+    """判断检修助手回复是否「翻车」：控制结构 JSON / 残缺 JSON / 套话式软拒答。"""
+    s = (message or "").strip()
+    if not s:
+        return True
+    plain, _ = _extract_structured_chat_payload(s)  # 合法 {"message",..} 会被抽成干净文本
+    p = (plain or "").strip()
+    if not p:
+        return True
+    if (p.startswith("{") or p.startswith("```")
+            or "needs_more_tools" in p or "needs_user_clarification" in p
+            or '"status"' in p[:40]):
+        return True
+    return any(h in p[:120] for h in _MAINT_REFUSAL_HINTS)
+
+
+def _clean_fallback_text(text: str) -> str:
+    """抢救兜底输出：把可能的 {"message":..} 抽成纯文本。"""
+    plain, _ = _extract_structured_chat_payload((text or "").strip())
+    return (plain or "").strip()
+
+
+async def _maintenance_fallback_answer(input_data: AgentInput, maint_ctx: dict):
+    """检修场景兜底：抛开 ReAct/工具门槛，用「上下文+历史」做一次纯对话作答。"""
+    system = (
+        "你是经验丰富的现场检修助手。请根据下面的【任务背景】和对话历史，"
+        "用简明、安全第一、可操作的中文，直接给工人下一步可执行的建议。"
+        "第一句话就给结论，即使知识库没有完全匹配的资料，也要基于通用检修经验务实作答。"
+        "严禁以「资料不足 / 无法回答 / 暂不能生成」搪塞；"
+        "严禁输出任何 JSON、花括号 {} 或字段名，只用自然段中文回答。\n\n"
+        + _render_maintenance_block(maint_ctx)
+    )
+
+    # 历史去 JSON 化：助手历史若是结构化输出，先抽成纯文本，仍是结构则丢弃，避免把模型带偏
+    history_msgs = []
+    for turn in (input_data.conversation_history or []):
+        role = turn.get("role")
+        content = turn.get("content")
+        if role not in ("user", "assistant") or not content:
+            continue
+        if role == "assistant":
+            content = _clean_fallback_text(content)
+            if not content or content.startswith("{"):
+                continue
+        history_msgs.append({"role": role, "content": content})
+
+    async def _ask(include_history: bool):
+        msgs = [{"role": "system", "content": system}]
+        if include_history:
+            msgs.extend(history_msgs)
+        msgs.append({"role": "user", "content": input_data.user_message})
+        resp = await get_llm_service().chat(messages=msgs, temperature=0.5)
+        raw = resp.get("content", "") if isinstance(resp, dict) else str(resp or "")
+        return _clean_fallback_text(raw)
+
+    def _bad(t: str) -> bool:
+        if not t or t.startswith("{") or "needs_more_tools" in t:
+            return True
+        # 仅当「短且整体像拒答」才判坏；长答案里偶尔出现"无法给出精确值"等不算翻车
+        return len(t) < 100 and any(h in t for h in _MAINT_REFUSAL_HINTS)
+
+    try:
+        text = await _ask(include_history=True)
+        if _bad(text):
+            # 历史可能带偏（结构化/拒答），去掉历史只凭背景再问一次
+            text = await _ask(include_history=False)
+        return None if _bad(text) else text
+    except Exception:
+        logger.exception("[maintenance_fallback] error session=%s", input_data.session_id)
+        return None
+
+
 @app.post("/ai/chat/stream")
 async def chat_stream(request: ChatRequest):
     """
@@ -485,30 +603,60 @@ async def chat_stream(request: ChatRequest):
             stream_react_trace = done_data.get("react_trace", [])
             stream_tools_used = done_data.get("tools_used", [])
             fix_latency = done_data.get("latency_ms", 0)
+            verified_tools = tools_in_stream if tools_in_stream else stream_tools_used
+            verified_latency = fix_latency
 
-            # 构建 AgentOutput 供验证管线校验
-            fix_output = AgentOutput(
-                agent_name="fix_agent",
-                message=full_message,
-                intention=None,
-                tools_used=tools_in_stream if tools_in_stream else stream_tools_used,
-                metadata={
-                    "react_trace": stream_react_trace,
-                    "user_message": input_data.user_message,
-                    "original_user_message": request.message,
-                    "intent_decision": (input_data.context or {}).get("intent_decision"),
-                },
-                latency_ms=fix_latency
-            )
+            # —— 检修助手出口兜底（仅 maintenance 场景）——
+            # 模型若吐出控制结构 JSON（needs_more_tools / 残缺 {"message"..}）或套话式软拒答，
+            # 则抛开 ReAct 用「上下文+历史」重答一次，避免把内部结构/拒答暴露给工人。
+            fallback_text = None
+            maint_ctx = (input_data.context or {}).get("maintenance")
+            if maint_ctx and _is_unhelpful_maintenance_reply(full_message):
+                fallback_text = await _maintenance_fallback_answer(input_data, maint_ctx)
+                if fallback_text:
+                    logger.info("[chat_stream] 检修助手出口兜底已触发 session=%s", request.session_id)
 
-            # 运行3层确定性校验（~300ms），获取内联标记位置
-            verified_output = await get_review_agent().review(fix_output)
-            verification = verified_output.metadata.get("verification", {})
-            has_issues = verified_output.metadata.get("verification_has_issues", False)
+            if fallback_text:
+                # 兜底答案是基于上下文的务实建议，不走检索校验、不加内联标记
+                final_message = fallback_text
+                diagnosis_items = None
+                verification = {}
+                has_issues = False
+                markers = []
+            else:
+                # 构建 AgentOutput 供验证管线校验
+                fix_output = AgentOutput(
+                    agent_name="fix_agent",
+                    message=full_message,
+                    intention=None,
+                    tools_used=tools_in_stream if tools_in_stream else stream_tools_used,
+                    metadata={
+                        "react_trace": stream_react_trace,
+                        "user_message": input_data.user_message,
+                        "original_user_message": request.message,
+                        "intent_decision": (input_data.context or {}).get("intent_decision"),
+                    },
+                    latency_ms=fix_latency
+                )
 
-            # 流式输出最终回答（逐字），在未验证语句前插入 marker 事件
-            final_message, diagnosis_items = _extract_structured_chat_payload(verified_output.message)
-            markers = get_review_agent().get_inline_markers(final_message, verification)
+                # 运行3层确定性校验（~300ms），获取内联标记位置
+                verified_output = await get_review_agent().review(fix_output)
+                verification = verified_output.metadata.get("verification", {})
+                has_issues = verified_output.metadata.get("verification_has_issues", False)
+
+                # 流式输出最终回答（逐字），在未验证语句前插入 marker 事件
+                final_message, diagnosis_items = _extract_structured_chat_payload(verified_output.message)
+                markers = get_review_agent().get_inline_markers(final_message, verification)
+                verified_tools = verified_output.tools_used
+                verified_latency = verified_output.latency_ms
+
+            # —— 最终硬保险：检修场景下绝不让结构化 JSON / 冷拒答流给工人 ——
+            if maint_ctx and _is_unhelpful_maintenance_reply(final_message):
+                logger.info("[chat_stream] 检修助手最终保险触发，替换为安全话术 session=%s", request.session_id)
+                final_message = _MAINT_SAFE_FALLBACK_LINE
+                diagnosis_items = None
+                markers = []
+
             marker_idx = 0
             for i, char in enumerate(final_message):
                 while marker_idx < len(markers) and markers[marker_idx]["char_pos"] <= i:
@@ -544,8 +692,8 @@ async def chat_stream(request: ChatRequest):
             final_done = {
                 "event": "done",
                 "data": {
-                    "tools_used": verified_output.tools_used,
-                    "latency_ms": verified_output.latency_ms
+                    "tools_used": verified_tools,
+                    "latency_ms": verified_latency
                 }
             }
             if diagnosis_items:
