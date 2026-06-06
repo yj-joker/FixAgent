@@ -133,7 +133,7 @@ class IntentRouter:
             "requires_safety_notice": False,
             "allow_visual_answer_without_manual": True,
             "answer_style": "plain_conversational",
-            "allowed_tools": ["knowledge_retrieval", "graph_search_java"],
+            "allowed_tools": ["knowledge_retrieval", "java_graph_diagnosis_path"],
         },
         "parameter_query": {
             "evidence_level": "required",
@@ -152,7 +152,7 @@ class IntentRouter:
             "requires_manual_evidence": True,
             "requires_safety_notice": False,
             "answer_style": "diagnosis_brief",
-            "allowed_tools": ["knowledge_retrieval", "graph_search_java", "graph_search_devices", "recall_conversation_detail"],
+            "allowed_tools": ["knowledge_retrieval", "java_graph_diagnosis_path", "java_graph_device_search", "recall_conversation_detail"],
         },
         "maintenance_guidance": {
             "evidence_level": "required",
@@ -163,7 +163,7 @@ class IntentRouter:
             "requires_safety_notice": True,
             "operation_intent": True,
             "answer_style": "step_guidance",
-            "allowed_tools": ["knowledge_retrieval", "graph_search_java", "graph_search_devices", "procedure_recommend", "recall_conversation_detail"],
+            "allowed_tools": ["knowledge_retrieval", "java_graph_diagnosis_path", "java_graph_device_search", "procedure_recommend", "recall_conversation_detail"],
         },
         "procedure_planning": {
             "evidence_level": "required",
@@ -174,7 +174,7 @@ class IntentRouter:
             "requires_safety_notice": True,
             "operation_intent": True,
             "answer_style": "procedure_plan",
-            "allowed_tools": ["knowledge_retrieval", "graph_search_java", "graph_search_devices", "procedure_recommend", "recall_conversation_detail"],
+            "allowed_tools": ["knowledge_retrieval", "java_graph_diagnosis_path", "java_graph_device_search", "procedure_recommend", "recall_conversation_detail"],
         },
         "document_understanding": {
             "evidence_level": "optional",

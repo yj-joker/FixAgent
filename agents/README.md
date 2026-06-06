@@ -26,7 +26,7 @@ Agent 是系统的**核心智能组件**，采用 **FixAgent + ReviewAgent** 双
 │  可用工具:                                             │
 │  ├── knowledge_retrieval (知识库向量检索)              │
 │  ├── graph_query_diagnosis_path (图谱诊断路径)        │
-│  └── graph_search_devices (图谱设备搜索)              │
+│  └── java_graph_device_search (Java 图谱设备搜索)     │
 └──────────────────────────────────────────────────────┘
     │
     │  (非流式 / 流式)

@@ -14,7 +14,7 @@ MQ consumer → MaintenanceAgent.generate_steps()
 
 【工具】
 - knowledge_retrieval：检索维修手册知识库
-- graph_search_java：查询设备→部件→故障→解决方案图谱
+- java_graph_diagnosis_path：查询设备→部件→故障→解决方案图谱
 
 【输出】
 JSON 结构化步骤列表，每步包含:
@@ -216,8 +216,8 @@ class MaintenanceAgent(BaseAgent):
 
         # 1. 图谱查询
         try:
-            from tools.graph_java_tool import get_graph_java_tool
-            graph_tool = get_graph_java_tool()
+            from tools.graph_java_tool import get_java_graph_diagnosis_path_tool
+            graph_tool = get_java_graph_diagnosis_path_tool()
             graph_resp = await graph_tool.run(
                 keyword=device_name,
                 fault_description=fault_description,

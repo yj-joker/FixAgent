@@ -16,9 +16,11 @@ Agent 可调用的工具集合，每个工具封装一种外部能力。
 from .base_tool import BaseTool, ToolResult, ToolError, ToolException
 from .knowledge_retrieval_tool import KnowledgeRetrievalTool, get_knowledge_retrieval_tool
 from .fact_retrieval_tool import FactRetrievalTool, get_fact_retrieval_tool
-from .graph_query_tool import (
-    GraphSearchDeviceTool,
-    get_graph_search_device_tool,
+from .graph_java_tool import (
+    JavaGraphDeviceSearchTool,
+    JavaGraphDiagnosisPathTool,
+    get_java_graph_device_search_tool,
+    get_java_graph_diagnosis_path_tool,
 )
 from .document_tool import DocumentParserTool, get_document_parser
 from .conversation_detail_tool import ConversationDetailTool, get_conversation_detail_tool
@@ -37,8 +39,10 @@ __all__ = [
     "FactRetrievalTool",
     "get_fact_retrieval_tool",
     # 图查询
-    "GraphSearchDeviceTool",
-    "get_graph_search_device_tool",
+    "JavaGraphDiagnosisPathTool",
+    "JavaGraphDeviceSearchTool",
+    "get_java_graph_diagnosis_path_tool",
+    "get_java_graph_device_search_tool",
     # 文档解析
     "DocumentParserTool",
     "get_document_parser",

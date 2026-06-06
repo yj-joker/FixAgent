@@ -33,7 +33,7 @@ from config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 
-class GraphJavaTool(BaseTool):
+class JavaGraphDiagnosisPathTool(BaseTool):
     """
     通过 Java 后端查询图谱诊断路径
 
@@ -52,7 +52,7 @@ class GraphJavaTool(BaseTool):
 
     @property
     def name(self) -> str:
-        return "graph_search_java"
+        return "java_graph_diagnosis_path"
 
     @property
     def description(self) -> str:
@@ -246,11 +246,106 @@ class GraphJavaTool(BaseTool):
 
 # ==================== 单例 ====================
 
-_graph_java_tool: Optional[GraphJavaTool] = None
+class JavaGraphDeviceSearchTool(BaseTool):
+    """Search devices through the Java graph service."""
+
+    def __init__(self):
+        self._settings = get_settings()
+        self._base_url = self._settings.java_service_url
+
+    @property
+    def name(self) -> str:
+        return "java_graph_device_search"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Search device nodes from the maintenance knowledge graph through the Java backend. "
+            "Use this when the device name is vague or incomplete and a device list is needed "
+            "before diagnosis path search."
+        )
+
+    def get_parameters_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "keyword": {
+                    "type": "string",
+                    "description": "Search keyword matching device name, code, model, or location",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of returned devices, default 10",
+                    "default": 10,
+                },
+            },
+            "required": ["keyword"],
+        }
+
+    async def _execute(self, keyword: str, limit: int = 10) -> dict:
+        logger.info("[graph_java_tool] search devices: keyword=%s, limit=%d", keyword, limit)
+
+        try:
+            headers = {"X-Internal-Token": self._settings.internal_token}
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{self._base_url}/weixiu/device/search",
+                    params={"keyword": keyword, "limit": limit},
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+
+            devices = result.get("data", [])
+            formatted = []
+            for device in devices:
+                formatted.append({
+                    "id": device.get("id"),
+                    "name": device.get("name"),
+                    "code": device.get("code"),
+                    "model": device.get("model"),
+                    "location": device.get("location"),
+                    "manufacturer": device.get("manufacturer"),
+                })
+
+            device_names = [device["name"] for device in formatted if device.get("name")]
+            logger.info(
+                "[graph_java_tool] device search completed: found %d devices %s",
+                len(formatted),
+                device_names,
+            )
+
+            return {
+                "count": len(formatted),
+                "devices": formatted,
+            }
+
+        except httpx.ConnectError:
+            raise ToolException(
+                code="JAVA_CONNECT_ERROR",
+                message=f"鏃犳硶杩炴帴 Java 鍚庣鏈嶅姟: {self._base_url}",
+            )
+        except Exception as e:
+            raise ToolException(
+                code="GRAPH_DEVICE_SEARCH_FAILED",
+                message=f"鍥捐氨璁惧鎼滅储澶辫触: {e}",
+            )
 
 
-def get_graph_java_tool() -> GraphJavaTool:
-    global _graph_java_tool
-    if _graph_java_tool is None:
-        _graph_java_tool = GraphJavaTool()
-    return _graph_java_tool
+_diagnosis_path_tool: Optional[JavaGraphDiagnosisPathTool] = None
+_device_search_tool: Optional[JavaGraphDeviceSearchTool] = None
+
+
+def get_java_graph_diagnosis_path_tool() -> JavaGraphDiagnosisPathTool:
+    global _diagnosis_path_tool
+    if _diagnosis_path_tool is None:
+        _diagnosis_path_tool = JavaGraphDiagnosisPathTool()
+    return _diagnosis_path_tool
+
+
+def get_java_graph_device_search_tool() -> JavaGraphDeviceSearchTool:
+    global _device_search_tool
+    if _device_search_tool is None:
+        _device_search_tool = JavaGraphDeviceSearchTool()
+    return _device_search_tool

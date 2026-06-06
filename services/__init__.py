@@ -7,7 +7,7 @@
 - KnowledgeService → 知识入库编排
 
 注意：图谱查询已统一收敛到 Java 端，Python 不再直连 Neo4j。
-Agent 通过 tools/graph_java_tool.py 和 tools/graph_query_tool.py 调用 Java HTTP 接口。
+Agent 通过 tools/graph_java_tool.py 调用 Java HTTP 接口。
 """
 
 from .llm_service import LLMService, get_llm_service
