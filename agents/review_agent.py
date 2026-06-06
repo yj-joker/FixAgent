@@ -1084,6 +1084,8 @@ class _ResponseComposer:
         for raw_line in text.splitlines():
             line = raw_line.strip()
             if not line:
+                if lines and lines[-1] != "":
+                    lines.append("")
                 continue
             line = re.sub(r"^#{1,6}\s*", "", line)
             line = re.sub(r"^[\-*]\s*", "", line)
@@ -1095,10 +1097,22 @@ class _ResponseComposer:
         if not lines:
             return ""
         if style == "plain_conversational":
-            compact = " ".join(lines)
-            compact = re.sub(r"\s+", " ", compact).strip()
-            return compact
+            return _ResponseComposer._normalize_plain_text_lines(lines)
         return "\n".join(lines)
+
+    @staticmethod
+    def _normalize_plain_text_lines(lines: List[str]) -> str:
+        normalized: List[str] = []
+        for line in lines:
+            if not line:
+                continue
+
+            cleaned = re.sub(r"[ \t]+", " ", line).strip()
+            if not cleaned:
+                continue
+            normalized.append(cleaned)
+
+        return "\n".join(normalized).strip()
 
 
 # ====================================================================

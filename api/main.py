@@ -148,6 +148,13 @@ app.add_middleware(
 )
 
 
+def _is_knowledge_inventory_question(message: str) -> bool:
+    text = message or ""
+    inventory_terms = ("有哪些", "有什么", "列出", "查看", "清单", "目录", "已导入", "收录")
+    knowledge_terms = ("知识库", "知识文件", "知识文档", "手册", "文档", "文件", "PDF", "pdf")
+    return any(term in text for term in inventory_terms) and any(term in text for term in knowledge_terms)
+
+
 def _should_use_rag_fast_path(request: ChatRequest) -> bool:
     """保守触发简单 RAG 快速路径，避免普通诊断问题误绕过 ReAct。"""
     if request.images:
@@ -155,9 +162,11 @@ def _should_use_rag_fast_path(request: ChatRequest) -> bool:
     context = request.context or {}
     if context.get("disable_fast_path") or context.get("force_react"):
         return False
+    message = request.message or ""
+    if _is_knowledge_inventory_question(message):
+        return False
     if request.mode == AgentMode.RETRIEVAL:
         return True
-    message = request.message or ""
     return any(
         keyword in message
         for keyword in ("根据知识库", "查知识库", "知识库回答", "只查资料", "根据资料", "根据手册")
@@ -288,6 +297,10 @@ async def _run_rag_fast_path(request: ChatRequest) -> AgentOutput | None:
             "content": (
                 "你是设备检修知识库问答助手。必须基于给定知识库证据回答；"
                 "证据不足时明确说明不足，不要编造参数、型号或操作步骤。"
+                "禁止使用 emoji。"
+                "不允许把多个信息点挤在同一整段中。"
+                "普通解释使用自然段；当内容包含编号、清单、选项、步骤或文件列表时，每一项必须单独换行。"
+                "编号格式使用“1. 内容”“2. 内容”，不要把多个编号写在同一行。"
             ),
         },
         {
@@ -296,6 +309,7 @@ async def _run_rag_fast_path(request: ChatRequest) -> AgentOutput | None:
                 f"用户问题：{request.message}\n\n"
                 f"知识库证据：\n{evidence_text}\n\n"
                 "请用中文回答，必要时列出依据和不确定点。"
+                "如果回答包含截止时间、比赛流程、注意事项等多个信息块，请使用清晰小段落和逐行编号。"
             ),
         },
     ]
@@ -398,7 +412,10 @@ async def chat(request: ChatRequest) -> ChatResponse:
             )
 
         review_t0 = time.time()
-        final_result = await get_review_agent().review(fix_result, level=review_level)
+        if fix_result.metadata.get("execution_mode") == "knowledge_inventory_direct":
+            final_result = fix_result
+        else:
+            final_result = await get_review_agent().review(fix_result, level=review_level)
         review_phase_ms = int((time.time() - review_t0) * 1000)
 
         verification = final_result.metadata.get("verification", {})
@@ -602,6 +619,7 @@ async def chat_stream(request: ChatRequest):
             full_message = "".join(token_buffer)
             stream_react_trace = done_data.get("react_trace", [])
             stream_tools_used = done_data.get("tools_used", [])
+            stream_metadata = done_data.get("metadata", {}) if isinstance(done_data.get("metadata"), dict) else {}
             fix_latency = done_data.get("latency_ms", 0)
             verified_tools = tools_in_stream if tools_in_stream else stream_tools_used
             verified_latency = fix_latency
@@ -631,6 +649,7 @@ async def chat_stream(request: ChatRequest):
                     intention=None,
                     tools_used=tools_in_stream if tools_in_stream else stream_tools_used,
                     metadata={
+                        **stream_metadata,
                         "react_trace": stream_react_trace,
                         "user_message": input_data.user_message,
                         "original_user_message": request.message,
@@ -640,7 +659,10 @@ async def chat_stream(request: ChatRequest):
                 )
 
                 # 运行3层确定性校验（~300ms），获取内联标记位置
-                verified_output = await get_review_agent().review(fix_output)
+                if fix_output.metadata.get("execution_mode") == "knowledge_inventory_direct":
+                    verified_output = fix_output
+                else:
+                    verified_output = await get_review_agent().review(fix_output)
                 verification = verified_output.metadata.get("verification", {})
                 has_issues = verified_output.metadata.get("verification_has_issues", False)
 

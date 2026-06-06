@@ -655,7 +655,8 @@ class BaseAgent(ABC):
                 "data": {
                     "latency_ms": latency,
                     "react_trace": react_trace,
-                    "tools_used": output.tools_used
+                    "tools_used": output.tools_used,
+                    "metadata": output.metadata,
                 }
             }
 

@@ -13,3 +13,4 @@ PyMuPDF>=1.23.0
 python-multipart>=0.0.9
 minio>=7.2.0
 aio-pika>=9.4.0
+pymysql>=1.1.0

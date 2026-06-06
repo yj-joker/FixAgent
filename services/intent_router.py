@@ -108,11 +108,11 @@ class IntentRouter:
         "knowledge_inventory": {
             "evidence_level": "optional",
             "safety_level": "none",
-            "requires_knowledge_retrieval": True,
+            "requires_knowledge_retrieval": False,
             "requires_manual_evidence": False,
             "requires_safety_notice": False,
             "answer_style": "structured_brief",
-            "allowed_tools": ["knowledge_retrieval"],
+            "allowed_tools": ["knowledge_inventory"],
         },
         "knowledge_query": {
             "evidence_level": "optional",

@@ -41,6 +41,13 @@ class Settings:
     minio_secure = os.getenv("MINIO_SECURE", "false").lower() == "true"
     image_summary_llm_enabled = os.getenv("IMAGE_SUMMARY_LLM_ENABLED", "false").lower() == "true"
 
+    # MySQL metadata database used for structured knowledge inventory queries.
+    mysql_host = os.getenv("MYSQL_HOST", "localhost")
+    mysql_port = int(os.getenv("MYSQL_PORT", "3306"))
+    mysql_database = os.getenv("MYSQL_DATABASE", "fix")
+    mysql_user = os.getenv("MYSQL_USER", "root")
+    mysql_password = os.getenv("MYSQL_PASSWORD", "1234")
+
 
 _settings = None
 
