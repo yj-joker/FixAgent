@@ -130,6 +130,9 @@ class MaintenanceAgent(BaseAgent):
         device_name: Optional[str] = None,
         urgency_level: int = 1,
         report_images: Optional[List[str]] = None,
+        procedure_steps: Optional[List[Dict]] = None,
+        procedure_id: Optional[int] = None,
+        procedure_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         生成检修步骤（两步走：先检索证据，再生成步骤）
@@ -153,7 +156,8 @@ class MaintenanceAgent(BaseAgent):
             user_msg = self._build_prompt(
                 fault_description, device_name, device_id,
                 urgency_level, report_images,
-                graph_results, retrieval_results
+                graph_results, retrieval_results,
+                procedure_steps, procedure_id, procedure_name,
             )
 
             input_data = AgentInput(
@@ -258,6 +262,9 @@ class MaintenanceAgent(BaseAgent):
         report_images: Optional[List[str]],
         graph_results: Any,
         retrieval_results: Any,
+        procedure_steps: Optional[List[Dict]] = None,
+        procedure_id: Optional[int] = None,
+        procedure_name: Optional[str] = None,
     ) -> str:
         """构建包含检索证据的用户消息"""
         urgency_map = {0: "低", 1: "普通", 2: "紧急"}
@@ -275,6 +282,30 @@ class MaintenanceAgent(BaseAgent):
 
         if report_images:
             parts.append(f"\n已附带 {len(report_images)} 张故障图片。")
+
+        # 注入标准规程模板（AI_ADAPT 微调模式）
+        if procedure_steps:
+            pid = procedure_id if procedure_id is not None else ""
+            pname = procedure_name or ""
+            parts.append(f"\n---\n## 标准规程模板（规程ID: {pid}, 名称: {pname}）")
+            parts.append("以下是已有的标准规程步骤，请根据当前故障描述进行针对性微调：")
+            for ps in procedure_steps:
+                parts.append(f"\n### 模板步骤 {ps.get('stepOrder', '?')}: {ps.get('title', '')}")
+                parts.append(f"内容: {ps.get('content', '')}")
+                if ps.get('safetyNote'):
+                    parts.append(f"安全注意: {ps.get('safetyNote', '')}")
+
+            parts.append(
+                "\n**微调规则（请据此为每一步标注 sources）：**\n"
+                f'1. 可直接沿用的模板步骤：保留原内容，sources 添加 '
+                f'{{"type": "template", "procedureId": {pid!r}, "procedureName": {pname!r}, "templateStepOrder": 原始步骤序号}}\n'
+                f'2. 需要按当前故障调整的步骤：修改内容后，sources 添加 '
+                f'{{"type": "template_adjusted", "procedureId": {pid!r}, "procedureName": {pname!r}, "templateStepOrder": 原始步骤序号, "adjustmentNote": "简要说明修改原因"}}，'
+                "并可同时附加 manual / graph 证据\n"
+                "3. 模板中没有、需新增的步骤：仅用 manual / graph 证据，不要添加 template 类型\n"
+                "4. 为控制输出长度：sources 只填必要字段，adjustmentNote 不超过 30 字；"
+                "content/safetyNote 简明扼要，不要照抄模板原文。"
+            )
 
         # 注入图谱证据
         if graph_results and isinstance(graph_results, dict):
@@ -503,13 +534,14 @@ class MaintenanceAgent(BaseAgent):
     @staticmethod
     def _normalize_steps(steps: List[Dict]) -> List[Dict]:
         """确保每个步骤都有 sources 字段"""
+        valid_types = ("manual", "graph", "template", "template_adjusted")
         for step in steps:
             if "sources" not in step:
                 step["sources"] = []
             # 清理 sources 中的无效项
             valid_sources = []
             for src in step["sources"]:
-                if isinstance(src, dict) and src.get("type") in ("manual", "graph"):
+                if isinstance(src, dict) and src.get("type") in valid_types:
                     valid_sources.append(src)
             step["sources"] = valid_sources
         return steps
