@@ -25,6 +25,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 from services.llm_service import LLMService
+from services.react_loop import ReActLoop
 from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,17 @@ class AgentInput(BaseModel):
     images: Optional[List[str]] = Field(default=None, description="图片列表")
     context: Optional[Dict[str, Any]] = Field(default=None, description="结构化上下文（摘要、事实、偏好、待办）")
     conversation_history: Optional[List[Dict[str, str]]] = Field(default=None, description="多轮对话历史[{'role':'user','content':'...'}]")
+
+
+class AgentRunContext(BaseModel):
+    """Per-request state used by ReAct without mutating singleton agents."""
+    user_message: str = ""
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
+    images: List[str] = Field(default_factory=list)
+    enhanced_query: Optional[str] = None
+    intent_decision: Dict[str, Any] = Field(default_factory=dict)
+    allowed_tools: Optional[List[str]] = None
 
 
 class AgentOutput(BaseModel):
@@ -136,6 +148,35 @@ class BaseAgent(ABC):
         """
         return []
 
+    def build_run_context(self, input_data: AgentInput) -> AgentRunContext:
+        context = input_data.context or {}
+        intent_decision = context.get("intent_decision") if isinstance(context.get("intent_decision"), dict) else {}
+        policy = intent_decision.get("policy") if isinstance(intent_decision.get("policy"), dict) else {}
+        allowed_tools = policy.get("tool_scope") or intent_decision.get("allowed_tools")
+        return AgentRunContext(
+            user_message=input_data.user_message or "",
+            user_id=str(context["user_id"]) if context.get("user_id") else None,
+            session_id=input_data.session_id,
+            images=list(input_data.images or []),
+            enhanced_query=str(context["enhanced_retrieval_query"]) if context.get("enhanced_retrieval_query") else None,
+            intent_decision=dict(intent_decision),
+            allowed_tools=[str(name) for name in allowed_tools] if isinstance(allowed_tools, list) else None,
+        )
+
+    def get_system_prompt_for_run(self, run_context: AgentRunContext) -> str:
+        return self.get_system_prompt()
+
+    def get_tools_for_run(self, run_context: AgentRunContext) -> List[Any]:
+        return self.get_tools()
+
+    def _customize_tool_kwargs_for_run(
+        self,
+        tool_name: str,
+        kwargs: dict,
+        run_context: AgentRunContext,
+    ) -> dict:
+        return self._customize_tool_kwargs(tool_name, kwargs)
+
     def _customize_tool_kwargs(self, tool_name: str, kwargs: dict) -> dict:
         """
         为特定工具注入额外参数的钩子方法
@@ -197,7 +238,11 @@ class BaseAgent(ABC):
                     seen.add(tool_name)
         return tools_used
 
-    def _build_messages(self, input_data: AgentInput) -> List[Dict[str, str]]:
+    def _build_messages(
+        self,
+        input_data: AgentInput,
+        run_context: Optional[AgentRunContext] = None,
+    ) -> List[Dict[str, str]]:
         """
         构建LLM消息列表（支持多轮对话历史和结构化上下文）
 
@@ -213,7 +258,7 @@ class BaseAgent(ABC):
             消息列表，格式：[{"role": "system", ...}, {"role": "user", ...}, {"role": "assistant", ...}, ...]
         """
         # ===== 1. 构建system prompt（角色 + 上下文） =====
-        system_content = self.get_system_prompt()
+        system_content = self.get_system_prompt_for_run(run_context or self.build_run_context(input_data))
 
         # 将结构化上下文注入system prompt，让LLM知道背景信息
         if input_data.context:
@@ -395,7 +440,8 @@ class BaseAgent(ABC):
 
         try:
             # 1. 构建消息
-            messages = self._build_messages(input_data)
+            run_context = self.build_run_context(input_data)
+            messages = self._build_messages(input_data, run_context)
 
             # 2. 有图片时切换为视觉模型
             model_override = None
@@ -479,17 +525,18 @@ class BaseAgent(ABC):
 
         try:
             # 1. 构建消息
-            messages = self._build_messages(input_data)
+            run_context = self.build_run_context(input_data)
+            messages = self._build_messages(input_data, run_context)
 
             # 2. 获取工具列表，转为 OpenAI schema + handler 映射
-            tools = self.get_tools()
+            tools = self.get_tools_for_run(run_context)
             tool_schemas = [t.to_openai_schema() for t in tools]
             tool_handlers = {}
             for tool in tools:
                 def _make_handler(t):
                     async def handler(**kwargs):
                         # 允许子类为特定工具注入额外参数
-                        kwargs = self._customize_tool_kwargs(t.name, kwargs)
+                        kwargs = self._customize_tool_kwargs_for_run(t.name, kwargs, run_context)
                         tool_start = time.time()
                         logger.info(
                             "[%s][tool_start] tool=%s args=%s",
@@ -538,7 +585,7 @@ class BaseAgent(ABC):
                 logger.info(f"[{self.name}] 检测到图片，切换模型: {model_override}")
 
             # 4. ReAct 循环（chat_with_tools 内部自动处理）
-            response = await self.llm_service.chat_with_tools(
+            response = await ReActLoop(self.llm_service).run(
                 messages=messages,
                 tools=tool_schemas,
                 tool_handlers=tool_handlers,

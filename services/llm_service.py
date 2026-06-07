@@ -4,20 +4,9 @@ import logging
 import httpx
 from typing import AsyncIterator, Optional, List, Dict, Any, Callable, Awaitable
 from config.settings import get_settings
+from services.react_loop import _json_compatible
 
 logger = logging.getLogger(__name__)
-
-
-def _json_default(value: Any) -> Any:
-    """Convert structured tool results into JSON payloads sent back to the LLM."""
-    if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json")
-    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
-
-
-def _json_compatible(value: Any) -> Any:
-    """Return the same JSON-ready tool payload used for the model and audit trace."""
-    return json.loads(json.dumps(value, ensure_ascii=False, default=_json_default))
 
 
 class LLMService:
@@ -166,6 +155,36 @@ class LLMService:
                 "request_id": result.get("id")
             }
         return {"content": "", "tool_calls": [], "finish_reason": "error"}
+
+    async def complete_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        response_format: Optional[Dict[str, str]] = None,
+        model: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Run one non-streaming chat-completion request with optional tool schemas."""
+        use_model = model or self.model
+        params = {
+            "model": use_model,
+            "messages": messages,
+            "temperature": self.settings.llm_temperature,
+            "top_p": self.settings.llm_top_p,
+            "max_tokens": self.settings.llm_max_tokens
+        }
+
+        if tools:
+            params["tools"] = tools
+            params["tool_choice"] = "auto"
+
+        if response_format:
+            params["response_format"] = response_format
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        return await self._sync_chat_with_tools(self.client, headers, params)
 
     async def chat_with_tools(
         self,

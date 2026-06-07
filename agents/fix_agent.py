@@ -28,7 +28,8 @@ import logging
 import time
 from typing import List, Any, Optional, Dict
 
-from agents.base_agent import BaseAgent, AgentInput, AgentOutput
+from agents.base_agent import BaseAgent, AgentInput, AgentOutput, AgentRunContext
+from services.visual_query_context import build_visual_query_context
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +198,20 @@ FIX_AGENT_SYSTEM_PROMPT += """
 """
 
 
+FIX_AGENT_PROMPT_SECTIONS = {
+    "base_role": FIX_AGENT_SYSTEM_PROMPT,
+    "tool_usage": "",
+    "output_format": "",
+    "safety": "",
+    "multimodal": "",
+    "knowledge_inventory": "",
+}
+
+
+def build_fix_agent_system_prompt() -> str:
+    return "\n".join(part for part in FIX_AGENT_PROMPT_SECTIONS.values() if part).strip()
+
+
 class FixAgent(BaseAgent):
     """
     统一诊断 Agent
@@ -211,8 +226,6 @@ class FixAgent(BaseAgent):
     def __init__(self, llm_service):
         super().__init__(llm_service)
         self._tools = None
-        self._current_intent_decision: Optional[Dict[str, Any]] = None
-        self._current_allowed_tools: Optional[List[str]] = None
 
     @property
     def name(self) -> str:
@@ -223,8 +236,11 @@ class FixAgent(BaseAgent):
         return "设备检修AI助手：知识检索、故障诊断、维修指引"
 
     def get_system_prompt(self) -> str:
-        prompt = FIX_AGENT_SYSTEM_PROMPT
-        decision = self._current_intent_decision or {}
+        return build_fix_agent_system_prompt()
+
+    def get_system_prompt_for_run(self, run_context: AgentRunContext) -> str:
+        prompt = build_fix_agent_system_prompt()
+        decision = run_context.intent_decision or {}
         policy = decision.get("policy") or {}
         if decision:
             prompt += (
@@ -262,11 +278,20 @@ class FixAgent(BaseAgent):
                 get_conversation_detail_tool(),
                 get_procedure_recommend_tool(),
             ]
-        allowed = self._current_allowed_tools
+        allowed = getattr(self, "_current_allowed_tools", None)
         if allowed is None:
             return self._tools
         allowed_set = set(allowed)
         return [tool for tool in self._tools if tool.name in allowed_set]
+
+    def get_tools_for_run(self, run_context: AgentRunContext) -> List[Any]:
+        self.get_tools()
+        tools = self._tools or []
+        allowed = run_context.allowed_tools
+        if allowed is None:
+            return tools
+        allowed_set = set(allowed)
+        return [tool for tool in tools if tool.name in allowed_set]
 
     def _customize_tool_kwargs(self, tool_name: str, kwargs: dict) -> dict:
         """为 recall_conversation_detail 注入 user_id"""
@@ -283,32 +308,57 @@ class FixAgent(BaseAgent):
                 kwargs["query"] = enhanced_query if not query else f"{query} {enhanced_query}"
         return kwargs
 
-    async def run_with_react(self, input_data: AgentInput, max_iterations: int = 10) -> AgentOutput:
-        """
-        重写 ReAct 入口，提取 user_id 供 recall_conversation_detail 工具使用。
-        """
-        self._current_user_id = None
-        self._current_images = input_data.images or []
-        self._current_enhanced_query = None
-        self._current_intent_decision = None
-        self._current_allowed_tools = None
-        if input_data.context and input_data.context.get("user_id"):
-            self._current_user_id = str(input_data.context["user_id"])
-        if input_data.context and input_data.context.get("enhanced_retrieval_query"):
-            self._current_enhanced_query = str(input_data.context["enhanced_retrieval_query"])
-        if input_data.context and input_data.context.get("intent_decision"):
-            self._current_intent_decision = dict(input_data.context["intent_decision"])
-            policy = self._current_intent_decision.get("policy") or {}
-            allowed_tools = policy.get("tool_scope") or self._current_intent_decision.get("allowed_tools")
-            if isinstance(allowed_tools, list):
-                self._current_allowed_tools = [str(name) for name in allowed_tools]
+    def _customize_tool_kwargs_for_run(
+        self,
+        tool_name: str,
+        kwargs: dict,
+        run_context: AgentRunContext,
+    ) -> dict:
+        """Inject per-request context into selected tools."""
+        visual_context = build_visual_query_context(
+            run_context.user_message,
+            run_context.enhanced_query,
+            run_context.images,
+        )
+        if tool_name == "recall_conversation_detail":
+            kwargs["user_id"] = run_context.user_id or ""
+        if tool_name in ("knowledge_retrieval", "java_graph_diagnosis_path"):
+            if run_context.images and not kwargs.get("image_urls"):
+                kwargs["image_urls"] = run_context.images
+        if tool_name == "java_graph_diagnosis_path" and visual_context.get("has_images"):
+            visible_parts = visual_context.get("visible_parts") or []
+            fault_signs = visual_context.get("fault_signs") or []
+            device_clues = visual_context.get("device_clues") or []
+            if visible_parts and not kwargs.get("component_description"):
+                kwargs["component_description"] = " ".join(str(item) for item in visible_parts)
+            if fault_signs and not kwargs.get("fault_description"):
+                kwargs["fault_description"] = " ".join(str(item) for item in fault_signs)
+            if device_clues and not kwargs.get("keyword"):
+                kwargs["keyword"] = " ".join(str(item) for item in device_clues[:2])
+        if tool_name == "knowledge_retrieval" and run_context.enhanced_query:
+            query = str(kwargs.get("query") or "").strip()
+            kwargs["query"] = run_context.enhanced_query if not query else f"{query} {run_context.enhanced_query}"
+        if tool_name == "knowledge_retrieval" and visual_context.get("retrieval_hint"):
+            query = str(kwargs.get("query") or "").strip()
+            hint = str(visual_context["retrieval_hint"]).strip()
+            if hint and hint not in query:
+                kwargs["query"] = hint if not query else f"{query} {hint}"
+        return kwargs
 
-        if self._is_knowledge_inventory_intent():
-            return await self._run_knowledge_inventory_direct()
+    async def _run_with_react_contextual(
+        self,
+        input_data: AgentInput,
+        max_iterations: int,
+    ) -> AgentOutput:
+        run_context = self.build_run_context(input_data)
+
+        if self._is_knowledge_inventory_intent_for_run(run_context):
+            return await self._run_knowledge_inventory_direct_for_run(run_context)
 
         output = await super().run_with_react(input_data, max_iterations)
-        if self._current_intent_decision:
-            output.metadata["intent_decision"] = self._current_intent_decision
+        if run_context.intent_decision:
+            output.metadata["intent_decision"] = run_context.intent_decision
+        self._attach_minimum_requirement_check(output, run_context)
 
         react_status = self._parse_react_status(output.message)
         if react_status:
@@ -316,26 +366,91 @@ class FixAgent(BaseAgent):
             if react_status.get("status") == "needs_user_clarification":
                 output.message = self._format_user_clarification_message(react_status)
 
-        if self._needs_more_tools(output) and self._current_allowed_tools is not None:
+        if self._needs_more_tools(output) and run_context.allowed_tools is not None:
             logger.info("[fix_agent] intent tool scope insufficient, rerunning once with full tools")
-            self._current_allowed_tools = None
-            rerun = await super().run_with_react(input_data, max_iterations)
-            rerun.metadata["intent_decision"] = self._current_intent_decision or {}
+            rerun_input = self._without_tool_scope(input_data)
+            rerun = await super().run_with_react(rerun_input, max_iterations)
+            rerun_context = self.build_run_context(rerun_input)
+            rerun.metadata["intent_decision"] = rerun_context.intent_decision
             rerun.metadata["intent_rerun_reason"] = react_status.get("reason") if react_status else output.message
             if react_status:
                 rerun.metadata["react_status_before_rerun"] = react_status
             rerun.metadata["intent_rerun_with_full_tools"] = True
+            self._attach_minimum_requirement_check(rerun, rerun_context)
             return rerun
 
         return output
 
-    def _is_knowledge_inventory_intent(self) -> bool:
-        decision = self._current_intent_decision or {}
+    @staticmethod
+    def _without_tool_scope(input_data: AgentInput) -> AgentInput:
+        rerun_input = input_data.model_copy(deep=True)
+        rerun_context = dict(rerun_input.context or {})
+        intent_decision = dict(rerun_context.get("intent_decision") or {})
+        policy = dict(intent_decision.get("policy") or {})
+        policy["tool_scope"] = None
+        intent_decision["policy"] = policy
+        intent_decision["allowed_tools"] = None
+        rerun_context["intent_decision"] = intent_decision
+        rerun_input.context = rerun_context
+        return rerun_input
+
+    @staticmethod
+    def _required_tools_for_policy(run_context: AgentRunContext) -> List[str]:
+        decision = run_context.intent_decision or {}
+        policy = decision.get("policy") or {}
+        intent = decision.get("intent")
+        required: List[str] = []
+        if intent == "knowledge_inventory":
+            required.append("knowledge_inventory")
+        if (
+            intent in {"knowledge_query", "parameter_query", "fault_diagnosis", "maintenance_guidance", "procedure_planning", "document_understanding", "visual_identification"}
+            or policy.get("requires_knowledge_retrieval")
+            or decision.get("requires_knowledge_retrieval")
+        ):
+            required.append("knowledge_retrieval")
+        if (
+            intent in {"fault_diagnosis", "maintenance_guidance", "procedure_planning", "visual_identification"}
+            or policy.get("requires_graph_search")
+            or decision.get("requires_graph_search")
+        ):
+            required.append("java_graph_diagnosis_path")
+        if intent in {"maintenance_guidance", "procedure_planning"}:
+            required.append("procedure_recommend")
+        return list(dict.fromkeys(required))
+
+    def _attach_minimum_requirement_check(
+        self,
+        output: AgentOutput,
+        run_context: AgentRunContext,
+    ) -> None:
+        required_tools = self._required_tools_for_policy(run_context)
+        used_tools = set(output.tools_used or [])
+        missing_tools = [name for name in required_tools if name not in used_tools]
+        decision = run_context.intent_decision or {}
+        policy = decision.get("policy") or {}
+        requires_safety_notice = bool(
+            decision.get("requires_safety_notice")
+            or policy.get("safety_level") == "operation"
+            or decision.get("intent") in {"maintenance_guidance", "procedure_planning"}
+        )
+        output.metadata["agent_policy_check"] = {
+            "required_tools": required_tools,
+            "missing_tools": missing_tools,
+            "requires_safety_notice": requires_safety_notice,
+            "satisfied": not missing_tools,
+        }
+
+    @staticmethod
+    def _is_knowledge_inventory_intent_for_run(run_context: AgentRunContext) -> bool:
+        decision = run_context.intent_decision or {}
         return decision.get("intent") == "knowledge_inventory"
 
-    async def _run_knowledge_inventory_direct(self) -> AgentOutput:
+    async def _run_knowledge_inventory_direct_for_run(
+        self,
+        run_context: AgentRunContext,
+    ) -> AgentOutput:
         start_time = time.time()
-        tools = self.get_tools()
+        tools = self.get_tools_for_run(run_context)
         inventory_tool = next((tool for tool in tools if tool.name == "knowledge_inventory"), None)
         if inventory_tool is None:
             return AgentOutput(
@@ -344,7 +459,7 @@ class FixAgent(BaseAgent):
                 tools_used=[],
                 metadata={
                     "execution_mode": "knowledge_inventory_direct",
-                    "intent_decision": self._current_intent_decision or {},
+                    "intent_decision": run_context.intent_decision,
                     "status": "tool_missing",
                 },
                 latency_ms=int((time.time() - start_time) * 1000),
@@ -359,7 +474,7 @@ class FixAgent(BaseAgent):
                 tools_used=["knowledge_inventory"],
                 metadata={
                     "execution_mode": "knowledge_inventory_direct",
-                    "intent_decision": self._current_intent_decision or {},
+                    "intent_decision": run_context.intent_decision,
                     "status": "tool_error",
                     "error_detail": error_message,
                 },
@@ -368,19 +483,29 @@ class FixAgent(BaseAgent):
 
         data = result.data or {}
         documents = data.get("documents") or []
-        message = self._format_knowledge_inventory_message(documents)
         return AgentOutput(
             agent_name=self.name,
-            message=message,
+            message=self._format_knowledge_inventory_message(documents),
             tools_used=["knowledge_inventory"],
             metadata={
                 "execution_mode": "knowledge_inventory_direct",
-                "intent_decision": self._current_intent_decision or {},
+                "intent_decision": run_context.intent_decision,
                 "knowledge_inventory_total": len(documents),
                 "knowledge_inventory_source": data.get("source"),
+                "agent_policy_check": {
+                    "required_tools": ["knowledge_inventory"],
+                    "missing_tools": [],
+                    "satisfied": True,
+                },
             },
             latency_ms=int((time.time() - start_time) * 1000),
         )
+
+    async def run_with_react(self, input_data: AgentInput, max_iterations: int = 10) -> AgentOutput:
+        """
+        重写 ReAct 入口，提取 user_id 供 recall_conversation_detail 工具使用。
+        """
+        return await self._run_with_react_contextual(input_data, max_iterations)
 
     @staticmethod
     def _format_knowledge_inventory_message(documents: List[Dict[str, Any]]) -> str:
@@ -415,24 +540,9 @@ class FixAgent(BaseAgent):
 
     async def run_with_react_stream(self, input_data: AgentInput, max_iterations: int = 10):
         """重写流式 ReAct 入口，同样提取 user_id"""
-        self._current_user_id = None
-        self._current_images = input_data.images or []
-        self._current_enhanced_query = None
-        self._current_intent_decision = None
-        self._current_allowed_tools = None
-        if input_data.context and input_data.context.get("user_id"):
-            self._current_user_id = str(input_data.context["user_id"])
-        if input_data.context and input_data.context.get("enhanced_retrieval_query"):
-            self._current_enhanced_query = str(input_data.context["enhanced_retrieval_query"])
-        if input_data.context and input_data.context.get("intent_decision"):
-            self._current_intent_decision = dict(input_data.context["intent_decision"])
-            policy = self._current_intent_decision.get("policy") or {}
-            allowed_tools = policy.get("tool_scope") or self._current_intent_decision.get("allowed_tools")
-            if isinstance(allowed_tools, list):
-                self._current_allowed_tools = [str(name) for name in allowed_tools]
-
         async for event in super().run_with_react_stream(input_data, max_iterations):
             yield event
+        return
 
     @staticmethod
     def _needs_more_tools(output: AgentOutput) -> bool:
