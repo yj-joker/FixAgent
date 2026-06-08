@@ -490,7 +490,7 @@ class BaseAgent(ABC):
                 metadata={
                     "status": "error",
                     "error_type": type(e).__name__,
-                    "error_detail": str(e),
+                    "error_detail": str(e) or type(e).__name__,
                     "latency_ms": latency_ms
                 },
                 latency_ms=latency_ms

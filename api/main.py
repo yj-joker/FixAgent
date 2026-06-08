@@ -150,8 +150,11 @@ app.add_middleware(
 
 def _is_knowledge_inventory_question(message: str) -> bool:
     text = message or ""
-    inventory_terms = ("有哪些", "有什么", "列出", "查看", "清单", "目录", "已导入", "收录")
-    knowledge_terms = ("知识库", "知识文件", "知识文档", "手册", "文档", "文件", "PDF", "pdf")
+    content_terms = ("部件", "零件", "配件", "总成", "参数", "步骤", "装配", "拆卸", "安装", "表格", "图片", "章节", "故障", "原因", "结构", "组成")
+    if any(term in text for term in content_terms):
+        return False
+    inventory_terms = ("有哪些", "有什么", "哪些", "列出", "查看", "清单", "目录", "已导入", "收录")
+    knowledge_terms = ("知识库", "知识文件", "知识文档", "已上传", "上传", "已导入", "导入", "入库", "文档", "文件", "PDF", "pdf")
     return any(term in text for term in inventory_terms) and any(term in text for term in knowledge_terms)
 
 
