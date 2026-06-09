@@ -20,6 +20,8 @@ from schemas.request import (
     KnowledgeSearchRequest,
     MemoryConsolidateRequest,
     TemporaryPlanGenerateRequest,
+    CaseDraftRequest,
+    CaseComplianceRequest,
 )
 from schemas.response import (
     BaseResponse,
@@ -31,7 +33,10 @@ from schemas.response import (
     KnowledgeStorageStatsResponse,
     MemoryConsolidateResponse,
     TemporaryPlanDraftResponse,
+    CaseDraftResponse,
+    CaseComplianceResponse,
 )
+from agents.case_agent import draft_case, check_compliance
 from agents.fix_agent import get_fix_agent
 from agents.review_agent import get_review_agent
 from agents.memory_agent import get_memory_agent
@@ -119,10 +124,6 @@ async def lifespan(application: FastAPI):
         from mq.connection import close_connection
         await start_consumers()
         logger.info("[启动] RabbitMQ 消费者已启动")
-        import asyncio
-        from services.kg_retry_sweeper import start_kg_retry_sweeper
-        asyncio.create_task(start_kg_retry_sweeper())
-        logger.info("[启动] KG重试sweeper已启动")
     except Exception as e:
         logger.warning("[启动] RabbitMQ 消费者启动失败（MQ不可用时降级为HTTP模式）: %s", e)
     yield
@@ -1232,6 +1233,21 @@ async def realtime_memory_update(request: RealtimeUpdateRequest):
             "preference_changes": [],
             "error": str(e)
         }
+
+# ==================== 检修案例沉淀 ====================
+
+@app.post("/ai/case/draft", response_model=CaseDraftResponse)
+async def ai_case_draft(req: CaseDraftRequest):
+    """把原始材料整理成结构化检修案例草稿（含一轮 Basic Reflection 自检）。"""
+    d = await draft_case(req)
+    return CaseDraftResponse(**{k: d.get(k) for k in CaseDraftResponse.model_fields if k in d})
+
+
+@app.post("/ai/case/compliance", response_model=CaseComplianceResponse)
+async def ai_case_compliance(req: CaseComplianceRequest):
+    """门控 LLM：判断内容是否可纳入设备检修知识库。"""
+    return CaseComplianceResponse(**await check_compliance(req.text))
+
 
 # ==================== 多模态向量化（文本或图片，不融合）====================
 
