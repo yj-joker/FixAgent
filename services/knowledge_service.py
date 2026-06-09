@@ -24,7 +24,6 @@ from services.file_storage import get_file_storage
 from services.image_summary_service import get_image_summary_service
 from services.chunking_policy import build_section_index_chunks
 from services.vector_service import get_vector_service
-from services.manual_graph_extractor import select_schema_sections
 
 logger = logging.getLogger(__name__)
 
@@ -367,17 +366,6 @@ class KnowledgeService:
                 image_count += 1
 
         t1 = time.time()
-        kg_sections = [
-            {
-                "section_title": s.get("section_title", ""),
-                "text_chunks": [
-                    {"text": (c.get("text") if isinstance(c, dict) else str(c))}
-                    for c in s.get("text_chunks", [])
-                ],
-                "tables": [{"rows": t.get("rows", [])} for t in s.get("tables", [])],
-            }
-            for s in select_schema_sections(sections)
-        ]
         self.vector_svc.put_document_manifest(document_id, {
             **common_metadata,
             "status": "ready",
@@ -389,7 +377,6 @@ class KnowledgeService:
             "image_summary_count": image_summary_count,
             "table_count": table_count,
             "kg_status": "pending",
-            "kg_sections": kg_sections,
             "manual_id": manual_id,
         })
 

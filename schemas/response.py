@@ -814,3 +814,41 @@ class MemoryConsolidateResponse(BaseResponse):
     original_count: int = Field(..., serialization_alias="originalCount", description="原始对话条数")
     consolidated_at: str = Field(..., serialization_alias="consolidatedAt", description="整理时间")
 
+
+# ==================== 检修案例沉淀相关 ====================
+
+class CaseDraftResponse(BaseModel):
+    """
+    检修案例草稿响应
+
+    【功能关联】POST /ai/case/draft
+    【何时用】AI 整理材料后返回的结构化检修案例草稿。
+    所有字段给安全默认值，便于 Java 端直接取用。
+    """
+    title: str = ""
+    summary: str = ""
+    diagnosis: str = ""
+    resolution: str = ""
+    result: str = ""
+    experience_summary: str = ""
+    tags: str = ""
+    downtime: Optional[int] = None
+    cost: Optional[float] = None
+
+
+class CaseComplianceResponse(BaseModel):
+    """
+    案例内容合规审核响应
+
+    【功能关联】POST /ai/case/compliance
+    【字段说明】
+    - compliant: 是否可纳入知识库（relevance 且 legality）
+    - relevance: 是否属于设备检修/维修经验
+    - legality: 是否不含违法/有害/敏感内容
+    - reason: 拦截原因（中文）
+    """
+    compliant: bool
+    relevance: bool
+    legality: bool
+    reason: str = ""
+

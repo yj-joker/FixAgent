@@ -142,11 +142,13 @@ class JavaGraphDiagnosisPathTool(BaseTool):
             data = result.get("data", {})
             records = data.get("records", [])
             total = data.get("total", 0)
+            cases = data.get("cases", []) or []
 
-            if not records:
-                logger.info("[graph_java_tool] 未找到匹配的诊断路径")
+            if not records and not cases:
+                logger.info("[graph_java_tool] 未找到匹配的诊断路径或案例")
                 return {
                     "paths_found": 0,
+                    "cases_found": 0,
                     "context": "【图谱查询结果】\n未找到匹配的诊断路径。\n"
                 }
 
@@ -159,15 +161,20 @@ class JavaGraphDiagnosisPathTool(BaseTool):
                             r.get("matchScore", "?"),
                             len(r.get("solutions") or []))
 
-            logger.info("[graph_java_tool] 查询完成: 命中 %d 条路径, 总计 %d", len(records), total)
+            logger.info("[graph_java_tool] 查询完成: 命中 %d 条路径, 相关案例 %d 条, 总计 %d",
+                        len(records), len(cases), total)
 
             context = self._format_paths(records, keyword)
+            if cases:
+                context = context + "\n" + self._format_cases(cases)
 
             return {
                 "paths_found": len(records),
+                "cases_found": len(cases),
                 "total": total,
                 "context": context,
                 "raw_records": records,
+                "raw_cases": cases,
             }
 
         except httpx.HTTPStatusError as e:
@@ -241,6 +248,28 @@ class JavaGraphDiagnosisPathTool(BaseTool):
         lines.append("如果知识图谱证据不足，请说明需要进一步检查。")
         lines.append("不要编造知识图谱中不存在的部件、故障或解决方案。")
 
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_cases(cases: list) -> str:
+        """将相关沉淀案例格式化为 LLM 可读文本（一线人员审核入库的实战经验）。"""
+        lines = ["【相关案例（一线沉淀，已审核）】"]
+        for i, c in enumerate(cases):
+            title = c.get("title") or "无标题案例"
+            score = c.get("score")
+            score_str = f"（相关度{round(score, 3)}）" if isinstance(score, (int, float)) else ""
+            lines.append(f"{i + 1}. {title}{score_str}")
+            summary = c.get("summary")
+            if summary:
+                lines.append(f"   摘要：{summary}")
+            exp = c.get("experienceSummary")
+            if exp:
+                lines.append(f"   经验总结：{exp}")
+            resolution = c.get("resolution")
+            if resolution:
+                lines.append(f"   解决过程：{resolution}")
+            lines.append("")
+        lines.append("案例为同类故障的真实处置经验，可作为图谱证据的实战补充参考。")
         return "\n".join(lines)
 
 

@@ -33,8 +33,6 @@ KNOWLEDGE_EXCHANGE = "knowledge.exchange"
 KNOWLEDGE_IMPORT_QUEUE = "knowledge.import.queue"
 KNOWLEDGE_RESULT_KEY = "knowledge.result"
 KNOWLEDGE_RESULT_QUEUE = "knowledge.result.queue"
-KNOWLEDGE_KG_EXTRACT_KEY = "knowledge.kg.extract"
-KNOWLEDGE_KG_EXTRACT_QUEUE = "knowledge.kg.extract.queue"
 
 # ===== 检修任务队列 =====
 TASK_EXCHANGE = "task.exchange"
@@ -263,13 +261,6 @@ async def handle_knowledge_import(message: aio_pika.abc.AbstractIncomingMessage,
                         document_id, result.get("text_count", 0),
                         result.get("image_count", 0), result.get("table_count", 0))
 
-            if manual_id is not None:
-                await publish_result(channel, {
-                    "manualId": manual_id,
-                    "documentId": document_id,
-                    "deviceType": device_type,
-                }, exchange_name=KNOWLEDGE_EXCHANGE, routing_key=KNOWLEDGE_KG_EXTRACT_KEY)
-
         except Exception as e:
             logger.error("[MQ消费] 知识导入失败, documentId=%s, 错误:%s", document_id, e, exc_info=True)
             await publish_result(channel, {
@@ -280,22 +271,6 @@ async def handle_knowledge_import(message: aio_pika.abc.AbstractIncomingMessage,
                 "error": str(e),
                 "data": {},
             }, exchange_name=KNOWLEDGE_EXCHANGE, routing_key=KNOWLEDGE_RESULT_KEY)
-
-
-async def handle_kg_extract(message: aio_pika.abc.AbstractIncomingMessage,
-                            channel: aio_pika.abc.AbstractChannel):
-    async with message.process(requeue=False):
-        body = json.loads(message.body)
-        manual_id = body.get("manualId")
-        document_id = body.get("documentId")
-        device_type = body.get("deviceType")
-        logger.info("[MQ消费] KG抽取开始 manualId=%s doc=%s", manual_id, document_id)
-        try:
-            from services.manual_graph_ingest import run_kg_extraction
-            await run_kg_extraction(manual_id, document_id, device_type)
-            logger.info("[MQ消费] KG抽取完成 doc=%s", document_id)
-        except Exception as e:
-            logger.error("[MQ消费] KG抽取失败 doc=%s err=%s", document_id, e, exc_info=True)
 
 
 async def handle_task_generate(message: aio_pika.abc.AbstractIncomingMessage, channel: aio_pika.abc.AbstractChannel):
@@ -510,13 +485,6 @@ async def _declare_topology(channel: aio_pika.abc.AbstractChannel):
     )
     await knowledge_result_q.bind(knowledge_exchange, "knowledge.result")
 
-    # KG 图谱抽取队列（TTL 30min，抽取+回写耗时长）
-    knowledge_kg_extract_q = await channel.declare_queue(
-        KNOWLEDGE_KG_EXTRACT_QUEUE, durable=True,
-        arguments={"x-message-ttl": 1_800_000, "x-dead-letter-exchange": "memory.dlx"},
-    )
-    await knowledge_kg_extract_q.bind(knowledge_exchange, KNOWLEDGE_KG_EXTRACT_KEY)
-
     # ===== 检修任务拓扑 =====
     task_exchange = await channel.declare_exchange(
         TASK_EXCHANGE, aio_pika.ExchangeType.TOPIC, durable=True
@@ -598,14 +566,6 @@ async def start_consumers():
     knowledge_queue = await knowledge_channel.get_queue(KNOWLEDGE_IMPORT_QUEUE)
     await knowledge_queue.consume(
         lambda msg: handle_knowledge_import(msg, knowledge_channel)
-    )
-
-    # KG 图谱抽取通道（prefetch=1，LLM抽取+回写耗时长，串行处理）
-    kg_extract_channel = await connection.channel()
-    await kg_extract_channel.set_qos(prefetch_count=1)
-    kg_extract_queue = await kg_extract_channel.get_queue(KNOWLEDGE_KG_EXTRACT_QUEUE)
-    await kg_extract_queue.consume(
-        lambda msg: handle_kg_extract(msg, kg_extract_channel)
     )
 
     # 检修任务生成通道（prefetch=1，LLM推理耗时长，串行处理）

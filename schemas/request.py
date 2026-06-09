@@ -694,3 +694,38 @@ class MemoryConsolidateRequest(BaseModel):
     memoryUnresolvedVOList: List[MemoryUnresolvedVO] = Field(default_factory=list, description="已有的未完成事项列表（用于判断是否解决）")
     previousSummary: Optional[str] = Field(default=None, description="上一轮整合产出的摘要，用于生成渐进式摘要")
 
+
+# ==================== 检修案例沉淀相关 ====================
+
+class CaseDraftRequest(BaseModel):
+    """
+    检修案例草稿生成请求
+
+    【功能关联】POST /ai/case/draft
+    【何时用】Java 端把检修任务/文件/语音等原始材料交给 Python，
+    由 AI 整理成结构化检修案例草稿（含一轮 Basic Reflection 自检）。
+
+    【字段说明】
+    - source_type: 材料来源（task/file/note_photo/voice）
+    - task_context: 任务拼装文本
+    - raw_text: 文件/OCR/语音转写文本
+    - images: 相关图片 URL 列表
+    """
+    source_type: str = "task"            # task/file/note_photo/voice
+    task_context: Optional[str] = None   # 任务拼装文本
+    raw_text: Optional[str] = None       # 文件/OCR/语音转写文本
+    images: Optional[List[str]] = None
+
+
+class CaseComplianceRequest(BaseModel):
+    """
+    案例内容合规审核请求
+
+    【功能关联】POST /ai/case/compliance
+    【何时用】内容入库前由门控 LLM 判断是否相关、合法。
+
+    【字段说明】
+    - text: 待审核文本
+    """
+    text: str
+
