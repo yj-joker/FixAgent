@@ -22,6 +22,7 @@ from schemas.request import (
     TemporaryPlanGenerateRequest,
     CaseDraftRequest,
     CaseComplianceRequest,
+    ValidateRequest,
 )
 from schemas.response import (
     BaseResponse,
@@ -36,7 +37,7 @@ from schemas.response import (
     CaseDraftResponse,
     CaseComplianceResponse,
 )
-from agents.case_agent import draft_case, check_compliance
+from agents.case_agent import draft_case, check_compliance, validate_task_text, validate_graph_entities
 from agents.fix_agent import get_fix_agent
 from agents.review_agent import get_review_agent
 from agents.memory_agent import get_memory_agent
@@ -1247,6 +1248,19 @@ async def ai_case_draft(req: CaseDraftRequest):
 async def ai_case_compliance(req: CaseComplianceRequest):
     """门控 LLM：判断内容是否可纳入设备检修知识库。"""
     return CaseComplianceResponse(**await check_compliance(req.text))
+
+
+@app.post("/ai/validate")
+async def ai_validate(req: ValidateRequest):
+    """通用入口校验守门：case=相关性+合规；task=宽松任务有效性；graph=待入图谱实体有效性。"""
+    if req.purpose == "case":
+        c = await check_compliance(req.text)
+        return {"valid": c["compliant"], "reason": c["reason"]}
+    if req.purpose == "graph":
+        v = await validate_graph_entities(req.text)
+        return {"valid": v["valid"], "reason": v["reason"]}
+    v = await validate_task_text(req.text)
+    return {"valid": v["valid"], "reason": v["reason"]}
 
 
 # ==================== 多模态向量化（文本或图片，不融合）====================
