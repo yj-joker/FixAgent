@@ -77,12 +77,13 @@ class FactRetrievalTool(BaseTool):
         Returns:
             {"results": {"关键词1": [{"id": "", "content": "", "score": 0.92}, ...], ...}}
         """
-        from services.vector_service import get_vector_service
+        from services.vector_service import build_redis_filter, get_vector_service
 
         vector_service = get_vector_service()
+        fact_filter = build_redis_filter(record_type="fact", status="active")
 
         async def search_one(query: str) -> tuple:
-            results = await vector_service.search_by_text(query, top_k=top_k)
+            results = await vector_service.search_by_text(query, top_k=top_k, filter=fact_filter)
             similar = [
                 {
                     "id": r["doc_id"],

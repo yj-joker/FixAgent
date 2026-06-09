@@ -36,6 +36,9 @@ def build_redis_filter(
     device_type: str = None,
     document_version: str = None,
     manual_type: str = None,
+    record_type: str = None,
+    status: str = None,
+    chunk_label: str = None,
 ) -> Optional[str]:
     """构建 RediSearch 过滤表达式，供 API 层和工具层复用。
 
@@ -63,6 +66,12 @@ def build_redis_filter(
         filter_parts.append(f"@document_version:{{{escape_redis_tag_value(document_version)}}}")
     if manual_type:
         filter_parts.append(f"@manual_type:{{{escape_redis_tag_value(manual_type)}}}")
+    if record_type:
+        filter_parts.append(f"@record_type:{{{escape_redis_tag_value(record_type)}}}")
+    if status:
+        filter_parts.append(f"@status:{{{escape_redis_tag_value(status)}}}")
+    if chunk_label:
+        filter_parts.append(f"@chunk_label:{{{escape_redis_tag_value(chunk_label)}}}")
     if not filter_parts:
         return None
     return " ".join(f"({p})" for p in filter_parts)
@@ -115,21 +124,79 @@ class VectorService:
                 "tags", "TAG",
                 "document_id", "TAG",
                 "chunk_type", "TAG",
+                "chunk_label", "TAG",
+                "record_type", "TAG",
+                "status", "TAG",
                 "device_type", "TAG",
                 "document_version", "TAG",
                 "manual_type", "TAG",
                 "created_at", "NUMERIC"
             )
+        self._backfill_scope_fields()
 
     def _migrate_index(self):
         """为已有索引追加 category/tags TAG 字段（字段已存在时静默跳过）"""
-        for field_name in ("category", "tags", "document_id", "chunk_type", "device_type", "document_version", "manual_type"):
+        for field_name in (
+            "category",
+            "tags",
+            "document_id",
+            "chunk_type",
+            "chunk_label",
+            "record_type",
+            "status",
+            "device_type",
+            "document_version",
+            "manual_type",
+        ):
             try:
                 self.redis.execute_command(
                     "FT.ALTER", self.INDEX_NAME, "SCHEMA", "ADD", field_name, "TAG"
                 )
             except redis.exceptions.ResponseError:
                 pass
+        self._backfill_scope_fields()
+
+    def _backfill_scope_fields(self) -> None:
+        """Promote metadata scope fields for already-imported hash records."""
+        migration_key = f"migration:{self.INDEX_NAME}:scope_fields_backfilled"
+        try:
+            if self.redis.get(migration_key):
+                return
+
+            for key in self.redis.scan_iter(match=f"{self.VECTOR_KEY_PREFIX}*", count=1000):
+                raw = self.redis.hgetall(key)
+                if not raw:
+                    continue
+
+                def _decode(value):
+                    return value.decode("utf-8") if isinstance(value, bytes) else value
+
+                fields = {_decode(k): _decode(v) for k, v in raw.items()}
+                try:
+                    metadata = json.loads(fields.get("metadata") or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+
+                doc_id = fields.get("id") or _decode(key).removeprefix(self.VECTOR_KEY_PREFIX)
+                inferred_record_type = metadata.get("record_type")
+                if not inferred_record_type:
+                    inferred_record_type = "fact" if metadata.get("type") == "fact" or str(doc_id).startswith("fact:") else "manual"
+                inferred_status = metadata.get("status") or ("active" if inferred_record_type == "fact" else "ready")
+
+                mapping = {}
+                for field_name in ("document_id", "chunk_type", "chunk_label", "device_type", "document_version", "manual_type"):
+                    value = metadata.get(field_name) or fields.get(field_name)
+                    if value:
+                        mapping[field_name] = value
+                mapping["record_type"] = inferred_record_type
+                mapping["status"] = inferred_status
+
+                if mapping:
+                    self.redis.hset(key, mapping=mapping)
+
+            self.redis.set(migration_key, "1")
+        except Exception as e:
+            logger.warning(f"scope field backfill skipped: {e}")
 
     def _to_bytes(self, vector: List[float]) -> bytes:
         """将向量列表转为字节数组"""
@@ -174,8 +241,35 @@ class VectorService:
                 mapping["category"] = category
             if tags:
                 mapping["tags"] = ",".join(tags) if isinstance(tags, list) else tags
-            for field_name in ("document_id", "chunk_type", "device_type", "document_version", "manual_type"):
-                value = (metadata or {}).get(field_name)
+            meta = metadata or {}
+            inferred_record_type = meta.get("record_type")
+            if not inferred_record_type and (meta.get("type") == "fact" or str(doc_id).startswith("fact:")):
+                inferred_record_type = "fact"
+            if not inferred_record_type and (meta.get("document_id") or meta.get("chunk_type")):
+                inferred_record_type = "manual"
+            inferred_status = meta.get("status")
+            if not inferred_status and inferred_record_type == "fact":
+                inferred_status = "active"
+            if not inferred_status and inferred_record_type == "manual":
+                inferred_status = "ready"
+
+            scope_fields = (
+                "document_id",
+                "chunk_type",
+                "chunk_label",
+                "record_type",
+                "status",
+                "device_type",
+                "document_version",
+                "manual_type",
+            )
+            for field_name in scope_fields:
+                if field_name == "record_type":
+                    value = inferred_record_type
+                elif field_name == "status":
+                    value = inferred_status
+                else:
+                    value = meta.get(field_name)
                 if value:
                     mapping[field_name] = value
 
@@ -354,6 +448,69 @@ class VectorService:
         except Exception as e:
             logger.warning(f"keyword_search failed: {e}")
             return []
+
+    @staticmethod
+    def _decode_redis_value(value: Any, default: str = "") -> str:
+        if value is None:
+            return default
+        if isinstance(value, bytes):
+            try:
+                return value.decode("utf-8")
+            except UnicodeDecodeError:
+                return default
+        return str(value)
+
+    def _decode_hash_record(self, raw: Dict[Any, Any], fallback_doc_id: str = "") -> Dict[str, Any]:
+        if not raw:
+            return {}
+        fields = {
+            self._decode_redis_value(key): self._decode_redis_value(value)
+            for key, value in raw.items()
+        }
+        metadata_raw = fields.get("metadata") or "{}"
+        try:
+            metadata = json.loads(metadata_raw)
+            if not isinstance(metadata, dict):
+                metadata = {}
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+
+        doc_id = fields.get("id") or fallback_doc_id
+        if not doc_id:
+            return {}
+        return {
+            "doc_id": doc_id,
+            "text": fields.get("text", ""),
+            "score": 0.0,
+            "raw_score": None,
+            "raw_score_type": "context_lookup",
+            "relevance_score": 0.0,
+            "metadata": metadata,
+        }
+
+    def get_vector_record(self, doc_id: str) -> Dict[str, Any]:
+        """Read one stored vector hash by doc_id without running a vector search."""
+        if not doc_id:
+            return {}
+        try:
+            raw = self.redis.hgetall(f"{self.VECTOR_KEY_PREFIX}{doc_id}")
+            return self._decode_hash_record(raw, fallback_doc_id=doc_id)
+        except Exception as e:
+            logger.warning(f"get_vector_record failed: {e}")
+            return {}
+
+    def get_vector_records(self, doc_ids: List[str]) -> List[Dict[str, Any]]:
+        """Read stored vector hashes by doc_id, preserving caller order and skipping misses."""
+        records = []
+        seen = set()
+        for doc_id in doc_ids or []:
+            if not doc_id or doc_id in seen:
+                continue
+            seen.add(doc_id)
+            record = self.get_vector_record(doc_id)
+            if record:
+                records.append(record)
+        return records
 
     async def search_by_text(
         self,

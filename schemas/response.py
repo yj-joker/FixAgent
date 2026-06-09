@@ -44,6 +44,16 @@ class DiagnosisItem(BaseModel):
     root_cause: str = Field(default="", serialization_alias="rootCause", description="根本原因说明")
     knowledge_basis: str = Field(default="", serialization_alias="knowledgeBasis", description="知识库依据")
 
+class EvidenceImage(BaseModel):
+    image_url: str = Field(default="", serialization_alias="imageUrl")
+    caption: str = ""
+    page: Optional[Any] = None
+    section_title: str = Field(default="", serialization_alias="sectionTitle")
+    document_id: str = Field(default="", serialization_alias="documentId")
+    source_chunk_id: str = Field(default="", serialization_alias="sourceChunkId")
+    context_role: str = Field(default="", serialization_alias="contextRole")
+
+
 class ChatStreamEvent(BaseModel):
     """
     对话流式事件模型
@@ -135,6 +145,11 @@ class ChatResponse(BaseResponse):
     tools_used: Optional[List[str]] = Field(default=None, description="使用的工具列表")
     latency_ms: Optional[int] = Field(default=None, description="响应延迟(ms)")
     verification: Optional[dict] = Field(default=None, description="3层确定性校验结果")
+    evidence_images: List[EvidenceImage] = Field(
+        default_factory=list,
+        serialization_alias="evidenceImages",
+        description="RAG retrieved image evidence for frontend display",
+    )
     diagnosis_items: Optional[List[DiagnosisItem]] = Field(
         default=None,
         serialization_alias="diagnosisItems",

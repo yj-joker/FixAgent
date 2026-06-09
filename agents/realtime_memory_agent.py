@@ -293,11 +293,12 @@ class RealtimeMemoryAgent(BaseAgent):
             - superseded_ids: 被替代的旧事实 doc_id 列表（Java端用这些ID在MySQL中标记superseded）
             - new_fact_ids: 新写入的事实 doc_id 列表（Java端用这些ID作为MySQL的factId）
         """
-        from services.vector_service import get_vector_service
+        from services.vector_service import build_redis_filter, get_vector_service
         from embeddings.text_embedding import get_text_embedding
 
         vector_service = get_vector_service()
         embedding_service = get_text_embedding()
+        fact_filter = build_redis_filter(record_type="fact", status="active")
         superseded_ids = []  # 收集被替代的旧事实ID
         new_fact_ids = []    # 收集新写入的事实ID
         old_seq_ranges = []  # 收集旧事实的sourceSeqRange，供Java端合并
@@ -308,7 +309,7 @@ class RealtimeMemoryAgent(BaseAgent):
             try:
                 # 1. 用错误内容的语义去检索旧事实
                 old_vector = await embedding_service.embed(correction.wrong_content)
-                old_results = vector_service.search(old_vector, top_k=3)
+                old_results = vector_service.search(old_vector, top_k=3, filter=fact_filter)
 
                 # 找到匹配的旧事实（score越低越相似，COSINE距离）
                 old_seq_range = ""
@@ -340,6 +341,7 @@ class RealtimeMemoryAgent(BaseAgent):
                             text=correction.correct_content,
                             vector=new_vector,
                             metadata={
+                                "record_type": "fact",
                                 "type": "fact",
                                 "status": "conflict_pending",
                                 "session_id": session_id,
@@ -374,6 +376,7 @@ class RealtimeMemoryAgent(BaseAgent):
                     text=correction.correct_content,
                     vector=new_vector,
                     metadata={
+                        "record_type": "fact",
                         "type": "fact",
                         "status": "active",
                         "session_id": session_id,

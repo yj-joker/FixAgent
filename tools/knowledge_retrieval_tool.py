@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 from typing import Dict, List, Optional
 
 from embeddings.multimodal_embedding import get_multimodal_embedding
 from embeddings.text_embedding import get_text_embedding
 from schemas.models import VectorSearchResult
+from services.retrieval_planner import build_retrieval_plan, confidence_intent
+from services.retrieval_ranker import rank_candidates, should_use_expensive_rerank
+from services.retrieval_context_expander import expand_retrieval_context
 from services.retrieval_policy import (
-    detect_query_intent,
     diversify_candidates,
-    rerank_candidates,
     summarize_confidence,
 )
 from services.vector_service import build_redis_filter, escape_redis_tag_value, get_vector_service
@@ -65,8 +67,11 @@ class KnowledgeRetrievalTool(BaseTool):
         device_type: str = None,
         document_version: str = None,
         manual_type: str = None,
+        record_type: str = None,
+        status: str = None,
+        chunk_label: str = None,
     ) -> Optional[str]:
-        if not any((document_id, chunk_type, device_type, document_version, manual_type)):
+        if not any((document_id, chunk_type, device_type, document_version, manual_type, record_type, status, chunk_label)):
             parts = []
             if category:
                 parts.append(f"@category:{{{escape_redis_tag_value(category)}}}")
@@ -83,6 +88,9 @@ class KnowledgeRetrievalTool(BaseTool):
             device_type=device_type,
             document_version=document_version,
             manual_type=manual_type,
+            record_type=record_type,
+            status=status,
+            chunk_label=chunk_label,
         )
 
     @staticmethod
@@ -127,22 +135,50 @@ class KnowledgeRetrievalTool(BaseTool):
             )
         return list(merged.values())
 
-    async def _embed_query(self, query: str, image_urls: List[str] = None) -> List[float]:
+    @staticmethod
+    def _average_vectors(vectors: List[List[float]]) -> Optional[List[float]]:
+        valid_vectors = [vector for vector in vectors if vector]
+        if not valid_vectors:
+            return None
+        return [sum(values) / len(valid_vectors) for values in zip(*valid_vectors)]
+
+    async def _embed_query_vectors(self, query: str, image_urls: List[str] = None) -> Dict[str, List[float] | List[List[float]]]:
         try:
             if image_urls:
                 result = await get_multimodal_embedding().embed(text=query, image_urls=image_urls)
-                vectors = []
-                if result.get("text_vector"):
-                    vectors.append(result["text_vector"])
-                vectors.extend(result.get("image_vectors", []))
-                if not vectors:
+                text_vector = result.get("text_vector")
+                image_vectors = result.get("image_vectors", [])
+                if not text_vector and not image_vectors:
                     raise ToolException(code="EMBEDDING_FAILED", message="multimodal embedding returned no vectors")
-                return [sum(values) / len(vectors) for values in zip(*vectors)]
-            return await get_text_embedding().embed(query)
+                return {
+                    "text_vector": text_vector,
+                    "image_vectors": image_vectors,
+                    "image_vector": self._average_vectors(image_vectors),
+                }
+            return {"text_vector": await get_text_embedding().embed(query), "image_vectors": [], "image_vector": None}
         except ToolException:
             raise
         except Exception as e:
             raise ToolException(code="EMBEDDING_FAILED", message=f"embedding failed: {e}")
+
+    async def _embed_query(self, query: str, image_urls: List[str] = None) -> List[float]:
+        vectors = await self._embed_query_vectors(query, image_urls)
+        text_vector = vectors.get("text_vector")
+        image_vector = vectors.get("image_vector")
+        if image_urls:
+            fused = self._average_vectors([vector for vector in (text_vector, image_vector) if vector])
+            if fused:
+                return fused
+        if text_vector:
+            return text_vector
+        if image_vector:
+            return image_vector
+        raise ToolException(code="EMBEDDING_FAILED", message="embedding returned no vectors")
+
+    @staticmethod
+    def _route_name(route: str, relaxed: bool = False) -> str:
+        route_name = "table_vector" if route == "table" else route
+        return f"{route_name}_relaxed" if relaxed else route_name
 
     async def _execute(
         self,
@@ -157,86 +193,89 @@ class KnowledgeRetrievalTool(BaseTool):
         document_version: str = None,
         manual_type: str = None,
     ) -> List[VectorSearchResult]:
-        vector = await self._embed_query(query, image_urls)
-        intent = detect_query_intent(query)
+        query_vectors = await self._embed_query_vectors(query, image_urls)
+        plan = build_retrieval_plan(query, has_images=bool(image_urls), explicit_chunk_type=chunk_type)
+        confidence_type = confidence_intent(plan)
         recall_k = max(top_k * 3, top_k)
-        base_filter = self._build_filter(
-            category=category,
-            tags=tags,
-            document_id=document_id,
-            chunk_type=chunk_type,
-            device_type=device_type,
-            document_version=document_version,
-            manual_type=manual_type,
-        )
+        optional_filter_used = any((category, tags, device_type, document_version, manual_type))
+
+        def filter_for_route(route: str, relaxed: bool = False) -> Optional[str]:
+            route_chunk_type = chunk_type
+            if not route_chunk_type:
+                if route == "table":
+                    route_chunk_type = "table"
+                elif route == "image_vector":
+                    route_chunk_type = "image"
+                elif route == "image_summary":
+                    route_chunk_type = "image_summary"
+            return self._build_filter(
+                category=None if relaxed else category,
+                tags=None if relaxed else tags,
+                document_id=document_id,
+                chunk_type=route_chunk_type,
+                device_type=None if relaxed else device_type,
+                document_version=None if relaxed else document_version,
+                manual_type=None if relaxed else manual_type,
+                record_type="manual",
+                status="ready",
+            )
+
+        text_vector = query_vectors.get("text_vector")
+        image_vector = query_vectors.get("image_vector") or text_vector
+
+        async def run_route(route: str, relaxed: bool = False) -> List[Dict]:
+            route_filter = filter_for_route(route, relaxed=relaxed)
+            route_name = self._route_name(route, relaxed=relaxed)
+            if route == "keyword":
+                if not hasattr(vector_service, "keyword_search"):
+                    return []
+                docs = await asyncio.to_thread(
+                    vector_service.keyword_search,
+                    query,
+                    top_k=recall_k,
+                    include_metadata=True,
+                    filter=route_filter,
+                )
+                return [self._mark_route(doc, route_name) for doc in docs]
+
+            route_vector = text_vector
+            if route == "image_vector":
+                route_vector = image_vector
+            elif route == "image_summary":
+                route_vector = text_vector or image_vector
+            if not route_vector:
+                return []
+            docs = await asyncio.to_thread(
+                vector_service.search,
+                route_vector,
+                top_k=recall_k,
+                include_metadata=True,
+                filter=route_filter,
+            )
+            return [self._mark_route(doc, route_name) for doc in docs]
 
         try:
             vector_service = get_vector_service()
-            candidates = []
-            if chunk_type or intent != "image":
-                candidates.extend(
-                    self._mark_route(doc, "semantic")
-                    for doc in vector_service.search(
-                        vector, top_k=recall_k, include_metadata=True, filter=base_filter
-                    )
-                )
-            if hasattr(vector_service, "keyword_search") and (chunk_type or intent != "image"):
-                candidates.extend(
-                    self._mark_route(doc, "keyword")
-                    for doc in vector_service.keyword_search(
-                        query, top_k=recall_k, include_metadata=True, filter=base_filter
-                    )
-                )
-            if not chunk_type and intent in {"image", "mixed"}:
-                image_filter = self._build_filter(
-                    category, tags, document_id, "image", device_type, document_version, manual_type
-                )
-                summary_filter = self._build_filter(
-                    category, tags, document_id, "image_summary", device_type, document_version, manual_type
-                )
-                candidates.extend(
-                    self._mark_route(doc, "image_vector")
-                    for doc in vector_service.search(vector, top_k=recall_k, include_metadata=True, filter=image_filter)
-                )
-                candidates.extend(
-                    self._mark_route(doc, "image_summary")
-                    for doc in vector_service.search(vector, top_k=recall_k, include_metadata=True, filter=summary_filter)
-                )
-            if not chunk_type and intent in {"table", "mixed"}:
-                table_filter = self._build_filter(
-                    category, tags, document_id, "table", device_type, document_version, manual_type
-                )
-                candidates.extend(
-                    self._mark_route(doc, "table_vector")
-                    for doc in vector_service.search(vector, top_k=recall_k, include_metadata=True, filter=table_filter)
-                )
-            if not candidates and base_filter and not document_id:
+            route_results = await asyncio.gather(*(run_route(route) for route in plan.routes))
+            candidates = [doc for docs in route_results for doc in docs]
+
+            if not candidates and optional_filter_used and not document_id:
                 logger.info("No evidence matched optional retrieval filters; retrying without inferred metadata filters")
-                relaxed_filter = self._build_filter(chunk_type=chunk_type) if chunk_type else None
-                if chunk_type or intent != "image":
-                    candidates.extend(
-                        self._mark_route(doc, "semantic_relaxed")
-                        for doc in vector_service.search(
-                            vector, top_k=recall_k, include_metadata=True, filter=relaxed_filter
-                        )
-                    )
-                if hasattr(vector_service, "keyword_search") and (chunk_type or intent != "image"):
-                    candidates.extend(
-                        self._mark_route(doc, "keyword_relaxed")
-                        for doc in vector_service.keyword_search(
-                            query, top_k=recall_k, include_metadata=True, filter=relaxed_filter
-                        )
-                    )
+                relaxed_results = await asyncio.gather(*(run_route(route, relaxed=True) for route in plan.routes))
+                candidates.extend(doc for docs in relaxed_results for doc in docs)
         except Exception as e:
             raise ToolException(code="SEARCH_FAILED", message=f"retrieval search failed: {e}")
 
         merged = self._merge_candidates(candidates)
-        ranked = rerank_candidates(query, merged, intent=intent)
-        selected = diversify_candidates(ranked, top_k=top_k, intent=intent)
-        confidence = summarize_confidence(selected, intent=intent)
+        ranked = rank_candidates(query, merged, plan)
+        expensive_rerank_recommended = should_use_expensive_rerank(plan, ranked)
+        selected = diversify_candidates(ranked, top_k=top_k, intent=confidence_type)
+        confidence = summarize_confidence(selected, intent=confidence_type)
+        expanded_selected = expand_retrieval_context(selected, vector_service, max_expanded=6)
+        expanded_count = max(0, len(expanded_selected) - len(selected))
 
         results: List[VectorSearchResult] = []
-        for doc in selected:
+        for doc in expanded_selected:
             metadata = dict(doc.get("metadata") or {})
             if metadata.get("chunk_type") == "image_summary":
                 metadata["source_chunk_type"] = "image_summary"
@@ -245,11 +284,16 @@ class KnowledgeRetrievalTool(BaseTool):
             metadata["retrieval_routes"] = routes
             metadata["matched_types"] = confidence["matched_types"]
             metadata["retrieval_confidence"] = confidence["confidence"]
+            metadata["retrieval_plan_intent"] = plan.intent
+            metadata["requires_strict_evidence"] = plan.requires_strict_evidence
+            metadata["expensive_rerank_recommended"] = expensive_rerank_recommended
+            metadata["retrieval_context_expanded_count"] = expanded_count
             metadata["confidence_reason"] = {
                 "best_relevance_score": confidence["best_relevance_score"],
                 "candidate_count": confidence["candidate_count"],
                 "dual_image_hit": confidence["dual_image_hit"],
-                "intent": intent,
+                "intent": plan.intent,
+                "confidence_intent": confidence_type,
             }
             if confidence["confidence"] == "low":
                 metadata["answer_policy"] = "insufficient_evidence"

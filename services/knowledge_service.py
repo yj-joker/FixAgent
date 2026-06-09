@@ -22,6 +22,7 @@ from embeddings.text_embedding import get_text_embedding
 from embeddings.image_embedding import get_image_embedding
 from services.file_storage import get_file_storage
 from services.image_summary_service import get_image_summary_service
+from services.chunking_policy import build_section_index_chunks
 from services.vector_service import get_vector_service
 from services.manual_graph_extractor import select_schema_sections
 
@@ -135,6 +136,8 @@ class KnowledgeService:
         document_id = document_id or hashlib.md5(f"{file_name}|{file_url}".encode()).hexdigest()[:12]
         doc_prefix = hashlib.md5(document_id.encode()).hexdigest()[:8]
         common_metadata = {
+            "record_type": "manual",
+            "status": "ready",
             "file_name": file_name,
             "document_id": document_id,
             "source_file_url": source_file_url,
@@ -163,37 +166,56 @@ class KnowledgeService:
             section_title = section.get("section_title", f"第{sec_idx + 1}章")
             page_range = section.get("page_range", "")
             sec_category = category or section_title
+            structured_chunks = build_section_index_chunks(section, section_index=sec_idx)
+            local_chunk_doc_ids = {}
+            image_policy_chunks = [
+                chunk for chunk in structured_chunks
+                if chunk.get("chunk_type") == "image"
+            ]
 
             # 2a. 文本块 → 分批 embed_batch → 入库
-            raw_chunks = section.get("text_chunks", [])
             valid_chunks = [
-                self._normalize_text_chunk(chunk)
-                for chunk in raw_chunks
-                if len(self._normalize_text_chunk(chunk)["text"].strip()) >= 10
+                chunk for chunk in structured_chunks
+                if chunk.get("chunk_type") == "text" and len((chunk.get("text") or "").strip()) >= 10
             ]
+            table_chunks_for_refs = [
+                chunk for chunk in structured_chunks
+                if chunk.get("chunk_type") == "table" and (chunk.get("text") or "").strip()
+            ]
+            for global_i, chunk in enumerate(valid_chunks):
+                local_chunk_doc_ids[chunk.get("id")] = f"{doc_prefix}:{sec_idx:02d}:txt:{global_i:04d}"
+            for t_idx, table_chunk in enumerate(table_chunks_for_refs):
+                local_chunk_doc_ids[table_chunk.get("id")] = f"{doc_prefix}:{sec_idx:02d}:tbl:{t_idx:04d}"
+            for policy_image in image_policy_chunks:
+                policy_meta = policy_image.get("metadata") or {}
+                image_index = policy_meta.get("image_index")
+                if image_index is not None:
+                    local_chunk_doc_ids[policy_image.get("id")] = f"{doc_prefix}:{sec_idx:02d}:img:{int(image_index):04d}"
             for batch_start in range(0, len(valid_chunks), self._BATCH_SIZE):
                 batch = valid_chunks[batch_start:batch_start + self._BATCH_SIZE]
                 vectors = await self.text_emb.embed_batch([chunk["text"] for chunk in batch])
                 docs = []
                 for i, (chunk, vec) in enumerate(zip(batch, vectors)):
                     global_i = batch_start + i
-                    chunk_id = f"{doc_prefix}:{sec_idx:02d}:txt:{global_i:04d}"
+                    chunk_id = local_chunk_doc_ids.get(chunk.get("id")) or f"{doc_prefix}:{sec_idx:02d}:txt:{global_i:04d}"
+                    local_chunk_doc_ids[chunk.get("id")] = chunk_id
+                    chunk_metadata = {
+                        **common_metadata,
+                        **(chunk.get("metadata") or {}),
+                        "section_title": section_title,
+                        "page_range": page_range,
+                        "chunk_type": "text",
+                        "page": chunk.get("page"),
+                        "chunk_label": chunk.get("chunk_label", "general"),
+                    }
+                    chunk_metadata = self._resolve_chunk_refs(chunk_metadata, local_chunk_doc_ids)
                     docs.append({
                         "doc_id": chunk_id,
                         "text": chunk["text"],
                         "vector": vec,
                         "category": sec_category,
                         "tags": tags,
-                        "metadata": {
-                            **common_metadata,
-                            "section_title": section_title,
-                            "page_range": page_range,
-                            "chunk_type": "text",
-                            "page": chunk.get("page"),
-                            "chunk_label": chunk.get("chunk_label", "page"),
-                            "context_before": chunk.get("context_before", ""),
-                            "context_after": chunk.get("context_after", "")
-                        }
+                        "metadata": chunk_metadata
                     })
                 written = self.vector_svc.add_vector_batch(docs)
                 if written != len(docs):
@@ -205,27 +227,35 @@ class KnowledgeService:
                     raise RuntimeError("failed to write all text vector records")
                 text_count += len(docs)
 
-            # 2b. 表格 → 转文本 → 入库
-            for t_idx, table in enumerate(section.get("tables", [])):
-                table_text = self._table_to_text(table)
+            # 2b. 表格 → 整表块 + 行级参数块 → 入库
+            table_chunks = [
+                chunk for chunk in structured_chunks
+                if chunk.get("chunk_type") == "table" and (chunk.get("text") or "").strip()
+            ]
+            for t_idx, table_chunk in enumerate(table_chunks):
+                table_text = table_chunk["text"]
                 if not table_text.strip():
                     continue
                 vec = await self.text_emb.embed(table_text)
-                table_id = f"{doc_prefix}:{sec_idx:02d}:tbl:{t_idx:04d}"
+                table_id = local_chunk_doc_ids.get(table_chunk.get("id")) or f"{doc_prefix}:{sec_idx:02d}:tbl:{t_idx:04d}"
+                local_chunk_doc_ids[table_chunk.get("id")] = table_id
+                table_metadata = {
+                    **common_metadata,
+                    **(table_chunk.get("metadata") or {}),
+                    "section_title": section_title,
+                    "page_range": page_range,
+                    "chunk_type": "table",
+                    "page": table_chunk.get("page"),
+                    "chunk_label": table_chunk.get("chunk_label", "table_full"),
+                }
+                table_metadata = self._resolve_chunk_refs(table_metadata, local_chunk_doc_ids)
                 table_written = self.vector_svc.add_vector(
                     doc_id=table_id,
                     text=table_text,
                     vector=vec,
                     category=sec_category,
                     tags=tags,
-                    metadata={
-                        **common_metadata,
-                        "section_title": section_title,
-                        "page_range": page_range,
-                        "chunk_type": "table",
-                        "page": table.get("page"),
-                        "caption": table.get("caption", "")
-                    }
+                    metadata=table_metadata
                 )
                 if not table_written:
                     self._mark_failed_import(
@@ -238,6 +268,15 @@ class KnowledgeService:
 
             # 2c. 图片 → 图注文本向量化 → 入库
             for img_idx, img in enumerate(section.get("images", [])):
+                policy_image = next(
+                    (
+                        chunk for chunk in image_policy_chunks
+                        if (chunk.get("metadata") or {}).get("image_index") == img_idx
+                    ),
+                    {},
+                )
+                policy_metadata = dict(policy_image.get("metadata") or {})
+                policy_metadata = self._resolve_chunk_refs(policy_metadata, local_chunk_doc_ids)
                 caption = img.get("caption", "").strip()
                 img_name = img.get("image_name", f"img_{img_idx}")
                 local_path = img.get("local_path", "")
@@ -262,9 +301,11 @@ class KnowledgeService:
                     tags=tags,
                     metadata={
                         **common_metadata,
+                        **policy_metadata,
                         "section_title": section_title,
                         "page_range": page_range,
                         "chunk_type": "image",
+                        "chunk_label": "image",
                         "page": img.get("page"),
                         "image_name": img_name,
                         "local_path": local_path,
@@ -298,9 +339,11 @@ class KnowledgeService:
                         tags=tags,
                         metadata={
                             **common_metadata,
+                            **policy_metadata,
                             "section_title": section_title,
                             "page_range": page_range,
                             "chunk_type": "image_summary",
+                            "chunk_label": "image_summary",
                             "page": img.get("page"),
                             "image_name": img_name,
                             "image_url": image_url,
@@ -409,6 +452,33 @@ class KnowledgeService:
             "context_before": "",
             "context_after": "",
         }
+
+    @staticmethod
+    def _resolve_chunk_refs(metadata: dict, local_chunk_doc_ids: dict) -> dict:
+        resolved = dict(metadata or {})
+        if not local_chunk_doc_ids:
+            return resolved
+
+        for field_name in (
+            "prev_chunk_id",
+            "next_chunk_id",
+            "parent_table_chunk_id",
+            "source_image_id",
+            "summary_chunk_id",
+        ):
+            value = resolved.get(field_name)
+            if isinstance(value, str) and value in local_chunk_doc_ids:
+                resolved[field_name] = local_chunk_doc_ids[value]
+
+        for field_name in ("related_step_chunk_ids", "related_text_chunk_ids"):
+            values = resolved.get(field_name)
+            if isinstance(values, list):
+                resolved[field_name] = [
+                    local_chunk_doc_ids.get(value, value)
+                    for value in values
+                    if value
+                ]
+        return resolved
 
     def _mark_failed_import(
         self,

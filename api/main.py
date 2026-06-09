@@ -3,6 +3,7 @@ import logging
 import os
 import time
 from functools import partial
+from typing import List
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -23,6 +24,7 @@ from schemas.request import (
 from schemas.response import (
     BaseResponse,
     ChatResponse,
+    EvidenceImage,
     KnowledgeCacheClearResponse,
     KnowledgeImportResponse,
     KnowledgeSearchResponse,
@@ -34,7 +36,7 @@ from agents.fix_agent import get_fix_agent
 from agents.review_agent import get_review_agent
 from agents.memory_agent import get_memory_agent
 from agents.base_agent import AgentInput, AgentOutput
-from services.vector_service import get_vector_service
+from services.vector_service import build_redis_filter, get_vector_service
 from services.llm_service import get_llm_service
 from services.image_summary_service import get_image_summary_service
 from services.intent_router import get_intent_router
@@ -158,6 +160,21 @@ def _is_knowledge_inventory_question(message: str) -> bool:
     return any(term in text for term in inventory_terms) and any(term in text for term in knowledge_terms)
 
 
+def _is_high_risk_rag_question(message: str) -> bool:
+    text = message or ""
+    parameter_terms = (
+        "参数", "多少", "扭矩", "力矩", "间隙", "规格", "型号", "标准", "数值",
+        "N·m", "N路m", "mm", "MPa", "kPa", "电压", "电流", "torque", "spec",
+    )
+    procedure_terms = ("怎么", "如何", "步骤", "流程", "拆", "装", "更换", "维修", "检修", "安装", "调整", "操作")
+    diagnosis_terms = ("故障", "原因", "过热", "异响", "漏油", "启动不了", "报警", "异常", "怎么回事", "排除")
+    formal_plan_terms = ("检修方案", "维修方案", "SOP", "工单", "作业指导书", "安全措施")
+    return any(
+        term in text
+        for term in parameter_terms + procedure_terms + diagnosis_terms + formal_plan_terms
+    )
+
+
 def _should_use_rag_fast_path(request: ChatRequest) -> bool:
     """保守触发简单 RAG 快速路径，避免普通诊断问题误绕过 ReAct。"""
     if request.images:
@@ -167,6 +184,8 @@ def _should_use_rag_fast_path(request: ChatRequest) -> bool:
         return False
     message = request.message or ""
     if _is_knowledge_inventory_question(message):
+        return False
+    if _is_high_risk_rag_question(message):
         return False
     if request.mode == AgentMode.RETRIEVAL:
         return True
@@ -269,6 +288,66 @@ def _evidence_item_to_text(item, index: int) -> str:
     page = metadata.get("page_number") or metadata.get("page")
     page_text = f", page={page}" if page else ""
     return f"[证据{index}] source={source}, score={score}{page_text}\n{content}"
+
+
+def _plain_dict(value) -> dict:
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _iter_trace_result_items(metadata: dict):
+    trace = (metadata or {}).get("react_trace") or []
+    for step in trace:
+        step_data = _plain_dict(step)
+        for tool_call in step_data.get("tool_calls") or []:
+            call_data = _plain_dict(tool_call)
+            result_data = call_data.get("result_data")
+            if result_data is None:
+                result_data = call_data.get("data")
+            if result_data is None:
+                result_data = call_data.get("result")
+            result_data = _plain_dict(result_data) if hasattr(result_data, "model_dump") else result_data
+            if isinstance(result_data, dict) and isinstance(result_data.get("data"), list):
+                result_data = result_data["data"]
+            if isinstance(result_data, list):
+                for item in result_data:
+                    item_data = _plain_dict(item)
+                    if item_data:
+                        yield item_data
+
+
+def _extract_evidence_images(metadata: dict) -> List[EvidenceImage]:
+    images: List[EvidenceImage] = []
+    seen = set()
+    for item in _iter_trace_result_items(metadata):
+        item_meta = dict(item.get("metadata") or {})
+        image_url = item_meta.get("image_url") or item_meta.get("imageUrl") or item.get("image_url")
+        if not image_url:
+            continue
+        chunk_type = item_meta.get("chunk_type") or item_meta.get("source_chunk_type") or ""
+        has_image_metadata = bool(item_meta.get("caption") or item_meta.get("image_title") or item_meta.get("image_name"))
+        if chunk_type not in {"image", "image_summary"} and not has_image_metadata:
+            continue
+
+        source_chunk_id = str(item.get("id") or item.get("doc_id") or item_meta.get("source_image_id") or "")
+        dedupe_key = (image_url, source_chunk_id)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        images.append(
+            EvidenceImage(
+                image_url=image_url,
+                caption=item_meta.get("caption") or item_meta.get("image_title") or item.get("content", ""),
+                page=item_meta.get("page_number") or item_meta.get("page"),
+                section_title=item_meta.get("section_title", ""),
+                document_id=item_meta.get("document_id", ""),
+                source_chunk_id=source_chunk_id,
+                context_role=item_meta.get("context_role", ""),
+            )
+        )
+    return images
 
 
 async def _run_rag_fast_path(request: ChatRequest) -> AgentOutput | None:
@@ -411,7 +490,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
                     message=fix_result.message,
                     tools_used=None,
                     latency_ms=fix_result.latency_ms
-                ).model_dump()
+                ).model_dump(by_alias=True)
             )
 
         review_t0 = time.time()
@@ -419,6 +498,8 @@ async def chat(request: ChatRequest) -> ChatResponse:
             final_result = fix_result
         else:
             final_result = await get_review_agent().review(fix_result, level=review_level)
+        if "react_trace" not in final_result.metadata and fix_result.metadata.get("react_trace"):
+            final_result.metadata["react_trace"] = fix_result.metadata["react_trace"]
         review_phase_ms = int((time.time() - review_t0) * 1000)
 
         verification = final_result.metadata.get("verification", {})
@@ -434,6 +515,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         )
 
         response_message, diagnosis_items = _extract_structured_chat_payload(final_result.message)
+        evidence_images = _extract_evidence_images(final_result.metadata)
 
         return ChatResponse(
             session_id=request.session_id,
@@ -442,6 +524,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
             latency_ms=final_result.latency_ms,
             verification=verification if has_issues else None,
             diagnosis_items=diagnosis_items,
+            evidence_images=evidence_images,
         )
     except Exception as e:
         logger.exception(f"[chat] session={request.session_id} error")
@@ -626,6 +709,7 @@ async def chat_stream(request: ChatRequest):
             fix_latency = done_data.get("latency_ms", 0)
             verified_tools = tools_in_stream if tools_in_stream else stream_tools_used
             verified_latency = fix_latency
+            evidence_images = _extract_evidence_images({**stream_metadata, "react_trace": stream_react_trace})
 
             # —— 检修助手出口兜底（仅 maintenance 场景）——
             # 模型若吐出控制结构 JSON（needs_more_tools / 残缺 {"message"..}）或套话式软拒答，
@@ -666,8 +750,11 @@ async def chat_stream(request: ChatRequest):
                     verified_output = fix_output
                 else:
                     verified_output = await get_review_agent().review(fix_output)
+                if "react_trace" not in verified_output.metadata and fix_output.metadata.get("react_trace"):
+                    verified_output.metadata["react_trace"] = fix_output.metadata["react_trace"]
                 verification = verified_output.metadata.get("verification", {})
                 has_issues = verified_output.metadata.get("verification_has_issues", False)
+                evidence_images = _extract_evidence_images(verified_output.metadata)
 
                 # 流式输出最终回答（逐字），在未验证语句前插入 marker 事件
                 final_message, diagnosis_items = _extract_structured_chat_payload(verified_output.message)
@@ -723,6 +810,11 @@ async def chat_stream(request: ChatRequest):
             }
             if diagnosis_items:
                 final_done["data"]["diagnosisItems"] = _serialize_diagnosis_items(diagnosis_items)
+            if evidence_images:
+                final_done["data"]["evidenceImages"] = [
+                    image.model_dump(by_alias=True)
+                    for image in evidence_images
+                ]
             yield f"data: {json_dumps(final_done)}\n\n"
 
         except Exception as e:
@@ -968,7 +1060,8 @@ async def search_facts(query: str, top_k: int = 5, session_ids: str = "",
         t0 = t.time()
         svc = get_vector_service()
         # 粗筛：多取候选，留给 reranker 精排
-        results = await svc.search_by_text(query, top_k=top_k * 3)
+        fact_filter = build_redis_filter(record_type="fact", status="active")
+        results = await svc.search_by_text(query, top_k=top_k * 3, filter=fact_filter)
 
         # 过滤：只保留 type=fact, status=active, 属于当前用户
         candidates = []

@@ -180,10 +180,10 @@ class DocumentParserTool(BaseTool):
             for page_num, page in enumerate(pdf.pages, start=1):
                 # 1. 提取文字
                 text = page.extract_text() or ""
+                text_blocks = self._extract_text_blocks_pdfplumber(page, page_num)
 
                 # 2. 提取表格
-                raw_tables = page.extract_tables()
-                tables = self._clean_tables(raw_tables)
+                tables = self._extract_tables_pdfplumber(page)
 
                 # 3. 提取图片
                 images = []
@@ -201,6 +201,8 @@ class DocumentParserTool(BaseTool):
                 pages_data.append({
                     "page": page_num,
                     "text": text,
+                    "text_blocks": text_blocks,
+                    "height": float(getattr(page, "height", 792) or 792),
                     "tables": tables,
                     "images": images
                 })
@@ -264,20 +266,28 @@ class DocumentParserTool(BaseTool):
                     with open(image_path, "wb") as f:
                         f.write(image_bytes)
 
+                rects = page.get_image_rects(xref)
+                bbox = None
+                if rects:
+                    rect = rects[0]
+                    bbox = [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)]
+
                 images.append({
                     "page": page_num,
                     "image_name": image_name,
                     "local_path": image_path,
                     "width": base_image.get("width"),
                     "height": base_image.get("height"),
-                    "format": ext
+                    "format": ext,
+                    "bbox": bbox,
                 })
             except Exception:
                 continue
 
         # 尝试从页面文字中匹配图注
         page_text = page.get_text("text")
-        self._attach_captions(images, page_text)
+        caption_blocks = self._extract_text_blocks_fitz(page, page_num)
+        self._attach_captions(images, page_text, caption_blocks=caption_blocks)
 
         return images
 
@@ -298,6 +308,7 @@ class DocumentParserTool(BaseTool):
                 "bottom": img.get("bottom"),
                 "width": img.get("width"),
                 "height": img.get("height"),
+                "bbox": [img.get("x0"), img.get("top"), img.get("x1"), img.get("bottom")],
                 "note": "图片数据未提取（PyMuPDF 不可用），请手动截取"
             })
         return images
@@ -305,7 +316,7 @@ class DocumentParserTool(BaseTool):
     # ==================== 图注匹配 ====================
 
     @staticmethod
-    def _attach_captions(images: list, page_text: str) -> None:
+    def _attach_captions_legacy(images: list, page_text: str) -> None:
         """
         从页面文字中找图注（图X-X 格式），按文字位置匹配图片。
 
@@ -333,6 +344,59 @@ class DocumentParserTool(BaseTool):
     # ==================== 表格清理 ====================
 
     @staticmethod
+    def _attach_captions(images: list, page_text: str, caption_blocks: list | None = None) -> None:
+        """Attach the nearest figure caption to each image when coordinates are available."""
+        if not images:
+            return
+
+        if caption_blocks:
+            candidates = [
+                block for block in caption_blocks
+                if DocumentParserTool._looks_like_caption(block.get("text", ""))
+                and DocumentParserTool._bbox(block)
+            ]
+            for image in images:
+                image_bbox = DocumentParserTool._bbox(image)
+                if not image_bbox:
+                    continue
+                best = None
+                best_score = -1.0
+                for caption in candidates:
+                    caption_bbox = DocumentParserTool._bbox(caption)
+                    if not caption_bbox:
+                        continue
+                    vertical_gap = caption_bbox[1] - image_bbox[3]
+                    if vertical_gap < -8 or vertical_gap > 180:
+                        continue
+                    overlap = DocumentParserTool._horizontal_overlap_ratio(image_bbox, caption_bbox)
+                    if overlap <= 0:
+                        continue
+                    score = overlap * 100 - vertical_gap
+                    if score > best_score:
+                        best = caption
+                        best_score = score
+                if best:
+                    image["caption"] = str(best.get("text", "")).strip()
+                    image["caption_confidence"] = 0.9
+
+        caption_pattern = re.compile(
+            r'(?:图|圖|Figure|Fig\.?)\s*\d+(?:[-–—]\d+)?\s*[:：]?\s*(.+?)(?:\n|(?:图|圖|Figure|Fig\.?)\s*\d+|\Z)',
+            re.IGNORECASE | re.DOTALL,
+        )
+        captions = [caption.strip() for caption in caption_pattern.findall(page_text or "") if caption.strip()]
+        if not captions:
+            return
+
+        sorted_images = sorted(
+            [image for image in images if not image.get("caption")],
+            key=lambda x: (DocumentParserTool._bbox(x) or [9999, 9999, 9999, 9999])[1],
+        )
+        for i, img in enumerate(sorted_images):
+            if i < len(captions):
+                img["caption"] = captions[i]
+                img["caption_confidence"] = 0.55
+
+    @staticmethod
     def _clean_tables(raw_tables: list) -> list:
         """清理 pdfplumber 提取的表格：去 None、去空行、剥离空白"""
         cleaned = []
@@ -349,16 +413,178 @@ class DocumentParserTool(BaseTool):
         return cleaned
 
     @staticmethod
+    def _bbox(item: dict) -> list | None:
+        bbox = item.get("bbox")
+        if bbox and len(bbox) == 4 and all(value is not None for value in bbox):
+            return [float(value) for value in bbox]
+        if all(item.get(name) is not None for name in ("x0", "top", "x1", "bottom")):
+            return [float(item["x0"]), float(item["top"]), float(item["x1"]), float(item["bottom"])]
+        return None
+
+    @staticmethod
+    def _bbox_area(bbox: list | None) -> float:
+        if not bbox:
+            return 0.0
+        return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+    @staticmethod
+    def _intersection_area(a: list | None, b: list | None) -> float:
+        if not a or not b:
+            return 0.0
+        return max(0.0, min(a[2], b[2]) - max(a[0], b[0])) * max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+
+    @staticmethod
+    def _horizontal_overlap_ratio(a: list, b: list) -> float:
+        width = max(1.0, min(a[2] - a[0], b[2] - b[0]))
+        overlap = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+        return overlap / width
+
+    @staticmethod
+    def _looks_like_caption(text: str) -> bool:
+        return bool(re.match(r'^\s*(?:图|圖|Figure|Fig\.?)\s*\d+', str(text or ""), re.IGNORECASE))
+
+    @staticmethod
+    def _normalize_block_text(text: str) -> str:
+        return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+    @staticmethod
+    def _extract_text_blocks_fitz(page, page_num: int) -> list:
+        blocks = []
+        try:
+            raw_blocks = page.get_text("blocks")
+        except Exception:
+            return []
+        for block in raw_blocks:
+            if len(block) < 5:
+                continue
+            text = str(block[4] or "").strip()
+            if text:
+                blocks.append({"text": text, "page": page_num, "bbox": [float(block[0]), float(block[1]), float(block[2]), float(block[3])]})
+        return blocks
+
+    @staticmethod
+    def _extract_text_blocks_pdfplumber(page, page_num: int) -> list:
+        try:
+            words = page.extract_words(extra_attrs=["size", "fontname"]) or []
+        except TypeError:
+            words = page.extract_words() or []
+        except Exception:
+            return []
+        lines = {}
+        for word in words:
+            text = str(word.get("text", "")).strip()
+            if not text:
+                continue
+            line_key = round(float(word.get("top", 0)) / 3) * 3
+            lines.setdefault(line_key, []).append(word)
+        blocks = []
+        for _, line_words in sorted(lines.items()):
+            line_words = sorted(line_words, key=lambda item: float(item.get("x0", 0)))
+            text = " ".join(str(word.get("text", "")).strip() for word in line_words if word.get("text"))
+            if not text:
+                continue
+            bbox = [
+                min(float(word.get("x0", 0)) for word in line_words),
+                min(float(word.get("top", 0)) for word in line_words),
+                max(float(word.get("x1", 0)) for word in line_words),
+                max(float(word.get("bottom", 0)) for word in line_words),
+            ]
+            sizes = [float(word.get("size", 0) or 0) for word in line_words]
+            blocks.append({"text": text, "page": page_num, "bbox": bbox, "font_size": max(sizes) if sizes else 0})
+        return blocks
+
+    def _extract_tables_pdfplumber(self, page) -> list:
+        tables = []
+        try:
+            found_tables = page.find_tables()
+        except Exception:
+            found_tables = []
+        for table in found_tables:
+            try:
+                cleaned = self._clean_tables([table.extract()])
+            except Exception:
+                cleaned = []
+            if cleaned:
+                tables.append({"bbox": list(table.bbox), "rows": cleaned[0]})
+        if tables:
+            return tables
+        try:
+            return [{"rows": table} for table in self._clean_tables(page.extract_tables() or [])]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _repeated_margin_texts(pages_data: list) -> set:
+        counts = {}
+        for page_data in pages_data:
+            height = float(page_data.get("height") or 792)
+            for block in page_data.get("text_blocks") or []:
+                bbox = DocumentParserTool._bbox(block)
+                if not bbox:
+                    continue
+                if bbox[1] >= 70 and bbox[3] <= height - 70:
+                    continue
+                norm = DocumentParserTool._normalize_block_text(block.get("text", ""))
+                if norm:
+                    counts[norm] = counts.get(norm, 0) + 1
+        return {text for text, count in counts.items() if count >= 2}
+
+    @staticmethod
+    def _is_page_number_noise(block: dict, page_num: int, page_height: float) -> bool:
+        bbox = DocumentParserTool._bbox(block)
+        text = str(block.get("text", "")).strip()
+        if not bbox or not text:
+            return False
+        in_margin = bbox[1] < 70 or bbox[3] > page_height - 70
+        return in_margin and text.isdigit() and (text == str(page_num) or len(text) <= 4)
+
+    @staticmethod
+    def _overlaps_any_table(block: dict, tables: list) -> bool:
+        block_bbox = DocumentParserTool._bbox(block)
+        block_area = DocumentParserTool._bbox_area(block_bbox)
+        if block_area <= 0:
+            return False
+        for table in tables or []:
+            table_bbox = DocumentParserTool._bbox(table) if isinstance(table, dict) else None
+            if table_bbox and DocumentParserTool._intersection_area(block_bbox, table_bbox) / block_area >= 0.35:
+                return True
+        return False
+
+    @staticmethod
+    def _layout_text_for_page(page_data: dict, repeated_noise: set) -> str:
+        blocks = list(page_data.get("text_blocks") or [])
+        if not blocks:
+            return (page_data.get("text") or "").strip()
+        page_num = int(page_data.get("page", 0) or 0)
+        page_height = float(page_data.get("height") or 792)
+        kept = []
+        for block in blocks:
+            text = str(block.get("text", "")).strip()
+            if not text:
+                continue
+            if DocumentParserTool._normalize_block_text(text) in repeated_noise:
+                continue
+            if DocumentParserTool._is_page_number_noise(block, page_num, page_height):
+                continue
+            if DocumentParserTool._overlaps_any_table(block, page_data.get("tables") or []):
+                continue
+            kept.append(block)
+        kept.sort(key=lambda block: ((DocumentParserTool._bbox(block) or [0, 0, 0, 0])[1], (DocumentParserTool._bbox(block) or [0, 0, 0, 0])[0]))
+        return "\n".join(str(block.get("text", "")).strip() for block in kept if str(block.get("text", "")).strip())
+
+    @staticmethod
     def _split_page_text(text: str, page_num: int) -> list:
         """Split a page into structured step chunks when numbered steps exist."""
         page_text = text.strip()
         if not page_text:
             return []
 
-        step_pattern = re.compile(r'(?m)^\s*(\d+[.、]\s+[^\n]+)')
+        step_pattern = re.compile(r'(?m)^\s*(\d+[\.\、\)](?!\d)\s*[^\n]+)')
         matches = list(step_pattern.finditer(page_text))
         if not matches:
+            chunk_uid = f"p{page_num}:text:0000"
             return [{
+                "chunk_uid": chunk_uid,
                 "text": page_text,
                 "page": page_num,
                 "chunk_label": "page",
@@ -368,25 +594,35 @@ class DocumentParserTool(BaseTool):
 
         prefix = page_text[:matches[0].start()].strip()
         chunks = []
+        step_group_id = f"p{page_num}:steps:{hashlib.md5(page_text[:120].encode()).hexdigest()[:8]}"
         for index, match in enumerate(matches):
             start = match.start()
             end = matches[index + 1].start() if index + 1 < len(matches) else len(page_text)
             chunk_text = page_text[start:end].strip()
             if prefix:
                 chunk_text = f"{prefix}\n{chunk_text}"
+            chunk_uid = f"{step_group_id}:step:{index:04d}"
             chunks.append({
+                "chunk_uid": chunk_uid,
                 "text": chunk_text,
                 "page": page_num,
                 "chunk_label": "step",
+                "step_group_id": step_group_id,
+                "step_index": index,
                 "context_before": prefix,
                 "context_after": page_text[end:end + 300].strip(),
             })
+        for index, chunk in enumerate(chunks):
+            if index > 0:
+                chunk["prev_step_id"] = chunks[index - 1]["chunk_uid"]
+            if index + 1 < len(chunks):
+                chunk["next_step_id"] = chunks[index + 1]["chunk_uid"]
         return chunks
 
     # ==================== 章节合并 ====================
 
     @staticmethod
-    def _group_into_sections(pages_data: list) -> list:
+    def _group_into_sections_legacy(pages_data: list) -> list:
         """
         将逐页数据按"第X章"标题合并为章节。
 
@@ -452,6 +688,71 @@ class DocumentParserTool(BaseTool):
         ]
 
     # ==================== 文件下载 ====================
+
+    @staticmethod
+    def _group_into_sections(pages_data: list) -> list:
+        """Group cleaned layout-aware page content into sections."""
+        repeated_noise = DocumentParserTool._repeated_margin_texts(pages_data)
+        chapter_pattern = re.compile(
+            r'(第[一二三四五六七八九十\d]+章|第[一二三四五六七八九十\d]+节|^\s*\d+(?:\.\d+)+\s+[^\n]+)',
+            re.MULTILINE,
+        )
+
+        sections = []
+        current_section = {
+            "section_title": "前言",
+            "page_range": "",
+            "text_chunks": [],
+            "images": [],
+            "tables": [],
+            "_start_page": pages_data[0]["page"] if pages_data else 1,
+        }
+        sections.append(current_section)
+
+        for page_data in pages_data:
+            page_num = page_data["page"]
+            text = DocumentParserTool._layout_text_for_page(page_data, repeated_noise)
+            match = chapter_pattern.search(text)
+            if match and (current_section["text_chunks"] or current_section["images"] or current_section["tables"]):
+                current_section["page_range"] = f"{current_section['_start_page']}-{page_num - 1}"
+                current_section = {
+                    "section_title": match.group().strip(),
+                    "page_range": "",
+                    "text_chunks": [],
+                    "images": [],
+                    "tables": [],
+                    "_start_page": page_num,
+                }
+                sections.append(current_section)
+            elif match and current_section["section_title"] == "前言":
+                current_section["section_title"] = match.group().strip()
+                current_section["_start_page"] = page_num
+
+            if text.strip():
+                current_section["text_chunks"].extend(DocumentParserTool._split_page_text(text, page_num))
+            current_section["images"].extend(page_data.get("images") or [])
+            for table in page_data.get("tables") or []:
+                if isinstance(table, dict):
+                    table_entry = {
+                        "page": page_num,
+                        "caption": table.get("caption") or f"第{page_num}页表格",
+                        "rows": table.get("rows") or [],
+                    }
+                    if table.get("bbox"):
+                        table_entry["bbox"] = table["bbox"]
+                else:
+                    table_entry = {"page": page_num, "caption": f"第{page_num}页表格", "rows": table}
+                if table_entry.get("rows"):
+                    current_section["tables"].append(table_entry)
+
+        if sections:
+            last_page = pages_data[-1]["page"] if pages_data else 1
+            for section in sections:
+                if not section["page_range"]:
+                    section["page_range"] = f"{section.get('_start_page', 1)}-{last_page}"
+                section.pop("_start_page", None)
+
+        return [section for section in sections if section["text_chunks"] or section["images"] or section["tables"]]
 
     async def _resolve_file(self, file_url: str) -> str:
         """

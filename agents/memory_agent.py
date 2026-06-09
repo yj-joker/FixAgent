@@ -328,11 +328,12 @@ class MemoryAgent(BaseAgent):
         if not facts:
             return []
 
-        from services.vector_service import get_vector_service
+        from services.vector_service import build_redis_filter, get_vector_service
         from embeddings.text_embedding import get_text_embedding
 
         vector_service = get_vector_service()
         embedding_service = get_text_embedding()
+        fact_filter = build_redis_filter(record_type="fact", status="active")
         batch_ts = str(int(time.time() * 1000))
         generated_ids = []
 
@@ -349,7 +350,7 @@ class MemoryAgent(BaseAgent):
 
             # ===== 去重保护：写入前检查是否已存在高度相似的事实 =====
             try:
-                existing = vector_service.search(vector, top_k=1)
+                existing = vector_service.search(vector, top_k=1, filter=fact_filter)
                 if existing:
                     top_match = existing[0]
                     top_meta = top_match.get("metadata", {})
@@ -372,6 +373,7 @@ class MemoryAgent(BaseAgent):
                 text=content,
                 vector=vector,
                 metadata={
+                    "record_type": "fact",
                     "type": "fact",
                     "status": "active",
                     "session_id": session_id,
