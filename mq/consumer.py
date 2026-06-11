@@ -115,6 +115,8 @@ async def handle_consolidate(message: aio_pika.abc.AbstractIncomingMessage, chan
                     "old_preferences": params.get("memoryPreferenceVOList", []),
                     "old_unresolved": params.get("memoryUnresolvedVOList", []),
                     "previous_summary": params.get("previousSummary"),
+                    # 现有事实索引（name+type+description），让整合 LLM 看见已有事实，复用 name 去重 / 标记 superseded
+                    "existing_facts": params.get("existingFactIndex", ""),
                 },
             )
 

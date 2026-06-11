@@ -38,9 +38,10 @@ MEMORY_SYSTEM_PROMPT = """你是工作记忆整理助手。从对话记录中提
   ✗ 用户问"电机异响怎么办"，助手回复"建议更换轴承" → 不能记录"用户计划更换轴承"
   ✓ 只有用户自己说"我准备去换轴承"才能记录为待办
 
-## 可用工具
-- **search_similar_facts**: 在已有事实库中批量搜索与候选事实语义相似的历史事实。
-  用法：先读完所有对话，识别出全部候选事实，提取每条事实的核心关键词（设备型号、错误码、故障部位等），然后一次性批量调用。
+## 去重依据
+用户消息下方的「## 已有事实索引」列出了该用户长期记忆中**已经存在**的事实（格式：- [name] (type) — 摘要）。
+判断某条候选事实是否重复/是否需更新，**以该索引为准**：同一件事复用相同 name 覆盖，全新的事才用新 name 新增。
+（search_similar_facts 工具已停用，不要依赖它的返回；若索引为空说明该用户暂无历史事实。）
 
 ## 分类标准
 
@@ -145,11 +146,11 @@ MEMORY_SYSTEM_PROMPT = """你是工作记忆整理助手。从对话记录中提
 注意：一旦事项在新对话中得到解决，应转为事实，并将该事项的 id 放入 resolved_item_ids
 
 ## 冲突判断规则（仅针对事实）
-根据工具返回的相似事实判断：
-- 无相似结果（score < 0.7）或结果为空 → 正常新增
-- 有相似且内容相同 → 不重复添加
-- 有相似、同话题但结论不同 → 以新对话中的结论为准，在 superseded_ids 中标记旧事实的 id
-- 有相似且互相印证 → 合并为一条更完整的表述
+对照上方「## 已有事实索引」判断：
+- 索引里没有这条事实 → 用新 name 正常新增
+- 索引里已有同一件事、内容也相同 → 不要重复输出（不放进 new_facts）
+- 索引里已有同一件事、但结论不同/有更新 → new_facts 里**复用相同 name**、content 写最新内容（系统按 name 就地覆盖，自动体现变更，无需 superseded_ids）
+- 索引为空 → 一律按新增处理
 
 偏好和未完成事项不调用工具，按以下规则处理：
 - 同类别、同级别偏好有矛盾 → 以最新表述为准
@@ -251,6 +252,8 @@ class MemoryAgent(BaseAgent):
         old_unresolved = ctx.get("old_unresolved", [])
         # 从Java端传来的上一轮整合产出的摘要，用于生成渐进式摘要
         previous_summary = ctx.get("previous_summary")
+        # 该用户现有事实索引（name + type + description），用于去重：复用同名 / 标记 superseded
+        existing_facts = ctx.get("existing_facts", "")
 
         parts = []
 
@@ -270,6 +273,17 @@ class MemoryAgent(BaseAgent):
                 level = "用户级" if p.get('preferenceCategory') == 0 else "会话级"
                 parts.append(f"| {p.get('content', '')} | {p.get('category', '其他')} | {level} |")
             parts.append("")
+
+        if existing_facts:
+            parts.append("## 已有事实索引（该用户长期记忆中已存在的事实，格式：- [name] (type) — 摘要）\n")
+            parts.append(existing_facts.rstrip())
+            parts.append("")
+            parts.append(
+                "去重规则（重要）：\n"
+                "- 新对话里的某条事实，若与上面某条 [name] 是**同一件事**（含结论被更新/纠正的情况）→ new_facts 里**复用那个完全相同的 name**，content 写最新内容。系统会按 name 就地覆盖更新，既不重复也能体现变更。\n"
+                "- 上面已有、本轮没有新增信息的事实 → **不要**重复输出到 new_facts。\n"
+                "- 只有上面完全没有的事实，才用一个新的 name 新增。\n"
+            )
 
         if old_unresolved:
             # 带上id列，让LLM能通过id精确标记哪些事项已解决
@@ -365,16 +379,10 @@ class MemoryAgent(BaseAgent):
 
         messages = self._build_messages(input_data)
 
-        from tools.fact_retrieval_tool import get_fact_retrieval_tool
-        fact_tool = get_fact_retrieval_tool()
-        tools = [fact_tool.to_openai_schema()]
-        async def fact_handler(**kwargs):
-            result = await fact_tool.run(**kwargs)
-            if result.success:
-                return result.data if result.data is not None else {"result": "success"}
-            return {"error": result.error.message if result.error else "unknown error"}
-
-        tool_handlers = {"search_similar_facts": fact_handler}
+        # [去向量] search_similar_facts 已停用（查空的事实向量库）。去重改由
+        # _build_messages 注入的「已有事实索引」+ 提示词 + Java 端 (user_id,name) upsert 承载，不再注册工具。
+        tools = []
+        tool_handlers = {}
 
         # ========== LLM 调用 + 重试 ==========
         content = ""
@@ -455,14 +463,16 @@ class MemoryAgent(BaseAgent):
 
         # 将向量库生成的 doc_id 附加到 summary 输出中
         # Java 端用这些 ID 作为 MySQL 的 factId，确保两端 ID 一致
-        summary_dict = summary.model_dump()
+        # by_alias=True：输出 camelCase（newFacts/briefSummary/...），对齐 Java MQ 整合读取的 key。
+        # 此前用默认 snake_case，导致 Java 全部读成 null（摘要不写、事实不存），是整合静默失效的根因。
+        summary_dict = summary.model_dump(by_alias=True)
         summary_dict["fact_ids"] = fact_ids
 
         return AgentOutput(
             agent_name=self.name,
             message=summary.brief_summary,
             intention=None,
-            tools_used=["search_similar_facts"] if summary.new_facts else [],
+            tools_used=[],
             metadata={
                 "summary": summary_dict,
                 "latency_ms": latency_ms
