@@ -415,43 +415,43 @@ class _SafetyCheck:
             "name": "高压电气安全",
             "trigger": ["电压", "千伏", "kV", "通电", "电线", "电缆", "配电", "高压", "触电"],
             "required": ["断电", "验电"],
-            "warning": "⚠️ 安全提醒：操作前必须切断电源并挂警示牌，用验电器确认无电压后方可作业。作业人员必须穿戴绝缘手套和绝缘鞋。"
+            "warning": "安全提醒：操作前必须切断电源并挂警示牌，用验电器确认无电压后方可作业。作业人员必须穿戴绝缘手套和绝缘鞋。"
         },
         {
             "name": "高温防护",
             "trigger": ["发动机", "排气", "冷却液", "高温", "过热", "涡轮", "锅炉", "蒸汽", "排气管", "气缸"],
             "required": ["冷却", "降温", "防烫"],
-            "warning": "⚠️ 安全提醒：设备停机后需充分冷却（建议等待30分钟以上），操作时佩戴防烫手套。高温部件温度可达100°C以上，直接接触会造成严重烫伤。"
+            "warning": "安全提醒：设备停机后需充分冷却（建议等待30分钟以上），操作时佩戴防烫手套。高温部件温度可达100°C以上，直接接触会造成严重烫伤。"
         },
         {
             "name": "化学品防护",
             "trigger": ["润滑油", "冷却液", "制动液", "溶剂", "清洗剂", "防冻液", "液压油", "机油", "燃油", "柴油", "汽油"],
             "required": ["防护手套", "护目镜", "手套", "通风"],
-            "warning": "⚠️ 安全提醒：接触化学品时需佩戴防化手套和护目镜，确保操作区域通风良好。废液应按规定收集处理，禁止随意排放。"
+            "warning": "安全提醒：接触化学品时需佩戴防化手套和护目镜，确保操作区域通风良好。废液应按规定收集处理，禁止随意排放。"
         },
         {
             "name": "重物吊装",
             "trigger": ["吊装", "拆卸发动机", "变速箱", "起吊", "起重", "吊车", "千斤顶", "举升"],
             "required": ["起吊设备", "人员配合", "支撑", "固定"],
-            "warning": "⚠️ 安全提醒：重物吊装前需检查吊具和索具完好性，确认载荷在设备额定范围内。作业时至少两人配合，无关人员需撤离作业区域。"
+            "warning": "安全提醒：重物吊装前需检查吊具和索具完好性，确认载荷在设备额定范围内。作业时至少两人配合，无关人员需撤离作业区域。"
         },
         {
             "name": "旋转部件防护",
             "trigger": ["皮带", "齿轮", "风扇", "飞轮", "传动轴", "联轴器", "转子", "叶轮"],
             "required": ["停机", "断电", "防护罩"],
-            "warning": "⚠️ 安全提醒：检查旋转部件前必须停机断电，确认部件完全停止转动。严禁在设备运行时将手或工具靠近旋转部件。"
+            "warning": "安全提醒：检查旋转部件前必须停机断电，确认部件完全停止转动。严禁在设备运行时将手或工具靠近旋转部件。"
         },
         {
             "name": "压力容器/管路安全",
             "trigger": ["气压", "液压", "压力容器", "气瓶", "压缩机", "高压油管", "蓄能器"],
             "required": ["泄压", "减压", "释放"],
-            "warning": "⚠️ 安全提醒：拆卸压力管路或容器前必须先泄压，确认压力表归零。高压油液喷射可造成严重伤害，操作时必须佩戴护目镜。"
+            "warning": "安全提醒：拆卸压力管路或容器前必须先泄压，确认压力表归零。高压油液喷射可造成严重伤害，操作时必须佩戴护目镜。"
         },
         {
             "name": "电池/电源安全",
             "trigger": ["电池", "电瓶", "蓄电池", "锂电池", "充电"],
             "required": ["断开", "短路", "绝缘"],
-            "warning": "⚠️ 安全提醒：操作电池前需先断开负极接线，工具手柄需做绝缘处理以防短路。电池短路会引起电弧、火灾或爆炸。"
+            "warning": "安全提醒：操作电池前需先断开负极接线，工具手柄需做绝缘处理以防短路。电池短路会引起电弧、火灾或爆炸。"
         },
     ]
 
@@ -694,9 +694,15 @@ class ReviewAgent:
     @staticmethod
     def _clean_pending_text(text: str) -> str:
         value = (text or "").strip()
-        value = re.sub(r"^[\-*#>\s]+", "", value)
+        value = re.sub(r"^\s*[-+]\s*", "", value)
+        value = re.sub(r"^\s*\*\s+", "", value)
+        value = re.sub(r"^\s*#{1,6}\s*", "", value)
+        value = re.sub(r"^\s*>\s*", "", value)
         value = re.sub(r"\*\*([^*]+)\*\*", r"\1", value)
         value = re.sub(r"`([^`]+)`", r"\1", value)
+        value = re.sub(r"\bsource=[^\s，。；;）)]+", "", value)
+        value = re.sub(r"\b(?:doc_id|chunk_id|image_url|top_k)\s*[:=]\s*[^\s，。；;）)]+", "", value)
+        value = re.sub(r"\b[\w-]+:\d{2}:img:\d{4}\b", "", value)
         value = re.sub(r"\s+", " ", value).strip()
         return value[:140] + "..." if len(value) > 140 else value
 
@@ -709,7 +715,7 @@ class ReviewAgent:
                 cleaned.append(text)
         if not cleaned:
             return ""
-        return "\n".join(f"- {text}" for text in cleaned)
+        return "\n".join(f"{index}. {text}" for index, text in enumerate(cleaned, start=1))
 
     @classmethod
     def _should_show_pending_section(cls, user_message: str, answer: str, held_items: List[str]) -> bool:
@@ -975,7 +981,7 @@ class ReviewAgent:
                 continue
             if any(m["char_pos"] == pos for m in markers):
                 continue
-            label = f"⚠️[图谱:{reason}] " if reason else "⚠️[图谱未确认] "
+            label = f"[图谱:{reason}] " if reason else "[图谱未确认] "
             markers.append({
                 "char_pos": pos,
                 "text": label,
@@ -1058,9 +1064,12 @@ class _ResponseComposer:
         sections = [base_message]
         confirmed_values = confirmed_values or []
         if confirmed_values:
-            confirmed_lines = "\n".join(f"- {value}" for value in confirmed_values)
+            confirmed_lines = "\n".join(
+                f"{index}. {value}"
+                for index, value in enumerate(confirmed_values, start=1)
+            )
             sections.append(
-                "## 已核对关键值\n"
+                "已核对关键值：\n"
                 "以下数值或型号可在当前知识依据中找到明确匹配：\n"
                 f"{confirmed_lines}"
             )
@@ -1088,7 +1097,8 @@ class _ResponseComposer:
                     lines.append("")
                 continue
             line = re.sub(r"^#{1,6}\s*", "", line)
-            line = re.sub(r"^[\-*]\s*", "", line)
+            line = re.sub(r"^[-+]\s*", "", line)
+            line = re.sub(r"^\*\s+", "", line)
             line = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
             line = re.sub(r"`([^`]+)`", r"\1", line)
             if line:

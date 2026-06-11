@@ -39,6 +39,7 @@ def build_redis_filter(
     record_type: str = None,
     status: str = None,
     chunk_label: str = None,
+    parent_section_id: str = None,
 ) -> Optional[str]:
     """构建 RediSearch 过滤表达式，供 API 层和工具层复用。
 
@@ -72,6 +73,8 @@ def build_redis_filter(
         filter_parts.append(f"@status:{{{escape_redis_tag_value(status)}}}")
     if chunk_label:
         filter_parts.append(f"@chunk_label:{{{escape_redis_tag_value(chunk_label)}}}")
+    if parent_section_id:
+        filter_parts.append(f"@parent_section_id:{{{escape_redis_tag_value(parent_section_id)}}}")
     if not filter_parts:
         return None
     return " ".join(f"({p})" for p in filter_parts)
@@ -125,6 +128,7 @@ class VectorService:
                 "document_id", "TAG",
                 "chunk_type", "TAG",
                 "chunk_label", "TAG",
+                "parent_section_id", "TAG",
                 "record_type", "TAG",
                 "status", "TAG",
                 "device_type", "TAG",
@@ -133,6 +137,7 @@ class VectorService:
                 "created_at", "NUMERIC"
             )
         self._backfill_scope_fields()
+        self._backfill_parent_section_fields()
 
     def _migrate_index(self):
         """为已有索引追加 category/tags TAG 字段（字段已存在时静默跳过）"""
@@ -142,6 +147,7 @@ class VectorService:
             "document_id",
             "chunk_type",
             "chunk_label",
+            "parent_section_id",
             "record_type",
             "status",
             "device_type",
@@ -184,7 +190,15 @@ class VectorService:
                 inferred_status = metadata.get("status") or ("active" if inferred_record_type == "fact" else "ready")
 
                 mapping = {}
-                for field_name in ("document_id", "chunk_type", "chunk_label", "device_type", "document_version", "manual_type"):
+                for field_name in (
+                    "document_id",
+                    "chunk_type",
+                    "chunk_label",
+                    "parent_section_id",
+                    "device_type",
+                    "document_version",
+                    "manual_type",
+                ):
                     value = metadata.get(field_name) or fields.get(field_name)
                     if value:
                         mapping[field_name] = value
@@ -198,9 +212,96 @@ class VectorService:
         except Exception as e:
             logger.warning(f"scope field backfill skipped: {e}")
 
+    def _backfill_parent_section_fields(self) -> None:
+        """Promote parent_section_id for records imported before the TAG field existed."""
+        migration_key = f"migration:{self.INDEX_NAME}:parent_section_backfilled"
+        try:
+            if self.redis.get(migration_key):
+                return
+
+            for key in self.redis.scan_iter(match=f"{self.VECTOR_KEY_PREFIX}*", count=1000):
+                raw = self.redis.hgetall(key)
+                if not raw:
+                    continue
+
+                def _decode(value):
+                    return value.decode("utf-8") if isinstance(value, bytes) else value
+
+                fields = {_decode(k): _decode(v) for k, v in raw.items()}
+                if fields.get("parent_section_id"):
+                    continue
+                try:
+                    metadata = json.loads(fields.get("metadata") or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+                parent_section_id = metadata.get("parent_section_id")
+                if parent_section_id:
+                    self.redis.hset(key, mapping={"parent_section_id": parent_section_id})
+
+            self.redis.set(migration_key, "1")
+        except Exception as e:
+            logger.warning(f"parent_section_id backfill skipped: {e}")
+
     def _to_bytes(self, vector: List[float]) -> bytes:
         """将向量列表转为字节数组"""
         return struct.pack(f"{len(vector)}f", *vector)
+
+    def _build_vector_mapping(
+        self,
+        doc_id: str,
+        text: str,
+        vector: List[float],
+        metadata: Optional[Dict[str, Any]] = None,
+        category: str = None,
+        tags: List[str] = None,
+    ) -> Dict[str, Any]:
+        # ensure_ascii=False：保留中文原文，避免存入Redis后变成 \uXXXX 乱码
+        metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else "{}"
+
+        mapping = {
+            "id": doc_id,
+            "text": text,
+            "vector": self._to_bytes(vector),
+            "metadata": metadata_json,
+            "created_at": str(int(time.time()))
+        }
+        if category:
+            mapping["category"] = category
+        if tags:
+            mapping["tags"] = ",".join(tags) if isinstance(tags, list) else tags
+        meta = metadata or {}
+        inferred_record_type = meta.get("record_type")
+        if not inferred_record_type and (meta.get("type") == "fact" or str(doc_id).startswith("fact:")):
+            inferred_record_type = "fact"
+        if not inferred_record_type and (meta.get("document_id") or meta.get("chunk_type")):
+            inferred_record_type = "manual"
+        inferred_status = meta.get("status")
+        if not inferred_status and inferred_record_type == "fact":
+            inferred_status = "active"
+        if not inferred_status and inferred_record_type == "manual":
+            inferred_status = "ready"
+
+        scope_fields = (
+            "document_id",
+            "chunk_type",
+            "chunk_label",
+            "parent_section_id",
+            "record_type",
+            "status",
+            "device_type",
+            "document_version",
+            "manual_type",
+        )
+        for field_name in scope_fields:
+            if field_name == "record_type":
+                value = inferred_record_type
+            elif field_name == "status":
+                value = inferred_status
+            else:
+                value = meta.get(field_name)
+            if value:
+                mapping[field_name] = value
+        return mapping
 
     def add_vector(
         self,
@@ -227,52 +328,7 @@ class VectorService:
         """
         try:
             key = f"{self.VECTOR_KEY_PREFIX}{doc_id}"
-            # ensure_ascii=False：保留中文原文，避免存入Redis后变成 \uXXXX 乱码
-            metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else "{}"
-
-            mapping = {
-                "id": doc_id,
-                "text": text,
-                "vector": self._to_bytes(vector),
-                "metadata": metadata_json,
-                "created_at": str(int(time.time()))
-            }
-            if category:
-                mapping["category"] = category
-            if tags:
-                mapping["tags"] = ",".join(tags) if isinstance(tags, list) else tags
-            meta = metadata or {}
-            inferred_record_type = meta.get("record_type")
-            if not inferred_record_type and (meta.get("type") == "fact" or str(doc_id).startswith("fact:")):
-                inferred_record_type = "fact"
-            if not inferred_record_type and (meta.get("document_id") or meta.get("chunk_type")):
-                inferred_record_type = "manual"
-            inferred_status = meta.get("status")
-            if not inferred_status and inferred_record_type == "fact":
-                inferred_status = "active"
-            if not inferred_status and inferred_record_type == "manual":
-                inferred_status = "ready"
-
-            scope_fields = (
-                "document_id",
-                "chunk_type",
-                "chunk_label",
-                "record_type",
-                "status",
-                "device_type",
-                "document_version",
-                "manual_type",
-            )
-            for field_name in scope_fields:
-                if field_name == "record_type":
-                    value = inferred_record_type
-                elif field_name == "status":
-                    value = inferred_status
-                else:
-                    value = meta.get(field_name)
-                if value:
-                    mapping[field_name] = value
-
+            mapping = self._build_vector_mapping(doc_id, text, vector, metadata, category, tags)
             self.redis.hset(key, mapping=mapping)
             return True
         except Exception as e:
@@ -296,18 +352,30 @@ class VectorService:
         Returns:
             成功添加的数量
         """
-        success_count = 0
-        for doc in documents:
-            if self.add_vector(
-                doc["doc_id"],
-                doc["text"],
-                doc["vector"],
-                doc.get("metadata"),
-                doc.get("category"),
-                doc.get("tags")
-            ):
-                success_count += 1
-        return success_count
+        if not documents:
+            return 0
+        try:
+            pipe = self.redis.pipeline(transaction=False)
+            queued = 0
+            for doc in documents:
+                key = f"{self.VECTOR_KEY_PREFIX}{doc['doc_id']}"
+                mapping = self._build_vector_mapping(
+                    doc["doc_id"],
+                    doc["text"],
+                    doc["vector"],
+                    doc.get("metadata"),
+                    doc.get("category"),
+                    doc.get("tags"),
+                )
+                pipe.hset(key, mapping=mapping)
+                queued += 1
+            results = pipe.execute()
+            if len(results) == queued:
+                return queued
+            return sum(1 for result in results if result is not False)
+        except Exception as e:
+            logger.error(f"批量向量添加失败: {e}")
+            return 0
 
     def search(
         self,
@@ -511,6 +579,100 @@ class VectorService:
             if record:
                 records.append(record)
         return records
+
+    def _decode_search_result_fields(self, fields: List[Any], fallback_doc_id: str = "") -> Dict[str, Any]:
+        field_dict = {fields[j]: fields[j + 1] for j in range(0, len(fields), 2)}
+
+        def _decode(field_name: bytes, default=""):
+            val = field_dict.get(field_name)
+            if val is None:
+                return default
+            return val.decode("utf-8") if isinstance(val, bytes) else val
+
+        doc_id = _decode(b"id", fallback_doc_id)
+        if not doc_id:
+            return {}
+        metadata_raw = _decode(b"metadata", "{}")
+        try:
+            metadata = json.loads(metadata_raw)
+            if not isinstance(metadata, dict):
+                metadata = {}
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+        return {
+            "doc_id": doc_id,
+            "text": _decode(b"text"),
+            "score": 0.0,
+            "raw_score": None,
+            "raw_score_type": "section_lookup",
+            "relevance_score": 0.0,
+            "metadata": metadata,
+        }
+
+    def _section_records_from_search_results(
+        self,
+        results: List[Any],
+        document_id: str,
+        parent_section_id: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        records = []
+        if not results or len(results) <= 1:
+            return records
+        for i in range(1, len(results), 2):
+            fallback = self._decode_redis_value(results[i]).removeprefix(self.VECTOR_KEY_PREFIX)
+            record = self._decode_search_result_fields(results[i + 1], fallback_doc_id=fallback)
+            metadata = record.get("metadata") or {}
+            if metadata.get("document_id") != document_id:
+                continue
+            if metadata.get("parent_section_id") != parent_section_id:
+                continue
+            records.append(record)
+            if len(records) >= limit:
+                break
+        return records
+
+    def get_section_records(self, document_id: str, parent_section_id: str, limit: int = 6) -> List[Dict[str, Any]]:
+        """Read same-section vector records for parent/child context expansion."""
+        if not document_id or not parent_section_id or limit <= 0:
+            return []
+
+        search_limit = max(limit * 4, limit)
+        try:
+            section_filter = build_redis_filter(
+                document_id=document_id,
+                parent_section_id=parent_section_id,
+                record_type="manual",
+                status="ready",
+            )
+            results = self.redis.execute_command(
+                "FT.SEARCH",
+                self.INDEX_NAME,
+                section_filter,
+                "RETURN", "3", "id", "text", "metadata",
+                "LIMIT", "0", str(search_limit),
+                "DIALECT", "2"
+            )
+            records = self._section_records_from_search_results(results, document_id, parent_section_id, limit)
+            if records:
+                return records
+        except Exception as e:
+            logger.warning(f"get_section_records indexed lookup failed: {e}")
+
+        try:
+            document_filter = build_redis_filter(document_id=document_id, record_type="manual", status="ready")
+            results = self.redis.execute_command(
+                "FT.SEARCH",
+                self.INDEX_NAME,
+                document_filter,
+                "RETURN", "3", "id", "text", "metadata",
+                "LIMIT", "0", str(max(search_limit, 1000)),
+                "DIALECT", "2"
+            )
+            return self._section_records_from_search_results(results, document_id, parent_section_id, limit)
+        except Exception as e:
+            logger.warning(f"get_section_records fallback lookup failed: {e}")
+            return []
 
     async def search_by_text(
         self,

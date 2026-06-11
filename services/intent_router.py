@@ -95,6 +95,12 @@ class IntentRouter:
     _PARAMETER_RE = re.compile(r"(多少|几|标准|参数|扭矩|力矩|间隙|电压|压力|温度|型号|规格|周期|公里|N\s*·?\s*m|mm)")
     _FAULT_RE = re.compile(r"(故障|坏了|打不着|启动不了|异响|漏油|过热|熄火|抖动|怠速不稳|无力|报警|报错|原因)")
     _VISUAL_RE = re.compile(r"(这是什么|是什么东西|认识这|一样吗|同一个|配件吗|部件吗|图片|图中|照片|识别)")
+    _MANUAL_IMAGE_QUERY_RE = re.compile(
+        r"((知识库|手册|资料|文档).{0,20}(查找|查询|检索|搜索|查|找|返回|展示|给我|提供).{0,20}"
+        r"(图片|照片|示例图|示例图片|结构图|示意图|外观图|图示|配图)|"
+        r"(查找|查询|检索|搜索|查|找|返回|展示|给我|提供).{0,20}"
+        r"(图片|照片|示例图|示例图片|结构图|示意图|外观图|图示|配图))"
+    )
     _INVENTORY_RE = re.compile(r"(知识库.*(文件|文档|手册)|有什么知识文件|导入了.*文件|有哪些.*手册)")
     _INVENTORY_META_ACTION_RE = re.compile(r"(有哪些|有什么|哪些|列出|查看|查询|显示|看看|清单|目录)")
     _INVENTORY_META_OBJECT_RE = re.compile(r"(知识库|知识文件|知识文档|已上传|上传|已导入|导入|入库|收录|文件|文档|资料|PDF|pdf)")
@@ -141,13 +147,13 @@ class IntentRouter:
             "evidence_level": "optional",
             "safety_level": "none",
             "requires_image_understanding": True,
-            "requires_knowledge_retrieval": True,
-            "requires_graph_search": True,
+            "requires_knowledge_retrieval": False,
+            "requires_graph_search": False,
             "requires_manual_evidence": False,
             "requires_safety_notice": False,
             "allow_visual_answer_without_manual": True,
             "answer_style": "plain_conversational",
-            "allowed_tools": ["knowledge_retrieval", "java_graph_diagnosis_path"],
+            "allowed_tools": [],
         },
         "parameter_query": {
             "evidence_level": "required",
@@ -227,7 +233,7 @@ class IntentRouter:
         fallback = self._classify_by_rules(text, images)
         if llm_decision and llm_decision.confidence >= self.LOW_CONFIDENCE_THRESHOLD:
             decision = llm_decision
-            if images and decision.intent not in {"visual_identification", "document_understanding"}:
+            if images and not text and decision.intent not in {"visual_identification", "document_understanding"}:
                 decision = fallback
         else:
             decision = fallback
@@ -254,6 +260,8 @@ class IntentRouter:
             "parameter_lookup, visual_compare, document_explain, inventory_list 中选择。"
             "confidence 为 0 到 1。不要生成用户回答，只判断用户当前想做什么。"
             "knowledge_inventory 仅用于用户明确询问知识库本身的文件、文档、上传、导入或入库状态。"
+            "如果用户要求从知识库、手册或资料中查找、返回、展示图片、照片、示例图、结构图、示意图，"
+            "这属于 document_content 的 knowledge_query，不属于 knowledge_inventory。"
             "如果用户询问文档内部的业务内容，如部件清单、零件目录、参数表、维修步骤或故障原因，"
             "即使出现清单、目录、手册、查询等词，也必须选择 knowledge_query、parameter_query、"
             "fault_diagnosis 或 maintenance_guidance，并需要知识检索。"
@@ -314,6 +322,8 @@ class IntentRouter:
             intent = "fault_diagnosis"
         elif self._PARAMETER_RE.search(text):
             intent = "parameter_query"
+        elif self._is_manual_image_query(text):
+            intent = "knowledge_query"
         elif self._VISUAL_RE.search(text):
             intent = "visual_identification"
         elif self._CHAT_RE.search(text) and len(text) <= 80:
@@ -333,6 +343,8 @@ class IntentRouter:
             return "find_cause"
         if self._PARAMETER_RE.search(text or ""):
             return "parameter_lookup"
+        if self._is_manual_image_query(text or ""):
+            return "document_explain"
         if self._is_explicit_knowledge_inventory_request(text or ""):
             return "inventory_list"
         if self._DOCUMENT_RE.search(text or ""):
@@ -351,6 +363,8 @@ class IntentRouter:
             return "visual_input"
         if not text:
             return "document_content"
+        if self._is_manual_image_query(text):
+            return "document_content"
         if self._is_explicit_knowledge_inventory_request(text):
             return "knowledge_metadata"
         if self._CHAT_RE.search(text) and len(text) <= 80:
@@ -362,6 +376,14 @@ class IntentRouter:
     def _apply_target_layer_consistency(self, decision: IntentDecision, text: str) -> IntentDecision:
         if decision.target_layer not in TARGET_LAYERS:
             decision.target_layer = self._infer_target_layer(text)
+
+        if self._is_manual_image_query(text):
+            decision.target_layer = "document_content"
+            decision.intent = "knowledge_query"
+            if decision.task_action == "inventory_list":
+                decision.task_action = "document_explain"
+            decision.source = "rules" if decision.source != "rules" else decision.source
+            return decision
 
         if decision.target_layer == "knowledge_metadata":
             decision.intent = "knowledge_inventory"
@@ -384,6 +406,8 @@ class IntentRouter:
     def _is_explicit_knowledge_inventory_request(self, text: str) -> bool:
         if not text:
             return False
+        if self._is_manual_image_query(text):
+            return False
         if self._DOCUMENT_CONTENT_OBJECT_RE.search(text):
             return False
         if self._INVENTORY_RE.search(text):
@@ -392,6 +416,9 @@ class IntentRouter:
             self._INVENTORY_META_ACTION_RE.search(text)
             and self._INVENTORY_META_OBJECT_RE.search(text)
         )
+
+    def _is_manual_image_query(self, text: str) -> bool:
+        return bool(text and self._MANUAL_IMAGE_QUERY_RE.search(text))
 
     def _apply_deterministic_overrides(self, decision: IntentDecision, text: str) -> IntentDecision:
         if not text:

@@ -448,6 +448,67 @@ class DocumentParserTool(BaseTool):
         return re.sub(r"\s+", " ", str(text or "")).strip().lower()
 
     @staticmethod
+    def _table_rows_from_candidate(table) -> list:
+        if isinstance(table, dict):
+            rows = table.get("rows") or []
+        else:
+            rows = table or []
+        normalized = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)):
+                row = [row]
+            cells = [str(cell or "").strip() for cell in row]
+            if any(cells):
+                normalized.append(cells)
+        return normalized
+
+    @staticmethod
+    def _table_rejection_reason(table) -> str:
+        rows = DocumentParserTool._table_rows_from_candidate(table)
+        if len(rows) < 2:
+            return "too_few_rows"
+
+        column_counts = [len(row) for row in rows]
+        max_columns = max(column_counts) if column_counts else 0
+        if max_columns < 2:
+            return "too_few_columns"
+
+        total_cells = sum(max_columns for _ in rows)
+        non_empty_cells = sum(1 for row in rows for cell in row if cell)
+        if non_empty_cells < 4:
+            return "too_few_non_empty_cells"
+
+        non_empty_ratio = non_empty_cells / max(1, total_cells)
+        if non_empty_ratio < 0.25:
+            return "too_sparse"
+
+        multi_column_rows = sum(1 for row in rows if sum(1 for cell in row if cell) >= 2)
+        if multi_column_rows < max(2, len(rows) // 2):
+            return "unstable_columns"
+
+        one_cell_long_rows = 0
+        for row in rows:
+            non_empty = [cell for cell in row if cell]
+            if len(non_empty) == 1 and len(non_empty[0]) >= 80:
+                one_cell_long_rows += 1
+        if one_cell_long_rows / max(1, len(rows)) >= 0.5:
+            return "paragraph_like_rows"
+
+        return ""
+
+    @staticmethod
+    def _is_valid_table_candidate(table) -> bool:
+        return not DocumentParserTool._table_rejection_reason(table)
+
+    @staticmethod
+    def _valid_tables_for_page(page_data: dict) -> list:
+        valid_tables = []
+        for table in page_data.get("tables") or []:
+            if DocumentParserTool._is_valid_table_candidate(table):
+                valid_tables.append(table)
+        return valid_tables
+
+    @staticmethod
     def _extract_text_blocks_fitz(page, page_num: int) -> list:
         blocks = []
         try:
@@ -505,11 +566,24 @@ class DocumentParserTool(BaseTool):
             except Exception:
                 cleaned = []
             if cleaned:
-                tables.append({"bbox": list(table.bbox), "rows": cleaned[0]})
+                candidate = {"bbox": list(table.bbox), "rows": cleaned[0]}
+                reason = self._table_rejection_reason(candidate)
+                if reason:
+                    logger.debug("Reject weak table candidate, reason=%s, bbox=%s", reason, candidate.get("bbox"))
+                    continue
+                tables.append(candidate)
         if tables:
             return tables
         try:
-            return [{"rows": table} for table in self._clean_tables(page.extract_tables() or [])]
+            fallback_tables = []
+            for table in self._clean_tables(page.extract_tables() or []):
+                candidate = {"rows": table}
+                reason = self._table_rejection_reason(candidate)
+                if reason:
+                    logger.debug("Reject weak fallback table candidate, reason=%s", reason)
+                    continue
+                fallback_tables.append(candidate)
+            return fallback_tables
         except Exception:
             return []
 
@@ -557,7 +631,11 @@ class DocumentParserTool(BaseTool):
             return (page_data.get("text") or "").strip()
         page_num = int(page_data.get("page", 0) or 0)
         page_height = float(page_data.get("height") or 792)
+        valid_tables = page_data.get("_valid_tables")
+        if valid_tables is None:
+            valid_tables = DocumentParserTool._valid_tables_for_page(page_data)
         kept = []
+        text_candidates = []
         for block in blocks:
             text = str(block.get("text", "")).strip()
             if not text:
@@ -566,9 +644,18 @@ class DocumentParserTool(BaseTool):
                 continue
             if DocumentParserTool._is_page_number_noise(block, page_num, page_height):
                 continue
-            if DocumentParserTool._overlaps_any_table(block, page_data.get("tables") or []):
+            text_candidates.append(block)
+            if DocumentParserTool._overlaps_any_table(block, valid_tables):
                 continue
             kept.append(block)
+        if not kept and text_candidates and valid_tables:
+            candidate_text = "\n".join(str(block.get("text", "")).strip() for block in text_candidates)
+            if len(candidate_text.strip()) >= 40:
+                logger.warning(
+                    "Table bbox removed all page text; keeping text fallback, page=%s, tables=%d",
+                    page_num, len(valid_tables),
+                )
+                kept = text_candidates
         kept.sort(key=lambda block: ((DocumentParserTool._bbox(block) or [0, 0, 0, 0])[1], (DocumentParserTool._bbox(block) or [0, 0, 0, 0])[0]))
         return "\n".join(str(block.get("text", "")).strip() for block in kept if str(block.get("text", "")).strip())
 
@@ -711,7 +798,11 @@ class DocumentParserTool(BaseTool):
 
         for page_data in pages_data:
             page_num = page_data["page"]
-            text = DocumentParserTool._layout_text_for_page(page_data, repeated_noise)
+            valid_tables = DocumentParserTool._valid_tables_for_page(page_data)
+            page_view = dict(page_data)
+            page_view["_valid_tables"] = valid_tables
+            page_view["tables"] = valid_tables
+            text = DocumentParserTool._layout_text_for_page(page_view, repeated_noise)
             match = chapter_pattern.search(text)
             if match and (current_section["text_chunks"] or current_section["images"] or current_section["tables"]):
                 current_section["page_range"] = f"{current_section['_start_page']}-{page_num - 1}"
@@ -731,7 +822,7 @@ class DocumentParserTool(BaseTool):
             if text.strip():
                 current_section["text_chunks"].extend(DocumentParserTool._split_page_text(text, page_num))
             current_section["images"].extend(page_data.get("images") or [])
-            for table in page_data.get("tables") or []:
+            for table in valid_tables:
                 if isinstance(table, dict):
                     table_entry = {
                         "page": page_num,

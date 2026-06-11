@@ -250,16 +250,38 @@ async def handle_knowledge_import(message: aio_pika.abc.AbstractIncomingMessage,
                 "data": {
                     "total_chunks": result.get("text_count", 0) + result.get("table_count", 0),
                     "text_count": result.get("text_count", 0),
+                    "parsed_text_chunks_count": result.get("parsed_text_chunks_count", 0),
+                    "chunked_text_chunks_count": result.get("chunked_text_chunks_count", 0),
+                    "indexable_text_chunks_count": result.get("indexable_text_chunks_count", 0),
                     "image_count": result.get("image_count", 0),
+                    "image_success_count": result.get("image_success_count", result.get("image_count", 0)),
+                    "image_failed_count": result.get("image_failed_count", 0),
+                    "image_embedding_failed_count": result.get("image_embedding_failed_count", 0),
+                    "image_summary_failed_count": result.get("image_summary_failed_count", 0),
                     "table_count": result.get("table_count", 0),
+                    "table_success_count": result.get("table_success_count", result.get("table_count", 0)),
+                    "table_failed_count": result.get("table_failed_count", 0),
+                    "stage_timings_ms": result.get("stage_timings_ms", {}),
                     "document_id": document_id,
                     "file_url": file_url,
                 },
             }, exchange_name=KNOWLEDGE_EXCHANGE, routing_key=KNOWLEDGE_RESULT_KEY)
 
-            logger.info("[MQ消费] 知识导入完成, documentId=%s, text=%s, image=%s, table=%s",
-                        document_id, result.get("text_count", 0),
-                        result.get("image_count", 0), result.get("table_count", 0))
+            logger.info("[MQ消费] 知识导入完成, documentId=%s, 解析文本块=%s, 拆分文本块=%s, 可入库文本块=%s, text=%s, image=%s, table=%s, 阶段耗时=%s",
+                        document_id,
+                        result.get("parsed_text_chunks_count", 0),
+                        result.get("chunked_text_chunks_count", 0),
+                        result.get("indexable_text_chunks_count", 0),
+                        result.get("text_count", 0),
+                        result.get("image_count", 0), result.get("table_count", 0),
+                        result.get("stage_timings_ms", {}))
+            logger.info("[MQ消费] 知识导入统计, documentId=%s, 图片成功=%s, 图片失败=%s, 图片向量兜底=%s, 表格成功=%s, 表格失败=%s",
+                        document_id,
+                        result.get("image_success_count", result.get("image_count", 0)),
+                        result.get("image_failed_count", 0),
+                        result.get("image_embedding_failed_count", 0),
+                        result.get("table_success_count", result.get("table_count", 0)),
+                        result.get("table_failed_count", 0))
 
         except Exception as e:
             logger.error("[MQ消费] 知识导入失败, documentId=%s, 错误:%s", document_id, e, exc_info=True)

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import asyncio
-from typing import Dict, List, Optional
+import inspect
+from typing import Any, Callable, Dict, List, Optional
 
 from embeddings.multimodal_embedding import get_multimodal_embedding
 from embeddings.text_embedding import get_text_embedding
@@ -12,6 +13,8 @@ from schemas.models import VectorSearchResult
 from services.retrieval_planner import build_retrieval_plan, confidence_intent
 from services.retrieval_ranker import rank_candidates, should_use_expensive_rerank
 from services.retrieval_context_expander import expand_retrieval_context
+from services.retrieval_fusion import DEFAULT_RRF_CONSTANT, reciprocal_rank_fusion
+from services.retrieval_quality import evaluate_retrieval_quality
 from services.retrieval_policy import (
     diversify_candidates,
     summarize_confidence,
@@ -20,6 +23,32 @@ from services.vector_service import build_redis_filter, escape_redis_tag_value, 
 from tools.base_tool import BaseTool, ToolException
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_RECALL_TOP_N = 50
+
+
+async def _emit_retrieval_event(
+    event_sink: Optional[Callable[[Dict[str, Any]], Any]],
+    event: str,
+    data: Dict[str, Any],
+) -> None:
+    if not event_sink:
+        return
+    result = event_sink({"event": event, "data": data})
+    if inspect.isawaitable(result):
+        await result
+
+
+def _count_selected_types(items: List[Dict]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in items or []:
+        metadata = item.get("metadata") or {}
+        chunk_type = metadata.get("chunk_type") or "text"
+        if chunk_type == "image_summary":
+            chunk_type = "image"
+        chunk_type = str(chunk_type or "text")
+        counts[chunk_type] = counts.get(chunk_type, 0) + 1
+    return counts
 
 
 class KnowledgeRetrievalTool(BaseTool):
@@ -177,7 +206,10 @@ class KnowledgeRetrievalTool(BaseTool):
 
     @staticmethod
     def _route_name(route: str, relaxed: bool = False) -> str:
-        route_name = "table_vector" if route == "table" else route
+        if route == "text":
+            route_name = "text_vector"
+        else:
+            route_name = "table_vector" if route == "table" else route
         return f"{route_name}_relaxed" if relaxed else route_name
 
     async def _execute(
@@ -192,18 +224,34 @@ class KnowledgeRetrievalTool(BaseTool):
         device_type: str = None,
         document_version: str = None,
         manual_type: str = None,
+        _event_sink: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> List[VectorSearchResult]:
         query_vectors = await self._embed_query_vectors(query, image_urls)
         plan = build_retrieval_plan(query, has_images=bool(image_urls), explicit_chunk_type=chunk_type)
         confidence_type = confidence_intent(plan)
-        recall_k = max(top_k * 3, top_k)
+        final_top_k = max(int(top_k or 0), 0)
+        recall_k = max(final_top_k * 3, DEFAULT_RECALL_TOP_N) if final_top_k else 0
         optional_filter_used = any((category, tags, device_type, document_version, manual_type))
+        await _emit_retrieval_event(
+            _event_sink,
+            "retrieval_start",
+            {
+                "query": query,
+                "intent": plan.intent,
+                "routes": list(plan.routes),
+                "topK": final_top_k,
+                "recallTopN": recall_k,
+                "hasImages": bool(image_urls),
+            },
+        )
 
         def filter_for_route(route: str, relaxed: bool = False) -> Optional[str]:
             route_chunk_type = chunk_type
             if not route_chunk_type:
                 if route == "table":
                     route_chunk_type = "table"
+                elif route == "text":
+                    route_chunk_type = "text"
                 elif route == "image_vector":
                     route_chunk_type = "image"
                 elif route == "image_summary":
@@ -223,20 +271,45 @@ class KnowledgeRetrievalTool(BaseTool):
         text_vector = query_vectors.get("text_vector")
         image_vector = query_vectors.get("image_vector") or text_vector
 
-        async def run_route(route: str, relaxed: bool = False) -> List[Dict]:
+        async def run_route(route: str, relaxed: bool = False, limit: int = None) -> List[Dict]:
             route_filter = filter_for_route(route, relaxed=relaxed)
             route_name = self._route_name(route, relaxed=relaxed)
+            route_top_k = limit or recall_k
             if route == "keyword":
                 if not hasattr(vector_service, "keyword_search"):
+                    await _emit_retrieval_event(
+                        _event_sink,
+                        "retrieval_route",
+                        {
+                            "route": route_name,
+                            "sourceRoute": route,
+                            "candidateCount": 0,
+                            "limit": route_top_k,
+                            "relaxed": relaxed,
+                            "skipped": True,
+                        },
+                    )
                     return []
                 docs = await asyncio.to_thread(
                     vector_service.keyword_search,
                     query,
-                    top_k=recall_k,
+                    top_k=route_top_k,
                     include_metadata=True,
                     filter=route_filter,
                 )
-                return [self._mark_route(doc, route_name) for doc in docs]
+                marked = [self._mark_route(doc, route_name) for doc in docs]
+                await _emit_retrieval_event(
+                    _event_sink,
+                    "retrieval_route",
+                    {
+                        "route": route_name,
+                        "sourceRoute": route,
+                        "candidateCount": len(marked),
+                        "limit": route_top_k,
+                        "relaxed": relaxed,
+                    },
+                )
+                return marked
 
             route_vector = text_vector
             if route == "image_vector":
@@ -244,35 +317,144 @@ class KnowledgeRetrievalTool(BaseTool):
             elif route == "image_summary":
                 route_vector = text_vector or image_vector
             if not route_vector:
+                await _emit_retrieval_event(
+                    _event_sink,
+                    "retrieval_route",
+                    {
+                        "route": route_name,
+                        "sourceRoute": route,
+                        "candidateCount": 0,
+                        "limit": route_top_k,
+                        "relaxed": relaxed,
+                        "skipped": True,
+                    },
+                )
                 return []
             docs = await asyncio.to_thread(
                 vector_service.search,
                 route_vector,
-                top_k=recall_k,
+                top_k=route_top_k,
                 include_metadata=True,
                 filter=route_filter,
             )
-            return [self._mark_route(doc, route_name) for doc in docs]
+            marked = [self._mark_route(doc, route_name) for doc in docs]
+            await _emit_retrieval_event(
+                _event_sink,
+                "retrieval_route",
+                {
+                    "route": route_name,
+                    "sourceRoute": route,
+                    "candidateCount": len(marked),
+                    "limit": route_top_k,
+                    "relaxed": relaxed,
+                },
+            )
+            return marked
 
         try:
             vector_service = get_vector_service()
             route_results = await asyncio.gather(*(run_route(route) for route in plan.routes))
-            candidates = [doc for docs in route_results for doc in docs]
+            candidate_lists = [list(docs) for docs in route_results]
 
-            if not candidates and optional_filter_used and not document_id:
+            if not any(candidate_lists) and optional_filter_used and not document_id:
                 logger.info("No evidence matched optional retrieval filters; retrying without inferred metadata filters")
                 relaxed_results = await asyncio.gather(*(run_route(route, relaxed=True) for route in plan.routes))
-                candidates.extend(doc for docs in relaxed_results for doc in docs)
+                candidate_lists = [list(docs) for docs in relaxed_results]
         except Exception as e:
             raise ToolException(code="SEARCH_FAILED", message=f"retrieval search failed: {e}")
 
-        merged = self._merge_candidates(candidates)
+        fused = reciprocal_rank_fusion(
+            candidate_lists,
+            key_fn=self._canonical_id,
+            top_k=recall_k,
+            rrf_constant=DEFAULT_RRF_CONSTANT,
+        )
+        merged = self._merge_candidates(fused)
         ranked = rank_candidates(query, merged, plan)
+        selected = diversify_candidates(ranked, top_k=final_top_k, intent=confidence_type)
+        first_quality = evaluate_retrieval_quality(plan, ranked, selected, top_k=final_top_k)
+        candidate_count_before = len(merged)
+        supplemental_search_used = False
+        supplemental_routes: List[str] = []
+        await _emit_retrieval_event(
+            _event_sink,
+            "retrieval_quality",
+            {
+                "stage": "first_pass",
+                "grade": first_quality.grade,
+                "score": first_quality.score,
+                "candidateCount": first_quality.candidate_count,
+                "bestScore": first_quality.best_score,
+                "matchedTypes": first_quality.matched_types,
+                "requiredTypes": first_quality.required_types,
+                "reasons": first_quality.reasons,
+                "shouldSupplement": first_quality.should_supplement,
+                "supplementalRoutes": first_quality.supplemental_routes,
+            },
+        )
+
+        if first_quality.should_supplement:
+            supplemental_search_used = True
+            supplemental_routes = first_quality.supplemental_routes
+            supplemental_limit = max(recall_k * 2, top_k * 6, 6)
+            await _emit_retrieval_event(
+                _event_sink,
+                "retrieval_supplement",
+                {
+                    "routes": supplemental_routes,
+                    "limit": supplemental_limit,
+                    "reasons": first_quality.reasons,
+                },
+            )
+            try:
+                supplemental_results = await asyncio.gather(
+                    *(run_route(route, limit=supplemental_limit) for route in supplemental_routes)
+                )
+            except Exception as e:
+                raise ToolException(code="SEARCH_FAILED", message=f"supplemental retrieval failed: {e}")
+            candidate_lists.extend(list(docs) for docs in supplemental_results)
+            fused = reciprocal_rank_fusion(
+                candidate_lists,
+                key_fn=self._canonical_id,
+                top_k=max(recall_k, supplemental_limit),
+                rrf_constant=DEFAULT_RRF_CONSTANT,
+            )
+            merged = self._merge_candidates(fused)
+            ranked = rank_candidates(query, merged, plan)
+            selected = diversify_candidates(ranked, top_k=final_top_k, intent=confidence_type)
+
+        final_quality = evaluate_retrieval_quality(plan, ranked, selected, top_k=final_top_k)
+        candidate_count_after = len(merged)
+        await _emit_retrieval_event(
+            _event_sink,
+            "retrieval_quality",
+            {
+                "stage": "final",
+                "grade": final_quality.grade,
+                "score": final_quality.score,
+                "candidateCount": final_quality.candidate_count,
+                "bestScore": final_quality.best_score,
+                "matchedTypes": final_quality.matched_types,
+                "requiredTypes": final_quality.required_types,
+                "reasons": final_quality.reasons,
+                "shouldSupplement": False,
+                "supplementalRoutes": supplemental_routes,
+            },
+        )
         expensive_rerank_recommended = should_use_expensive_rerank(plan, ranked)
-        selected = diversify_candidates(ranked, top_k=top_k, intent=confidence_type)
         confidence = summarize_confidence(selected, intent=confidence_type)
         expanded_selected = expand_retrieval_context(selected, vector_service, max_expanded=6)
         expanded_count = max(0, len(expanded_selected) - len(selected))
+        await _emit_retrieval_event(
+            _event_sink,
+            "retrieval_expand",
+            {
+                "expandedCount": expanded_count,
+                "primaryCount": len(selected),
+                "totalCount": len(expanded_selected),
+                "strategy": "parent_section_context",
+            },
+        )
 
         results: List[VectorSearchResult] = []
         for doc in expanded_selected:
@@ -288,14 +470,33 @@ class KnowledgeRetrievalTool(BaseTool):
             metadata["requires_strict_evidence"] = plan.requires_strict_evidence
             metadata["expensive_rerank_recommended"] = expensive_rerank_recommended
             metadata["retrieval_context_expanded_count"] = expanded_count
+            metadata["adaptive_rag_enabled"] = True
+            metadata["recall_top_n"] = recall_k
+            metadata["final_top_k"] = final_top_k
+            metadata.setdefault("rrf_enabled", False)
+            metadata.setdefault("rrf_constant", DEFAULT_RRF_CONSTANT)
+            metadata["first_pass_quality"] = first_quality.grade
+            metadata["final_quality"] = final_quality.grade
+            metadata["first_pass_quality_score"] = first_quality.score
+            metadata["final_quality_score"] = final_quality.score
+            metadata["first_pass_quality_reasons"] = first_quality.reasons
+            metadata["final_quality_reasons"] = final_quality.reasons
+            metadata["quality_reasons"] = final_quality.reasons
+            metadata["required_evidence_types"] = final_quality.required_types
+            metadata["supplemental_search_used"] = supplemental_search_used
+            metadata["supplemental_routes"] = supplemental_routes
+            metadata["candidate_count_before"] = candidate_count_before
+            metadata["candidate_count_after"] = candidate_count_after
             metadata["confidence_reason"] = {
                 "best_relevance_score": confidence["best_relevance_score"],
                 "candidate_count": confidence["candidate_count"],
                 "dual_image_hit": confidence["dual_image_hit"],
                 "intent": plan.intent,
                 "confidence_intent": confidence_type,
+                "first_pass_quality": first_quality.grade,
+                "final_quality": final_quality.grade,
             }
-            if confidence["confidence"] == "low":
+            if confidence["confidence"] == "low" or final_quality.grade == "low":
                 metadata["answer_policy"] = "insufficient_evidence"
             results.append(
                 VectorSearchResult(
@@ -310,6 +511,22 @@ class KnowledgeRetrievalTool(BaseTool):
                     rerank_score=doc.get("rerank_score"),
                 )
             )
+        await _emit_retrieval_event(
+            _event_sink,
+            "retrieval_done",
+            {
+                "selectedCount": len(results),
+                "primaryCount": len(selected),
+                "expandedCount": expanded_count,
+                "candidateCountBefore": candidate_count_before,
+                "candidateCountAfter": candidate_count_after,
+                "countsByType": _count_selected_types(expanded_selected),
+                "finalQuality": final_quality.grade,
+                "finalQualityScore": final_quality.score,
+                "supplementalSearchUsed": supplemental_search_used,
+                "supplementalRoutes": supplemental_routes,
+            },
+        )
         return results
 
 

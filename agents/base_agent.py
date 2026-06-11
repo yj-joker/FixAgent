@@ -18,8 +18,9 @@ import time
 import asyncio
 import logging
 import json
+import inspect
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional, AsyncIterator
+from typing import List, Dict, Any, Optional, AsyncIterator, Callable
 from datetime import datetime
 
 from pydantic import BaseModel, Field
@@ -238,6 +239,31 @@ class BaseAgent(ABC):
                     seen.add(tool_name)
         return tools_used
 
+    @staticmethod
+    def _tool_accepts_event_sink(tool: Any) -> bool:
+        target = getattr(tool, "_execute", None) or getattr(tool, "run", None)
+        if target is None:
+            return False
+        try:
+            signature = inspect.signature(target)
+        except (TypeError, ValueError):
+            return False
+        return any(
+            param_name == "_event_sink" or param.kind == inspect.Parameter.VAR_KEYWORD
+            for param_name, param in signature.parameters.items()
+        )
+
+    @staticmethod
+    async def _emit_stream_event(
+        event_sink: Optional[Callable[[Dict[str, Any]], Any]],
+        event: Dict[str, Any],
+    ) -> None:
+        if not event_sink:
+            return
+        result = event_sink(event)
+        if inspect.isawaitable(result):
+            await result
+
     def _build_messages(
         self,
         input_data: AgentInput,
@@ -272,7 +298,7 @@ class BaseAgent(ABC):
                 lines.append(
                     f"设备：{t.get('deviceName', '') or '未知'}；"
                     f"故障：{t.get('faultDescription', '') or '未填写'}；"
-                    f"检修等级：{t.get('maintenanceLevel', '') or '-'}"
+                    f"检修等级：{t.get('maintenanceLevel', '') or '未提供'}"
                 )
                 prog = m.get("progress") or {}
                 if prog:
@@ -293,9 +319,13 @@ class BaseAgent(ABC):
                         lines.append(f"该步参考依据：{fs.get('sources')}")
                 ov = m.get("overview")
                 if ov:
-                    lines.append("\n【全部步骤一览】\n" + "\n".join(f"- {s}" for s in ov))
+                    overview_lines = "\n".join(
+                        f"{index}. {step}"
+                        for index, step in enumerate(ov, start=1)
+                    )
+                    lines.append("\n全部步骤一览：\n" + overview_lines)
                 context_parts.append(
-                    "## 当前检修任务\n" + "\n".join(lines)
+                    "当前检修任务：\n" + "\n".join(lines)
                     + "\n\n你是现场检修助手，正在与工人进行【连续的现场对话】。"
                     "请结合上面的任务背景、当前聚焦步骤、以及前面的对话内容来回答；"
                     "当工人追问「还不行怎么办 / 下一步呢」时，要承接前文继续给出可操作的排查与处置建议，必要时引用其它步骤。"
@@ -306,40 +336,55 @@ class BaseAgent(ABC):
 
             # 之前的对话摘要
             if input_data.context.get("previous_summary"):
-                context_parts.append(f"## 之前的对话摘要\n{input_data.context['previous_summary']}")
+                context_parts.append(f"之前的对话摘要：\n{input_data.context['previous_summary']}")
 
             # 相关历史事实（向量检索得到）
             if input_data.context.get("relevant_facts"):
                 facts = input_data.context["relevant_facts"]
-                facts_str = "\n".join(f"- {f.get('text', f) if isinstance(f, dict) else f}" for f in facts)
-                context_parts.append(f"## 相关历史事实\n{facts_str}")
+                facts_str = "\n".join(
+                    f"{index}. {f.get('text', f) if isinstance(f, dict) else f}"
+                    for index, f in enumerate(facts, start=1)
+                )
+                context_parts.append(f"相关历史事实：\n{facts_str}")
 
             # 用户偏好
             if input_data.context.get("user_preferences"):
                 prefs = input_data.context["user_preferences"]
-                prefs_str = "\n".join(f"- {p.get('content', p) if isinstance(p, dict) else p}" for p in prefs)
-                context_parts.append(f"## 用户偏好\n{prefs_str}")
+                prefs_str = "\n".join(
+                    f"{index}. {p.get('content', p) if isinstance(p, dict) else p}"
+                    for index, p in enumerate(prefs, start=1)
+                )
+                context_parts.append(f"用户偏好：\n{prefs_str}")
 
             # 会话偏好
             if input_data.context.get("session_preferences"):
                 prefs = input_data.context["session_preferences"]
-                prefs_str = "\n".join(f"- {p.get('content', p) if isinstance(p, dict) else p}" for p in prefs)
-                context_parts.append(f"## 当前会话偏好\n{prefs_str}")
+                prefs_str = "\n".join(
+                    f"{index}. {p.get('content', p) if isinstance(p, dict) else p}"
+                    for index, p in enumerate(prefs, start=1)
+                )
+                context_parts.append(f"当前会话偏好：\n{prefs_str}")
 
             # 未解决事项
             if input_data.context.get("unresolved_items"):
                 items = input_data.context["unresolved_items"]
-                items_str = "\n".join(f"- [{i.get('type', '未知')}] {i.get('content', i) if isinstance(i, dict) else i}" for i in items)
-                context_parts.append(f"## 待解决事项\n{items_str}")
+                items_str = "\n".join(
+                    f"{index}. [{item.get('type', '未知')}] {item.get('content', item) if isinstance(item, dict) else item}"
+                    for index, item in enumerate(items, start=1)
+                )
+                context_parts.append(f"待解决事项：\n{items_str}")
 
             # 用户画像
             if input_data.context.get("user_profile"):
                 profiles = input_data.context["user_profile"]
-                profile_str = "\n".join(f"- **{p.get('type', '未知')}**: {p.get('content', '')}" for p in profiles)
-                context_parts.append(f"## 用户画像\n{profile_str}")
+                profile_str = "\n".join(
+                    f"{index}. {profile.get('type', '未知')}：{profile.get('content', '')}"
+                    for index, profile in enumerate(profiles, start=1)
+                )
+                context_parts.append(f"用户画像：\n{profile_str}")
 
             if context_parts:
-                system_content += "\n\n---\n以下是当前对话的背景信息，请据此回答用户问题：\n\n" + "\n\n".join(context_parts)
+                system_content += "\n\n以下是当前对话的背景信息，请据此回答用户问题：\n\n" + "\n\n".join(context_parts)
 
         messages = [{"role": "system", "content": system_content}]
 
@@ -499,7 +544,8 @@ class BaseAgent(ABC):
     async def run_with_react(
         self,
         input_data: AgentInput,
-        max_iterations: int = 10
+        max_iterations: int = 10,
+        _event_sink: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> AgentOutput:
         """
         ReAct 模式执行入口
@@ -544,6 +590,12 @@ class BaseAgent(ABC):
                             t.name,
                             self._summarize_for_log(kwargs),
                         )
+                        await self._emit_stream_event(
+                            _event_sink,
+                            {"event": "tool", "data": {"tool": t.name}},
+                        )
+                        if _event_sink and self._tool_accepts_event_sink(t):
+                            kwargs["_event_sink"] = _event_sink
                         try:
                             result = await t.run(**kwargs)
                         except Exception:
@@ -671,7 +723,27 @@ class BaseAgent(ABC):
         }
 
         try:
-            output = await self.run_with_react(input_data, max_iterations)
+            progress_queue: asyncio.Queue = asyncio.Queue()
+
+            async def emit_progress(event: Dict[str, Any]) -> None:
+                await progress_queue.put(event)
+
+            run_task = asyncio.create_task(
+                self.run_with_react(
+                    input_data,
+                    max_iterations,
+                    _event_sink=emit_progress,
+                )
+            )
+
+            while not run_task.done() or not progress_queue.empty():
+                try:
+                    progress_event = await asyncio.wait_for(progress_queue.get(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    continue
+                yield progress_event
+
+            output = await run_task
 
             if output.metadata.get("status") == "error":
                 yield {"event": "error", "data": {"message": output.message}}
@@ -680,13 +752,6 @@ class BaseAgent(ABC):
 
             # 输出工具调用事件
             react_trace = output.metadata.get("react_trace", [])
-            for step in react_trace:
-                if step.get("action") == "tool_call":
-                    for tc in step.get("tool_calls", []):
-                        yield {
-                            "event": "tool",
-                            "data": {"tool": tc.get("name", "unknown")}
-                        }
 
             # 逐字流式输出最终回答
             message = output.message

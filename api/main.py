@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 from functools import partial
 from typing import List
@@ -45,12 +46,43 @@ from services.vector_service import build_redis_filter, get_vector_service
 from services.llm_service import get_llm_service
 from services.image_summary_service import get_image_summary_service
 from services.intent_router import get_intent_router
+from services.intent_fast_path import get_intent_fast_path_runner
+from services.output_style import USER_VISIBLE_PLAIN_TEXT_RULES
 from tools.knowledge_retrieval_tool import get_knowledge_retrieval_tool
 from services.temporary_plan_service import get_temporary_plan_service
 from config.settings import get_settings
 from schemas.models import AgentMode
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_EVIDENCE_IMAGE_LIMIT = 2
+MAX_EVIDENCE_IMAGE_LIMIT = 6
+_COUNT_WORDS = {
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "俩": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+    "十": 10,
+}
+_IMAGE_COUNT_PATTERNS = (
+    re.compile(
+        r"(?:返回|展示|显示|给我|帮我找|找|查找|提供|列出|发|看|翻出|检索|输出|需要|要)"
+        r".{0,12}?(?P<count>\d{1,2}|[一二两俩三四五六七八九十]{1,3})"
+        r"\s*(?:张|幅|个|份)?\s*(?:相关)?\s*(?:图片|图|照片|示意图)"
+    ),
+    re.compile(
+        r"(?:返回|展示|显示|给我|帮我找|找|查找|提供|列出|发|看|翻出|检索|输出|需要|要)"
+        r".{0,8}?(?:图片|图|照片|示意图)"
+        r".{0,8}?(?P<count>\d{1,2}|[一二两俩三四五六七八九十]{1,3})\s*(?:张|幅|个|份)?"
+    ),
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -176,6 +208,37 @@ def _is_high_risk_rag_question(message: str) -> bool:
     )
 
 
+def _is_explicit_rag_request(message: str) -> bool:
+    text = message or ""
+    explicit_terms = (
+        "根据知识库", "查知识库", "知识库回答", "只查资料", "根据资料", "根据手册",
+        "璇锋牴鎹煡璇嗗簱", "鏍规嵁鐭ヨ瘑搴?,", "鏍规嵁鐭ヨ瘑搴?",
+        "鏌ョ煡璇嗗簱", "鐭ヨ瘑搴撳洖绛?,", "鐭ヨ瘑搴撳洖绛?",
+        "鍙煡璧勬枡", "鏍规嵁璧勬枡", "鏍规嵁鎵嬪唽",
+    )
+    return any(term in text for term in explicit_terms)
+
+
+def _is_strict_rag_fast_path_blocked_question(message: str) -> bool:
+    text = message or ""
+    parameter_terms = (
+        "参数", "多少", "扭矩", "力矩", "间隙", "规格", "型号", "标准", "数值",
+        "电压", "电流", "N·m", "Nm", "mm", "MPa", "kPa", "torque", "spec",
+        "鍙傛暟", "澶氬皯", "鎵煩", "鍔涚煩", "闂撮殭", "瑙勬牸",
+        "鍨嬪彿", "鏍囧噯", "鏁板€?,", "鐢靛帇", "鐢垫祦",
+    )
+    procedure_terms = (
+        "怎么", "如何", "步骤", "流程", "拆", "装", "更换", "维修", "检修", "安装", "调整", "操作",
+        "鎬庝箞", "濡備綍", "姝ラ", "娴佺▼", "鎷?,", "瑁?,", "鏇存崲",
+        "缁翠慨", "妫€淇?,", "瀹夎", "璋冩暣", "鎿嶄綔",
+    )
+    formal_plan_terms = (
+        "检修方案", "维修方案", "SOP", "工单", "作业指导书", "安全措施",
+        "妫€淇柟妗?,", "缁翠慨鏂规", "浣滀笟鎸囧涔?,", "瀹夊叏鎺柦",
+    )
+    return any(term in text for term in parameter_terms + procedure_terms + formal_plan_terms)
+
+
 def _should_use_rag_fast_path(request: ChatRequest) -> bool:
     """保守触发简单 RAG 快速路径，避免普通诊断问题误绕过 ReAct。"""
     if request.images:
@@ -186,6 +249,8 @@ def _should_use_rag_fast_path(request: ChatRequest) -> bool:
     message = request.message or ""
     if _is_knowledge_inventory_question(message):
         return False
+    if _is_explicit_rag_request(message):
+        return not _is_strict_rag_fast_path_blocked_question(message)
     if _is_high_risk_rag_question(message):
         return False
     if request.mode == AgentMode.RETRIEVAL:
@@ -283,12 +348,23 @@ async def _prepare_chat_agent_input(request: ChatRequest) -> AgentInput:
 def _evidence_item_to_text(item, index: int) -> str:
     data = item.model_dump() if hasattr(item, "model_dump") else item
     metadata = data.get("metadata") or {}
-    source = data.get("id") or metadata.get("document_id") or f"evidence-{index}"
-    score = data.get("score", "")
     content = data.get("content") or data.get("text") or ""
     page = metadata.get("page_number") or metadata.get("page")
-    page_text = f", page={page}" if page else ""
-    return f"[证据{index}] source={source}, score={score}{page_text}\n{content}"
+    title = (
+        metadata.get("caption")
+        or metadata.get("image_title")
+        or metadata.get("section_title")
+        or metadata.get("title")
+        or ""
+    )
+    lines = [f"证据{index}："]
+    if page:
+        lines.append(f"页码：第{page}页")
+    if title:
+        lines.append(f"说明：{title}")
+    if content:
+        lines.append(f"内容：{content}")
+    return "\n".join(lines)
 
 
 def _plain_dict(value) -> dict:
@@ -318,7 +394,50 @@ def _iter_trace_result_items(metadata: dict):
                         yield item_data
 
 
-def _extract_evidence_images(metadata: dict) -> List[EvidenceImage]:
+def _count_text_to_int(value: str) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    if text in _COUNT_WORDS:
+        return _COUNT_WORDS[text]
+    if "十" in text:
+        left, _, right = text.partition("十")
+        tens = _COUNT_WORDS.get(left, 1) if left else 1
+        ones = _COUNT_WORDS.get(right, 0) if right else 0
+        return tens * 10 + ones
+    return None
+
+
+def _requested_evidence_image_limit(user_message: str = "") -> int:
+    message = str(user_message or "")
+    for pattern in _IMAGE_COUNT_PATTERNS:
+        match = pattern.search(message)
+        if not match:
+            continue
+        count = _count_text_to_int(match.group("count"))
+        if count:
+            return min(max(count, 1), MAX_EVIDENCE_IMAGE_LIMIT)
+    return DEFAULT_EVIDENCE_IMAGE_LIMIT
+
+
+def _limit_evidence_images(images: List[EvidenceImage], user_message: str = "") -> List[EvidenceImage]:
+    limit = _requested_evidence_image_limit(user_message)
+    limited: List[EvidenceImage] = []
+    seen = set()
+    for image in images:
+        dedupe_key = image.image_url or image.source_chunk_id
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        limited.append(image)
+        if len(limited) >= limit:
+            break
+    return limited
+
+
+def _extract_evidence_images(metadata: dict, user_message: str = "") -> List[EvidenceImage]:
     images: List[EvidenceImage] = []
     seen = set()
     for item in _iter_trace_result_items(metadata):
@@ -348,7 +467,7 @@ def _extract_evidence_images(metadata: dict) -> List[EvidenceImage]:
                 context_role=item_meta.get("context_role", ""),
             )
         )
-    return images
+    return _limit_evidence_images(images, user_message)
 
 
 async def _run_rag_fast_path(request: ChatRequest) -> AgentOutput | None:
@@ -380,10 +499,7 @@ async def _run_rag_fast_path(request: ChatRequest) -> AgentOutput | None:
             "content": (
                 "你是设备检修知识库问答助手。必须基于给定知识库证据回答；"
                 "证据不足时明确说明不足，不要编造参数、型号或操作步骤。"
-                "禁止使用 emoji。"
-                "不允许把多个信息点挤在同一整段中。"
-                "普通解释使用自然段；当内容包含编号、清单、选项、步骤或文件列表时，每一项必须单独换行。"
-                "编号格式使用“1. 内容”“2. 内容”，不要把多个编号写在同一行。"
+                f"{USER_VISIBLE_PLAIN_TEXT_RULES}"
             ),
         },
         {
@@ -466,6 +582,9 @@ async def chat(request: ChatRequest) -> ChatResponse:
                 review_level = "light"
 
         if fix_result is None:
+            fix_result = await get_intent_fast_path_runner().run(input_data)
+
+        if fix_result is None:
             fix_result = await get_fix_agent().run_with_react(input_data)
         fix_result.metadata["user_message"] = input_data.user_message
         fix_result.metadata["original_user_message"] = request.message
@@ -516,7 +635,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         )
 
         response_message, diagnosis_items = _extract_structured_chat_payload(final_result.message)
-        evidence_images = _extract_evidence_images(final_result.metadata)
+        evidence_images = _extract_evidence_images(final_result.metadata, request.message)
 
         return ChatResponse(
             session_id=request.session_id,
@@ -555,7 +674,7 @@ def _render_maintenance_block(m: dict) -> str:
     lines.append(
         f"设备：{t.get('deviceName', '') or '未知'}；"
         f"故障：{t.get('faultDescription', '') or '未填写'}；"
-        f"检修等级：{t.get('maintenanceLevel', '') or '-'}"
+        f"检修等级：{t.get('maintenanceLevel', '') or '未提供'}"
     )
     prog = m.get("progress") or {}
     if prog:
@@ -607,7 +726,8 @@ async def _maintenance_fallback_answer(input_data: AgentInput, maint_ctx: dict):
         "用简明、安全第一、可操作的中文，直接给工人下一步可执行的建议。"
         "第一句话就给结论，即使知识库没有完全匹配的资料，也要基于通用检修经验务实作答。"
         "严禁以「资料不足 / 无法回答 / 暂不能生成」搪塞；"
-        "严禁输出任何 JSON、花括号 {} 或字段名，只用自然段中文回答。\n\n"
+        "严禁输出任何 JSON、花括号 {} 或字段名，只用自然段中文回答。"
+        f"{USER_VISIBLE_PLAIN_TEXT_RULES}\n\n"
         + _render_maintenance_block(maint_ctx)
     )
 
@@ -650,6 +770,126 @@ async def _maintenance_fallback_answer(input_data: AgentInput, maint_ctx: dict):
         return None
 
 
+async def _emit_reviewed_stream_from_output(
+    request: ChatRequest,
+    input_data: AgentInput,
+    fix_output: AgentOutput,
+    review_level: str = "full",
+):
+    """Review a completed AgentOutput and emit the final SSE token stream."""
+    import asyncio as _asyncio
+
+    react_trace = fix_output.metadata.get("react_trace", [])
+    metadata = fix_output.metadata if isinstance(fix_output.metadata, dict) else {}
+    evidence_images = _extract_evidence_images({**metadata, "react_trace": react_trace}, request.message)
+
+    for step in react_trace:
+        if step.get("action") != "tool_call":
+            continue
+        for tool_call in step.get("tool_calls", []):
+            tool_name = tool_call.get("name")
+            if tool_name:
+                yield f"data: {json_dumps({'event': 'tool', 'data': {'tool': tool_name}})}\n\n"
+
+    maint_ctx = (input_data.context or {}).get("maintenance")
+    fallback_text = None
+    if maint_ctx and _is_unhelpful_maintenance_reply(fix_output.message):
+        fallback_text = await _maintenance_fallback_answer(input_data, maint_ctx)
+        if fallback_text:
+            logger.info("[chat_stream] 检修助手出口兜底已触发 session=%s", request.session_id)
+
+    if fallback_text:
+        final_message = fallback_text
+        diagnosis_items = None
+        verification = {}
+        has_issues = False
+        markers = []
+        verified_tools = fix_output.tools_used
+        verified_latency = fix_output.latency_ms
+    else:
+        review_input = AgentOutput(
+            agent_name=fix_output.agent_name,
+            message=fix_output.message,
+            intention=fix_output.intention,
+            tools_used=fix_output.tools_used,
+            metadata={
+                **metadata,
+                "react_trace": react_trace,
+                "user_message": input_data.user_message,
+                "original_user_message": request.message,
+                "intent_decision": (input_data.context or {}).get("intent_decision"),
+            },
+            latency_ms=fix_output.latency_ms,
+            raw_response=fix_output.raw_response,
+        )
+
+        if review_input.metadata.get("execution_mode") == "knowledge_inventory_direct":
+            verified_output = review_input
+        else:
+            verified_output = await get_review_agent().review(review_input, level=review_level)
+        if "react_trace" not in verified_output.metadata and react_trace:
+            verified_output.metadata["react_trace"] = react_trace
+
+        verification = verified_output.metadata.get("verification", {})
+        has_issues = verified_output.metadata.get("verification_has_issues", False)
+        evidence_images = _extract_evidence_images(verified_output.metadata, request.message)
+        final_message, diagnosis_items = _extract_structured_chat_payload(verified_output.message)
+        markers = get_review_agent().get_inline_markers(final_message, verification)
+        verified_tools = verified_output.tools_used
+        verified_latency = verified_output.latency_ms
+
+    if maint_ctx and _is_unhelpful_maintenance_reply(final_message):
+        logger.info("[chat_stream] 检修助手最终保险触发，替换为安全话术 session=%s", request.session_id)
+        final_message = _MAINT_SAFE_FALLBACK_LINE
+        diagnosis_items = None
+        markers = []
+
+    marker_idx = 0
+    for index, char in enumerate(final_message):
+        while marker_idx < len(markers) and markers[marker_idx]["char_pos"] <= index:
+            marker = markers[marker_idx]
+            yield f"data: {json_dumps({'event': 'marker', 'data': {'text': marker['text'], 'type': marker['type']}})}\n\n"
+            marker_idx += 1
+
+        yield f"data: {json_dumps({'event': 'token', 'data': {'content': char}})}\n\n"
+        if index % 15 == 0:
+            await _asyncio.sleep(0)
+
+    while marker_idx < len(markers):
+        marker = markers[marker_idx]
+        yield f"data: {json_dumps({'event': 'marker', 'data': {'text': marker['text'], 'type': marker['type']}})}\n\n"
+        marker_idx += 1
+
+    verification_event = {
+        "event": "verification",
+        "data": {
+            "has_issues": has_issues,
+            "summary": {
+                "grounding_unverified": verification.get("grounding", {}).get("unverified_count", 0),
+                "graph_unverified": verification.get("graph", {}).get("unverified_count", 0),
+                "safety_missing": verification.get("safety", {}).get("missing_count", 0),
+            },
+        },
+    }
+    yield f"data: {json_dumps(verification_event)}\n\n"
+
+    final_done = {
+        "event": "done",
+        "data": {
+            "tools_used": verified_tools,
+            "latency_ms": verified_latency,
+        },
+    }
+    if diagnosis_items:
+        final_done["data"]["diagnosisItems"] = _serialize_diagnosis_items(diagnosis_items)
+    if evidence_images:
+        final_done["data"]["evidenceImages"] = [
+            image.model_dump(by_alias=True)
+            for image in evidence_images
+        ]
+    yield f"data: {json_dumps(final_done)}\n\n"
+
+
 @app.post("/ai/chat/stream")
 async def chat_stream(request: ChatRequest):
     """
@@ -674,6 +914,25 @@ async def chat_stream(request: ChatRequest):
         input_data = await _prepare_chat_agent_input(request)
 
         try:
+            fast_output = None
+            fast_review_level = "full"
+            if _should_use_rag_fast_path(request):
+                fast_output = await _run_rag_fast_path(request)
+                if fast_output is not None:
+                    fast_review_level = "light"
+
+            if fast_output is None:
+                fast_output = await get_intent_fast_path_runner().run(input_data)
+            if fast_output is not None:
+                async for chunk in _emit_reviewed_stream_from_output(
+                    request,
+                    input_data,
+                    fast_output,
+                    review_level=fast_review_level,
+                ):
+                    yield chunk
+                return
+
             fix_agent = get_fix_agent()
 
             # 执行 FixAgent ReAct，转发进度事件（status/tool），缓冲 token
@@ -690,6 +949,8 @@ async def chat_stream(request: ChatRequest):
                     yield f"data: {json_dumps(event)}\n\n"
                 elif ev_type == "tool":
                     tools_in_stream.append(event.get("data", {}).get("tool", ""))
+                    yield f"data: {json_dumps(event)}\n\n"
+                elif isinstance(ev_type, str) and ev_type.startswith("retrieval_"):
                     yield f"data: {json_dumps(event)}\n\n"
                 elif ev_type == "token":
                     token_buffer.append(event.get("data", {}).get("content", ""))
@@ -710,7 +971,7 @@ async def chat_stream(request: ChatRequest):
             fix_latency = done_data.get("latency_ms", 0)
             verified_tools = tools_in_stream if tools_in_stream else stream_tools_used
             verified_latency = fix_latency
-            evidence_images = _extract_evidence_images({**stream_metadata, "react_trace": stream_react_trace})
+            evidence_images = _extract_evidence_images({**stream_metadata, "react_trace": stream_react_trace}, request.message)
 
             # —— 检修助手出口兜底（仅 maintenance 场景）——
             # 模型若吐出控制结构 JSON（needs_more_tools / 残缺 {"message"..}）或套话式软拒答，
@@ -755,7 +1016,7 @@ async def chat_stream(request: ChatRequest):
                     verified_output.metadata["react_trace"] = fix_output.metadata["react_trace"]
                 verification = verified_output.metadata.get("verification", {})
                 has_issues = verified_output.metadata.get("verification_has_issues", False)
-                evidence_images = _extract_evidence_images(verified_output.metadata)
+                evidence_images = _extract_evidence_images(verified_output.metadata, request.message)
 
                 # 流式输出最终回答（逐字），在未验证语句前插入 marker 事件
                 final_message, diagnosis_items = _extract_structured_chat_payload(verified_output.message)
@@ -852,8 +1113,12 @@ async def knowledge_import(request: KnowledgeImportRequest) -> KnowledgeImportRe
         )
         logger.info(f"[knowledge_import] 文件={result['file_name']} "
                     f"页数={result['total_pages']} "
+                    f"解析文本块={result.get('parsed_text_chunks_count', 0)} "
+                    f"拆分文本块={result.get('chunked_text_chunks_count', 0)} "
+                    f"可入库文本块={result.get('indexable_text_chunks_count', 0)} "
                     f"文本={result['text_count']} 图片={result['image_count']} 表格={result['table_count']} "
-                    f"耗时={result['process_time_ms']}ms")
+                    f"耗时={result['process_time_ms']}ms "
+                    f"阶段耗时={result.get('stage_timings_ms', {})}")
         return KnowledgeImportResponse(
             success=True,
             message=f"导入完成：{result['file_name']}，共 {result['total_pages']} 页",
