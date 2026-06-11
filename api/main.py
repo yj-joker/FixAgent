@@ -46,6 +46,7 @@ from services.vector_service import build_redis_filter, get_vector_service
 from services.llm_service import get_llm_service
 from services.image_summary_service import get_image_summary_service
 from services.intent_router import get_intent_router
+from services.preference_capture import schedule_capture
 from tools.knowledge_retrieval_tool import get_knowledge_retrieval_tool
 from services.temporary_plan_service import get_temporary_plan_service
 from config.settings import get_settings
@@ -265,6 +266,10 @@ async def _prepare_chat_agent_input(request: ChatRequest) -> AgentInput:
     )
     context["intent_decision"] = intent_decision.model_dump()
     context["intention"] = intent_decision.intent
+
+    # 用户画像确定性兜底：偏好/身份不再只靠主 Agent 自觉调 save_memory，
+    # 命中门控即后台抽取并按规范 name upsert 到 memory_fact(type=user)，下一轮即生效。
+    schedule_capture(raw_message, context.get("user_id"))
 
     if request.images and intent_decision.requires_image_understanding:
         image_understanding = await _build_image_understanding(request.images, effective_message)
@@ -1019,104 +1024,6 @@ async def memory_consolidate(request: MemoryConsolidateRequest) -> MemoryConsoli
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/ai/memory/search_facts")
-async def search_facts(query: str, top_k: int = 5, session_ids: str = "",
-                       device_type: str = "", equipment_id: str = "",
-                       site_id: str = "", task_id: str = ""):
-    """
-    事实记忆向量检索接口 — 带多因子重排序 + 业务维度感知
-
-    Java 端在组装对话上下文时调用此接口，
-    用当前用户消息作为 query 去向量库中检索最相关的历史事实。
-    检索结果会被注入到 AI 对话上下文中，让 AI 能"记住"之前的事实。
-
-    【两阶段排序】
-    1. 粗筛：Redis KNN 取 top_k * 3 候选
-    2. 精排：FactReranker 多因子综合排序（语义 + 新近性 + 重要度 + 频率 + 置信度 + 业务匹配）
-
-    Args:
-        query: 用户当前发送的消息文本，用于语义匹配
-        top_k: 最多返回几条最相关的事实，默认5条
-        session_ids: 当前用户的会话ID列表，逗号分隔。用于过滤非本用户的事实
-        device_type: 当前设备类型（可选，用于业务维度加权）
-        equipment_id: 当前设备ID（可选）
-        site_id: 当前场地ID（可选）
-        task_id: 当前检修任务ID（可选）
-
-    Returns:
-        {"facts": [{"doc_id": "fact:xxx", "content": "...", "score": 0.85, "final_score": 0.72, ...}, ...]}
-    """
-    import time as t
-    from services.fact_reranker import rerank
-
-    if not (query or "").strip():
-        logger.info("[search_facts] empty query, skip fact vector search")
-        return {"facts": [], "query_time_ms": 0}
-
-    # 解析会话ID白名单
-    allowed_sessions = set()
-    if session_ids:
-        allowed_sessions = {sid.strip() for sid in session_ids.split(",") if sid.strip()}
-
-    try:
-        t0 = t.time()
-        svc = get_vector_service()
-        # 粗筛：多取候选，留给 reranker 精排
-        fact_filter = build_redis_filter(record_type="fact", status="active")
-        results = await svc.search_by_text(query, top_k=top_k * 3, filter=fact_filter)
-
-        # 过滤：只保留 type=fact, status=active, 属于当前用户
-        candidates = []
-        for r in results:
-            metadata = r.get("metadata", {})
-            if metadata.get("type") != "fact":
-                continue
-            # 过滤已废弃的事实（双重保障：即使旧向量未被删除，也不会返回）
-            if metadata.get("status") and metadata.get("status") != "active":
-                continue
-            # 按会话ID过滤：只保留属于当前用户的事实
-            fact_session = metadata.get("session_id", "")
-            if allowed_sessions and fact_session not in allowed_sessions:
-                continue
-            candidates.append(r)
-
-        # 构建业务上下文
-        business_context = {}
-        if device_type:
-            business_context["device_type"] = device_type
-        if equipment_id:
-            business_context["equipment_id"] = equipment_id
-        if site_id:
-            business_context["site_id"] = site_id
-        if task_id:
-            business_context["task_id"] = task_id
-
-        # 精排：多因子重排序（含业务维度）
-        ranked = rerank(candidates, top_k=top_k,
-                        business_context=business_context or None)
-
-        # 格式化输出
-        facts = []
-        for r in ranked:
-            metadata = r.get("metadata", {})
-            facts.append({
-                "content": r.get("text", ""),
-                "score": round(r.get("score", 0), 4),
-                "final_score": r.get("final_score", 0),
-                "score_breakdown": r.get("score_breakdown", {}),
-                "doc_id": r.get("doc_id", ""),
-                "keywords": metadata.get("keywords", ""),
-                "session_id": metadata.get("session_id", ""),
-            })
-
-        query_time_ms = int((t.time() - t0) * 1000)
-        logger.info(f"[search_facts] 查询={query[:50]} 候选={len(candidates)} 精排后={len(facts)} 耗时={query_time_ms}ms")
-        return {"facts": facts, "query_time_ms": query_time_ms}
-    except Exception as e:
-        logger.exception(f"[search_facts] error")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 class DeleteFactsRequest(BaseModel):
     fact_ids: list[str]
 
@@ -1136,104 +1043,8 @@ async def delete_facts(request: DeleteFactsRequest):
     return {"deleted": deleted}
 
 
-class RealtimeUpdateRequest(BaseModel):
-    """实时记忆更新请求体"""
-    session_id: str
-    user_message: str
-    ai_response: str = ""
-    recent_facts: list = []
-
-
-@app.post("/ai/memory/realtime_update")
-async def realtime_memory_update(request: RealtimeUpdateRequest):
-    """
-    实时记忆更新检测接口
-
-    每轮对话完成后，Java端异步调用此接口。
-    轻量级LLM判断用户是否纠正了事实或改变了偏好。
-    如果检测到变更，立即更新向量库和返回偏好变更给Java端保存。
-
-    【与定时整合的区别】
-    - 本接口：只处理"纠正"和"偏好变更"，2-3秒完成
-    - /consolidate：做完整整合（新事实、待办、摘要），40-60秒
-
-    【调用时机】
-    Java端在 doOnComplete 保存AI回复后立即异步调用。
-    不阻塞主对话流，用户感知不到。
-
-    Args:
-        session_id: 会话ID
-        user_message: 用户本轮消息
-        ai_response: AI本轮回复（可选）
-        recent_facts: JSON格式的本轮注入事实列表（可选）
-
-    Returns:
-        {
-            "has_update": true/false,
-            "fact_corrections": [...],  // 已在向量库中更新的事实
-            "preference_changes": [...] // 需要Java端保存的偏好变更
-        }
-    """
-    import time as t
-
-    try:
-        t0 = t.time()
-
-        session_id = request.session_id
-        user_message = request.user_message
-        ai_response = request.ai_response
-        recent_facts = request.recent_facts
-
-        # 解析 recent_facts
-        if isinstance(recent_facts, str):
-            try:
-                facts_list = json.loads(recent_facts) if recent_facts else []
-            except (json.JSONDecodeError, TypeError):
-                facts_list = []
-        else:
-            facts_list = recent_facts if recent_facts else []
-
-        from agents.realtime_memory_agent import get_realtime_memory_agent
-        agent = get_realtime_memory_agent()
-
-        input_data = AgentInput(
-            user_message=user_message,
-            session_id=session_id,
-            context={
-                "user_message": user_message,
-                "ai_response": ai_response,
-                "recent_facts": facts_list
-            }
-        )
-
-        result = await agent.run(input_data)
-        latency_ms = int((t.time() - t0) * 1000)
-
-        result_data = result.metadata.get("result", {})
-        logger.info(
-            f"[realtime_update] 会话={session_id} "
-            f"有更新={result_data.get('has_update', False)} "
-            f"耗时={latency_ms}ms"
-        )
-
-        return {
-            "has_update": result_data.get("has_update", False),
-            "fact_corrections": result_data.get("fact_corrections", []),
-            "preference_changes": result_data.get("preference_changes", []),
-            # 被替代的旧事实的向量库doc_id列表
-            # Java端用这些ID在MySQL memory_fact表中标记旧事实为superseded
-            "superseded_fact_ids": result_data.get("superseded_fact_ids", []),
-            "latency_ms": latency_ms
-        }
-
-    except Exception as e:
-        logger.exception(f"[realtime_update] error")
-        return {
-            "has_update": False,
-            "fact_corrections": [],
-            "preference_changes": [],
-            "error": str(e)
-        }
+# [已退役] /ai/memory/realtime_update 端点删除：实时记忆更新链路停用，
+# 事实纠正改由对话内 save_memory/delete_memory 处理（旧链路去向量后只加不替、产生矛盾数据）。
 
 # ==================== 检修案例沉淀 ====================
 

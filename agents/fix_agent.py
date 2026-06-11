@@ -198,6 +198,30 @@ FIX_AGENT_SYSTEM_PROMPT += """
 """
 
 
+FIX_AGENT_MEMORY_RULES = """
+## 长期记忆使用规则
+
+上下文中的「长期记忆目录」是该用户的记忆索引（条目格式：[name] (type) — 摘要）。你同时是记忆的读者、作者和遗忘者。
+
+读取：目录中某条与当前问题相关、且需要超出摘要的细节时，才调用 read_memory(name)；摘要本身已够用就不必读。
+
+写入（save_memory）只记"已建立共识"：
+- 该存：用户亲口陈述的事实/规则/纠正；你建议且用户明确接受的约定。
+- 不存：你单方面的建议或推测；当下对话才需要的临时信息；能从知识库/图谱/任务记录里查到的内容。
+- type 四选一：user=关于用户本人的画像，含①交互偏好（回复语言/风格/详略，如"用中文""回复简洁些"）②身份/角色/专长（如"我是钳工""我负责装配线""我是新手"），每轮都会生效；feedback=要遵守的操作规则（必须写 why=该规则成立的外部原因、how_to_apply=何时适用与失效信号）；project=设备/项目的客观事实；reference=去别处查的指针。
+- 写前先看目录：已有相近条目→用同名 save_memory 覆盖更新，不要另起新名重复创建。
+
+用户画像（type=user）专项——高频出错点，务必照做：
+- 触发即存：用户陈述或改变①交互偏好或②自身身份/角色/专长时，本轮就调用 save_memory(type=user)，不能只口头答应。
+- 用稳定规范 name 覆盖，同一主题永远同名（回复语言→reply-language；回复风格/详略→reply-style；用户身份角色→user-role；用户专长/经验→user-expertise）。改偏好=用同名 save_memory 覆盖（如日语改中文，就用 name=reply-language 覆盖成"中文"）；撤销=delete_memory。
+- 【反幻觉】只有本轮真的调用了 save_memory 才可以说"已记住/已写入"；没调用就别声称写过。
+- 【答案以库为准】用户问"我的偏好/身份是什么"时，以上下文【用户偏好】注入内容为准回答，不要凭本轮对话里的临时说法；若注入的偏好与用户刚说的不一致，立即用同名 save_memory 更新，使库与现实对齐。
+
+冲突与核验：记忆是线索不是结论。当前对话观察与记忆矛盾时，以现场观察为准，并向用户指出矛盾；改写或删除记忆前先经用户确认。
+
+删除（delete_memory）：用户明确否定/作废某条记忆的主体时删除（不是更新）；read_memory 后发现其 why 前提已不成立时，向用户确认后删除。
+"""
+
 FIX_AGENT_PROMPT_SECTIONS = {
     "base_role": FIX_AGENT_SYSTEM_PROMPT,
     "tool_usage": "",
@@ -205,11 +229,16 @@ FIX_AGENT_PROMPT_SECTIONS = {
     "safety": "",
     "multimodal": "",
     "knowledge_inventory": "",
+    "memory_usage": FIX_AGENT_MEMORY_RULES,
 }
 
 
 def build_fix_agent_system_prompt() -> str:
     return "\n".join(part for part in FIX_AGENT_PROMPT_SECTIONS.values() if part).strip()
+
+
+# 记忆工具不受意图路由 tool_scope 限制（横切能力，任何意图下都可读/存/删记忆）
+_ALWAYS_ALLOWED_TOOLS = {"read_memory", "save_memory", "delete_memory"}
 
 
 class FixAgent(BaseAgent):
@@ -269,6 +298,11 @@ class FixAgent(BaseAgent):
             )
             from tools.conversation_detail_tool import get_conversation_detail_tool
             from tools.procedure_recommend_tool import get_procedure_recommend_tool
+            from tools.memory_tool import (
+                get_read_memory_tool,
+                get_save_memory_tool,
+                get_delete_memory_tool,
+            )
 
             self._tools = [
                 get_knowledge_retrieval_tool(),
@@ -277,11 +311,15 @@ class FixAgent(BaseAgent):
                 get_java_graph_device_search_tool(),
                 get_conversation_detail_tool(),
                 get_procedure_recommend_tool(),
+                get_read_memory_tool(),
+                get_save_memory_tool(),
+                get_delete_memory_tool(),
             ]
         allowed = getattr(self, "_current_allowed_tools", None)
         if allowed is None:
             return self._tools
-        allowed_set = set(allowed)
+        # 记忆工具是横切能力，不受意图 tool_scope 限制（否则 scoped 模式下 LLM 无法存/删记忆）
+        allowed_set = set(allowed) | _ALWAYS_ALLOWED_TOOLS
         return [tool for tool in self._tools if tool.name in allowed_set]
 
     def get_tools_for_run(self, run_context: AgentRunContext) -> List[Any]:
@@ -290,12 +328,13 @@ class FixAgent(BaseAgent):
         allowed = run_context.allowed_tools
         if allowed is None:
             return tools
-        allowed_set = set(allowed)
+        allowed_set = set(allowed) | _ALWAYS_ALLOWED_TOOLS
         return [tool for tool in tools if tool.name in allowed_set]
 
     def _customize_tool_kwargs(self, tool_name: str, kwargs: dict) -> dict:
         """为 recall_conversation_detail 注入 user_id"""
-        if tool_name == "recall_conversation_detail" and hasattr(self, "_current_user_id"):
+        if tool_name in ("recall_conversation_detail", "read_memory", "save_memory", "delete_memory") \
+                and hasattr(self, "_current_user_id"):
             kwargs["user_id"] = self._current_user_id or ""
         if tool_name in ("knowledge_retrieval", "java_graph_diagnosis_path"):
             images = getattr(self, "_current_images", None)
@@ -320,7 +359,7 @@ class FixAgent(BaseAgent):
             run_context.enhanced_query,
             run_context.images,
         )
-        if tool_name == "recall_conversation_detail":
+        if tool_name in ("recall_conversation_detail", "read_memory", "save_memory", "delete_memory"):
             kwargs["user_id"] = run_context.user_id or ""
         if tool_name in ("knowledge_retrieval", "java_graph_diagnosis_path"):
             if run_context.images and not kwargs.get("image_urls"):

@@ -102,6 +102,12 @@ class IntentRouter:
     _DOCUMENT_RE = re.compile(r"(这页|这张表|这个截图|文档.*讲|手册.*讲|表格.*意思|OCR|解析)")
     _PROCEDURE_RE = re.compile(r"(工单|作业单|标准作业|SOP|检修流程|维修流程|生成流程|作业指导书)")
     _CHAT_RE = re.compile(r"(你好|您好|早上好|晚上好|我是|最近|转行|学习|入门|聊聊|谢谢|辛苦)")
+    # 长期记忆管理（删除/忘掉某条记忆）：要求带记忆类名词，避免误伤"删除检修任务/文件"等。
+    # 命中后走中性 chat_social，让 LLM 依记忆使用规则调用 delete_memory（记忆工具恒可用），
+    # 不被 knowledge_inventory 等强提示意图劫持。
+    _MEMORY_MGMT_RE = re.compile(
+        r"(忘掉|忘记|删掉|删除|清除|去掉|作废).{0,16}(长期记忆|这条记忆|那条记忆|记忆|这条规则|那条规则|这条偏好|记住的)"
+    )
     _INTENT_INJECTION_RE = re.compile(
         r"(意图|intent|路由|分类).{0,12}(判断为|识别为|设置为|改成|输出|返回|等于|=|:)|"
         r"(判断为|识别为|设置为|改成).{0,12}(chat_social|knowledge_inventory|knowledge_query|visual_identification|"
@@ -218,6 +224,15 @@ class IntentRouter:
         injection_decision = self._detect_intent_injection(text)
         if injection_decision:
             return self._apply_strategy(injection_decision)
+
+        # 长期记忆管理（删除/忘掉某条记忆）：高优先级走中性 chat_social，
+        # 避免被 knowledge_inventory 等意图劫持导致 delete_memory 不被调用。
+        if not images and self._MEMORY_MGMT_RE.search(text):
+            mem_decision = IntentDecision(
+                target_layer="chat", intent="chat_social",
+                task_action="general_answer", confidence=1.0, source="rules",
+            )
+            return self._apply_strategy(mem_decision)
 
         try:
             llm_decision = await self._classify_with_llm(text, bool(images), context or {})

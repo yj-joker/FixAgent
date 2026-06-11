@@ -64,51 +64,7 @@ async def publish_result(channel: aio_pika.abc.AbstractChannel, data: dict,
     )
 
 
-async def handle_realtime(message: aio_pika.abc.AbstractIncomingMessage, channel: aio_pika.abc.AbstractChannel):
-    async with message.process(requeue=False):
-        body = json.loads(message.body)
-        session_id = str(body["sessionId"])
-        user_id = body["userId"]
-        logger.info("[MQ消费] 实时更新开始, 会话ID:%s", session_id)
-
-        try:
-            from agents.realtime_memory_agent import get_realtime_memory_agent
-            from agents.base_agent import AgentInput
-
-            agent = get_realtime_memory_agent()
-            input_data = AgentInput(
-                user_message=body["userMessage"],
-                session_id=session_id,
-                context={
-                    "user_message": body["userMessage"],
-                    "ai_response": body.get("aiResponse", ""),
-                    "recent_facts": body.get("recentFacts", []),
-                },
-            )
-            result = await agent.run(input_data)
-            result_data = result.metadata.get("result", {})
-
-            await publish_result(channel, {
-                "type": "realtime_update",
-                "sessionId": session_id,
-                "userId": user_id,
-                "currentRound": body.get("currentRound"),
-                "success": True,
-                "data": result_data,
-            })
-            logger.info("[MQ消费] 实时更新完成, 会话ID:%s, has_update=%s",
-                        session_id, result_data.get("has_update", False))
-
-        except Exception as e:
-            logger.error("[MQ消费] 实时更新失败, 会话ID:%s, 错误:%s", session_id, e)
-            await publish_result(channel, {
-                "type": "realtime_update",
-                "sessionId": session_id,
-                "userId": user_id,
-                "success": False,
-                "error": str(e),
-                "data": {},
-            })
+# [已退役] handle_realtime 删除：实时记忆更新链路停用，事实纠正改由对话内 save_memory/delete_memory 处理。
 
 
 async def handle_consolidate(message: aio_pika.abc.AbstractIncomingMessage, channel: aio_pika.abc.AbstractChannel):
@@ -544,13 +500,8 @@ async def start_consumers():
     realtime_q, consolidate_q, knowledge_import_q, task_generate_q, step_verify_q, reflection_q = await _declare_topology(init_channel)
     await init_channel.close()
 
-    # 实时更新通道（prefetch=5，允许并发处理多条）
-    realtime_channel = await connection.channel()
-    await realtime_channel.set_qos(prefetch_count=5)
-    realtime_queue = await realtime_channel.get_queue(REALTIME_QUEUE)
-    await realtime_queue.consume(
-        lambda msg: handle_realtime(msg, realtime_channel)
-    )
+    # [已退役] 实时更新消费者删除：事实纠正改由对话内 save_memory/delete_memory 处理。
+    # 队列拓扑仍保留（Java 端已停止发送，队列长期为空，无副作用）。
 
     # 记忆整合通道（prefetch=1，单任务耗时长，串行处理）
     consolidate_channel = await connection.channel()

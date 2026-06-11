@@ -36,6 +36,12 @@ class FactItem(BaseModel):
     equipment_id: str = Field(default="", description="关联设备ID，无关则留空")
     site_id: str = Field(default="", description="关联场地ID，无关则留空")
     task_id: str = Field(default="", description="关联检修任务ID，无关则留空")
+    # 文件式记忆索引字段（Task 4 新增）：用于按 name 寻址/去重、索引展示与规则应用
+    name: str = Field(default="", description="简短稳定的英文/拼音 slug，同一事实复用同名")
+    description: str = Field(default="", description="一句话钩子(≤30字)，供记忆索引展示与相关性判断")
+    type: str = Field(default="project", description="feedback=要遵守的规则 | project=客观事实 | reference=指针")
+    why: str = Field(default="", description="规则/事实为何成立(可空)，主要给feedback用")
+    how_to_apply: str = Field(default="", description="何时适用/失效信号(可空)，主要给feedback用")
 
 
 class PreferenceItem(BaseModel):
