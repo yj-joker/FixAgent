@@ -338,7 +338,7 @@ class BaseAgent(ABC):
             if input_data.context.get("previous_summary"):
                 context_parts.append(f"之前的对话摘要：\n{input_data.context['previous_summary']}")
 
-            # 相关历史事实（向量检索得到）
+            # 相关历史事实（向量检索得到，vector 模式）
             if input_data.context.get("relevant_facts"):
                 facts = input_data.context["relevant_facts"]
                 facts_str = "\n".join(
@@ -346,6 +346,10 @@ class BaseAgent(ABC):
                     for index, f in enumerate(facts, start=1)
                 )
                 context_parts.append(f"相关历史事实：\n{facts_str}")
+
+            # 长期记忆目录（index 模式：注入记忆索引，条目格式 [名称] (类型) — 摘要）
+            if input_data.context.get("memory_index"):
+                context_parts.append(f"## 长期记忆目录\n{input_data.context['memory_index']}")
 
             # 用户偏好
             if input_data.context.get("user_preferences"):
