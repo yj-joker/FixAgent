@@ -26,7 +26,7 @@ api/main.py → FixAgent.run_with_react() → chat_with_tools() → 工具调用
 import json
 import logging
 import time
-from typing import List, Any, Optional, Dict
+from typing import List, Any, Optional, Dict, Callable
 
 from agents.base_agent import BaseAgent, AgentInput, AgentOutput, AgentRunContext
 from services.output_style import USER_VISIBLE_PLAIN_TEXT_RULES
@@ -361,13 +361,14 @@ class FixAgent(BaseAgent):
         self,
         input_data: AgentInput,
         max_iterations: int,
+        _event_sink: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> AgentOutput:
         run_context = self.build_run_context(input_data)
 
         if self._is_knowledge_inventory_intent_for_run(run_context):
             return await self._run_knowledge_inventory_direct_for_run(run_context)
 
-        output = await super().run_with_react(input_data, max_iterations)
+        output = await super().run_with_react(input_data, max_iterations, _event_sink=_event_sink)
         if run_context.intent_decision:
             output.metadata["intent_decision"] = run_context.intent_decision
         self._attach_minimum_requirement_check(output, run_context)
@@ -381,7 +382,7 @@ class FixAgent(BaseAgent):
         if self._needs_more_tools(output) and run_context.allowed_tools is not None:
             logger.info("[fix_agent] intent tool scope insufficient, rerunning once with full tools")
             rerun_input = self._without_tool_scope(input_data)
-            rerun = await super().run_with_react(rerun_input, max_iterations)
+            rerun = await super().run_with_react(rerun_input, max_iterations, _event_sink=_event_sink)
             rerun_context = self.build_run_context(rerun_input)
             rerun.metadata["intent_decision"] = rerun_context.intent_decision
             rerun.metadata["intent_rerun_reason"] = react_status.get("reason") if react_status else output.message
@@ -513,11 +514,16 @@ class FixAgent(BaseAgent):
             latency_ms=int((time.time() - start_time) * 1000),
         )
 
-    async def run_with_react(self, input_data: AgentInput, max_iterations: int = 10) -> AgentOutput:
+    async def run_with_react(
+        self,
+        input_data: AgentInput,
+        max_iterations: int = 10,
+        _event_sink: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    ) -> AgentOutput:
         """
         重写 ReAct 入口，提取 user_id 供 recall_conversation_detail 工具使用。
         """
-        return await self._run_with_react_contextual(input_data, max_iterations)
+        return await self._run_with_react_contextual(input_data, max_iterations, _event_sink=_event_sink)
 
     @staticmethod
     def _format_knowledge_inventory_message(documents: List[Dict[str, Any]]) -> str:
