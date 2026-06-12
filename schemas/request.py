@@ -729,3 +729,19 @@ class CaseComplianceRequest(BaseModel):
     """
     text: str
 
+
+class ValidateRequest(BaseModel):
+    """
+    通用入口校验请求（守门 LLM 泛化）
+
+    【功能关联】POST /ai/validate
+    【何时用】task：员工创建检修任务时挡乱码/无关垃圾（宽松相关性）；
+             case：案例入库前的相关性+合规性判定（复用 check_compliance）。
+
+    【字段说明】
+    - text: 待校验文本
+    - purpose: task / case
+    """
+    text: str
+    purpose: str = "task"   # task / case
+

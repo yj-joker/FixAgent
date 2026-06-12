@@ -731,6 +731,12 @@ class FactSummary(BaseModel):
     content: str = Field(description="事实描述")
     keywords: str = Field(default="", description="检索用关键词")
     source_seq_range: str = Field(default="", serialization_alias="sourceSeqRange", description="来源对话序号范围")
+    # 文件式记忆索引字段（Task 4 新增），序列化为 camelCase 供 Java 端落库
+    name: str = Field(default="", description="简短稳定的 slug，同一事实复用同名")
+    description: str = Field(default="", description="一句话钩子(≤30字)，供记忆索引展示")
+    type: str = Field(default="project", description="feedback | project | reference")
+    why: str = Field(default="", description="规则/事实为何成立(可空)")
+    how_to_apply: str = Field(default="", serialization_alias="howToApply", description="何时适用/失效信号(可空)")
 
 
 class PreferenceSummary(BaseModel):
