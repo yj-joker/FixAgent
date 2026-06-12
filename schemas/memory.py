@@ -66,10 +66,9 @@ class UnresolvedItem(BaseModel):
     """
     未完成事项条目 —— 对话中悬而未决的待办
 
-    status 说明：
-    - active: 仍然需要处理
-    - superseded: 用户主动放弃或已在新对话中解决
+    已并入 memory_fact(type='unresolved', 用户级)，按 name 寻址去重/关闭。
     """
+    name: str = Field(default="", description="简短稳定的英文/拼音 slug，同一待办复用同名（如 check-pump-3-seal）")
     content: str = Field(description="待解决描述")
     type: str = Field(default="待办", description="类型：未答复问题|进行中任务|用户待办")
     status: str = Field(default="active", description="active=进行中, superseded=已放弃")
@@ -92,6 +91,6 @@ class MemorySummary(BaseModel):
     superseded_ids: list[str] = Field(default_factory=list, serialization_alias="supersededIds")
     updated_preferences: list[PreferenceItem] = Field(default_factory=list, serialization_alias="updatedPreferences")
     updated_unresolved: list[UnresolvedItem] = Field(default_factory=list, serialization_alias="updatedUnresolved")
-    # 改为用数据库ID精确匹配，而非content文本匹配；Java 读取 key 为 resolvedItems
-    resolved_item_ids: list[int] = Field(default_factory=list, serialization_alias="resolvedItems", description="已解决事项的数据库ID列表")
+    # 未决并入 memory_fact 后按 name 关闭：已解决事项的 name 列表（Java 软删 type=unresolved 记忆）
+    resolved_unresolved_names: list[str] = Field(default_factory=list, serialization_alias="resolvedUnresolvedNames", description="本轮已解决的未决事项 name 列表")
     brief_summary: str = Field(default="", serialization_alias="briefSummary", description="100字以内的渐进式摘要")

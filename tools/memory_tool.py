@@ -112,10 +112,11 @@ class SaveMemoryTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "当用户陈述了值得长期记住的事实/规则/偏好/身份且已确认时，存一条"
-            "（type ∈ user/feedback/project/reference）。"
+            "当用户陈述了值得长期记住的事实/规则/偏好/身份/待办且已确认时，存一条"
+            "（type ∈ user/unresolved/feedback/project/reference）。"
             "用户表达交互偏好（'用中文'、'回复简洁些'）或陈述自身身份/角色/专长（'我是钳工'、'我负责装配线'）时，"
-            "用 type=user 存/更新；改变已有偏好时用同一个稳定 name 覆盖（如 reply-language/reply-style/user-role）。"
+            "用 type=user 存/更新；用户表达明确的待办/行动意图（'我明天去换轴承'、'我待会儿重启试试'）时用 type=unresolved 存，"
+            "完成或放弃后用 delete_memory 按同名关闭；改变已有记忆时用同一个稳定 name 覆盖。"
         )
 
     def get_parameters_schema(self) -> dict:
@@ -132,8 +133,8 @@ class SaveMemoryTool(BaseTool):
                 },
                 "type": {
                     "type": "string",
-                    "description": "记忆类型：user（关于用户本人的画像：①交互偏好如回复语言/风格/详略 ②身份/角色/专长如'我是钳工'，每轮生效）、feedback（用户反馈/纠正的操作规则）、project（项目/设备客观事实）、reference（参考资料/指针）",
-                    "enum": ["user", "feedback", "project", "reference"],
+                    "description": "记忆类型：user（关于用户本人的画像：①交互偏好如回复语言/风格/详略 ②身份/角色/专长如'我是钳工'，每轮生效）、unresolved（用户明确表达的未完成待办/未答复问题，如'我明天去换轴承'，完成或放弃后用 delete_memory 按同名关闭）、feedback（用户反馈/纠正的操作规则）、project（项目/设备客观事实）、reference（参考资料/指针）",
+                    "enum": ["user", "unresolved", "feedback", "project", "reference"],
                 },
                 "content": {
                     "type": "string",

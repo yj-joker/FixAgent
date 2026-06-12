@@ -339,19 +339,29 @@ async def handle_reflection(message: aio_pika.abc.AbstractIncomingMessage, chann
         try:
             settings = get_settings()
 
-            # 从 Java 拉取用户全部 active 事实
+            # 从 Java 拉取：①用户长期事实(辅证据) ②已审核通过的检修案例履历(主证据)
+            headers = {"X-Internal-Token": settings.internal_token}
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(
                     f"{settings.java_service_url}/weixiu/memory/user-facts",
-                    params={"userId": user_id},
-                    headers={"X-Internal-Token": settings.internal_token},
+                    params={"userId": user_id}, headers=headers,
                 )
                 resp.raise_for_status()
-                api_result = resp.json()
+                facts = resp.json().get("data", [])
 
-            facts = api_result.get("data", [])
-            if not facts:
-                logger.info("[MQ消费] 用户无事实，跳过反思, userId:%s", user_id)
+                try:
+                    tresp = await client.get(
+                        f"{settings.java_service_url}/weixiu/memory/user-task-history",
+                        params={"userId": user_id}, headers=headers,
+                    )
+                    tresp.raise_for_status()
+                    task_history = tresp.json().get("data", [])
+                except Exception as te:
+                    logger.warning("[MQ消费] 拉取检修履历失败(降级为仅事实), userId:%s, err:%s", user_id, te)
+                    task_history = []
+
+            if not facts and not task_history:
+                logger.info("[MQ消费] 用户无事实也无检修履历，跳过反思, userId:%s", user_id)
                 return
 
             from agents.reflection_agent import get_reflection_agent
@@ -361,7 +371,7 @@ async def handle_reflection(message: aio_pika.abc.AbstractIncomingMessage, chann
             result = await agent.run(AgentInput(
                 user_message="请分析用户画像",
                 session_id=str(user_id),
-                context={"facts": facts, "user_id": user_id}
+                context={"facts": facts, "task_history": task_history, "user_id": user_id}
             ))
 
             if result.metadata.get("status") == "ok":
