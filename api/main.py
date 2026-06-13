@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import re
 import time
 from functools import partial
 from typing import List
@@ -23,6 +22,7 @@ from schemas.request import (
     TemporaryPlanGenerateRequest,
     CaseDraftRequest,
     CaseComplianceRequest,
+    ValidateRequest,
 )
 from schemas.response import (
     BaseResponse,
@@ -37,7 +37,7 @@ from schemas.response import (
     CaseDraftResponse,
     CaseComplianceResponse,
 )
-from agents.case_agent import draft_case, check_compliance
+from agents.case_agent import draft_case, check_compliance, validate_task_text, validate_graph_entities
 from agents.fix_agent import get_fix_agent
 from agents.review_agent import get_review_agent
 from agents.memory_agent import get_memory_agent
@@ -46,43 +46,13 @@ from services.vector_service import build_redis_filter, get_vector_service
 from services.llm_service import get_llm_service
 from services.image_summary_service import get_image_summary_service
 from services.intent_router import get_intent_router
-from services.intent_fast_path import get_intent_fast_path_runner
-from services.output_style import USER_VISIBLE_PLAIN_TEXT_RULES
+from services.preference_capture import schedule_capture
 from tools.knowledge_retrieval_tool import get_knowledge_retrieval_tool
 from services.temporary_plan_service import get_temporary_plan_service
 from config.settings import get_settings
 from schemas.models import AgentMode
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_EVIDENCE_IMAGE_LIMIT = 2
-MAX_EVIDENCE_IMAGE_LIMIT = 6
-_COUNT_WORDS = {
-    "一": 1,
-    "二": 2,
-    "两": 2,
-    "俩": 2,
-    "三": 3,
-    "四": 4,
-    "五": 5,
-    "六": 6,
-    "七": 7,
-    "八": 8,
-    "九": 9,
-    "十": 10,
-}
-_IMAGE_COUNT_PATTERNS = (
-    re.compile(
-        r"(?:返回|展示|显示|给我|帮我找|找|查找|提供|列出|发|看|翻出|检索|输出|需要|要)"
-        r".{0,12}?(?P<count>\d{1,2}|[一二两俩三四五六七八九十]{1,3})"
-        r"\s*(?:张|幅|个|份)?\s*(?:相关)?\s*(?:图片|图|照片|示意图)"
-    ),
-    re.compile(
-        r"(?:返回|展示|显示|给我|帮我找|找|查找|提供|列出|发|看|翻出|检索|输出|需要|要)"
-        r".{0,8}?(?:图片|图|照片|示意图)"
-        r".{0,8}?(?P<count>\d{1,2}|[一二两俩三四五六七八九十]{1,3})\s*(?:张|幅|个|份)?"
-    ),
-)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -208,37 +178,6 @@ def _is_high_risk_rag_question(message: str) -> bool:
     )
 
 
-def _is_explicit_rag_request(message: str) -> bool:
-    text = message or ""
-    explicit_terms = (
-        "根据知识库", "查知识库", "知识库回答", "只查资料", "根据资料", "根据手册",
-        "璇锋牴鎹煡璇嗗簱", "鏍规嵁鐭ヨ瘑搴?,", "鏍规嵁鐭ヨ瘑搴?",
-        "鏌ョ煡璇嗗簱", "鐭ヨ瘑搴撳洖绛?,", "鐭ヨ瘑搴撳洖绛?",
-        "鍙煡璧勬枡", "鏍规嵁璧勬枡", "鏍规嵁鎵嬪唽",
-    )
-    return any(term in text for term in explicit_terms)
-
-
-def _is_strict_rag_fast_path_blocked_question(message: str) -> bool:
-    text = message or ""
-    parameter_terms = (
-        "参数", "多少", "扭矩", "力矩", "间隙", "规格", "型号", "标准", "数值",
-        "电压", "电流", "N·m", "Nm", "mm", "MPa", "kPa", "torque", "spec",
-        "鍙傛暟", "澶氬皯", "鎵煩", "鍔涚煩", "闂撮殭", "瑙勬牸",
-        "鍨嬪彿", "鏍囧噯", "鏁板€?,", "鐢靛帇", "鐢垫祦",
-    )
-    procedure_terms = (
-        "怎么", "如何", "步骤", "流程", "拆", "装", "更换", "维修", "检修", "安装", "调整", "操作",
-        "鎬庝箞", "濡備綍", "姝ラ", "娴佺▼", "鎷?,", "瑁?,", "鏇存崲",
-        "缁翠慨", "妫€淇?,", "瀹夎", "璋冩暣", "鎿嶄綔",
-    )
-    formal_plan_terms = (
-        "检修方案", "维修方案", "SOP", "工单", "作业指导书", "安全措施",
-        "妫€淇柟妗?,", "缁翠慨鏂规", "浣滀笟鎸囧涔?,", "瀹夊叏鎺柦",
-    )
-    return any(term in text for term in parameter_terms + procedure_terms + formal_plan_terms)
-
-
 def _should_use_rag_fast_path(request: ChatRequest) -> bool:
     """保守触发简单 RAG 快速路径，避免普通诊断问题误绕过 ReAct。"""
     if request.images:
@@ -249,8 +188,6 @@ def _should_use_rag_fast_path(request: ChatRequest) -> bool:
     message = request.message or ""
     if _is_knowledge_inventory_question(message):
         return False
-    if _is_explicit_rag_request(message):
-        return not _is_strict_rag_fast_path_blocked_question(message)
     if _is_high_risk_rag_question(message):
         return False
     if request.mode == AgentMode.RETRIEVAL:
@@ -330,6 +267,10 @@ async def _prepare_chat_agent_input(request: ChatRequest) -> AgentInput:
     context["intent_decision"] = intent_decision.model_dump()
     context["intention"] = intent_decision.intent
 
+    # 用户画像确定性兜底：偏好/身份不再只靠主 Agent 自觉调 save_memory，
+    # 命中门控即后台抽取并按规范 name upsert 到 memory_fact(type=user)，下一轮即生效。
+    schedule_capture(raw_message, context.get("user_id"))
+
     if request.images and intent_decision.requires_image_understanding:
         image_understanding = await _build_image_understanding(request.images, effective_message)
         context["image_understanding"] = image_understanding
@@ -348,23 +289,12 @@ async def _prepare_chat_agent_input(request: ChatRequest) -> AgentInput:
 def _evidence_item_to_text(item, index: int) -> str:
     data = item.model_dump() if hasattr(item, "model_dump") else item
     metadata = data.get("metadata") or {}
+    source = data.get("id") or metadata.get("document_id") or f"evidence-{index}"
+    score = data.get("score", "")
     content = data.get("content") or data.get("text") or ""
     page = metadata.get("page_number") or metadata.get("page")
-    title = (
-        metadata.get("caption")
-        or metadata.get("image_title")
-        or metadata.get("section_title")
-        or metadata.get("title")
-        or ""
-    )
-    lines = [f"证据{index}："]
-    if page:
-        lines.append(f"页码：第{page}页")
-    if title:
-        lines.append(f"说明：{title}")
-    if content:
-        lines.append(f"内容：{content}")
-    return "\n".join(lines)
+    page_text = f", page={page}" if page else ""
+    return f"[证据{index}] source={source}, score={score}{page_text}\n{content}"
 
 
 def _plain_dict(value) -> dict:
@@ -394,50 +324,7 @@ def _iter_trace_result_items(metadata: dict):
                         yield item_data
 
 
-def _count_text_to_int(value: str) -> int | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    if text.isdigit():
-        return int(text)
-    if text in _COUNT_WORDS:
-        return _COUNT_WORDS[text]
-    if "十" in text:
-        left, _, right = text.partition("十")
-        tens = _COUNT_WORDS.get(left, 1) if left else 1
-        ones = _COUNT_WORDS.get(right, 0) if right else 0
-        return tens * 10 + ones
-    return None
-
-
-def _requested_evidence_image_limit(user_message: str = "") -> int:
-    message = str(user_message or "")
-    for pattern in _IMAGE_COUNT_PATTERNS:
-        match = pattern.search(message)
-        if not match:
-            continue
-        count = _count_text_to_int(match.group("count"))
-        if count:
-            return min(max(count, 1), MAX_EVIDENCE_IMAGE_LIMIT)
-    return DEFAULT_EVIDENCE_IMAGE_LIMIT
-
-
-def _limit_evidence_images(images: List[EvidenceImage], user_message: str = "") -> List[EvidenceImage]:
-    limit = _requested_evidence_image_limit(user_message)
-    limited: List[EvidenceImage] = []
-    seen = set()
-    for image in images:
-        dedupe_key = image.image_url or image.source_chunk_id
-        if dedupe_key in seen:
-            continue
-        seen.add(dedupe_key)
-        limited.append(image)
-        if len(limited) >= limit:
-            break
-    return limited
-
-
-def _extract_evidence_images(metadata: dict, user_message: str = "") -> List[EvidenceImage]:
+def _extract_evidence_images(metadata: dict) -> List[EvidenceImage]:
     images: List[EvidenceImage] = []
     seen = set()
     for item in _iter_trace_result_items(metadata):
@@ -467,7 +354,7 @@ def _extract_evidence_images(metadata: dict, user_message: str = "") -> List[Evi
                 context_role=item_meta.get("context_role", ""),
             )
         )
-    return _limit_evidence_images(images, user_message)
+    return images
 
 
 async def _run_rag_fast_path(request: ChatRequest) -> AgentOutput | None:
@@ -499,7 +386,10 @@ async def _run_rag_fast_path(request: ChatRequest) -> AgentOutput | None:
             "content": (
                 "你是设备检修知识库问答助手。必须基于给定知识库证据回答；"
                 "证据不足时明确说明不足，不要编造参数、型号或操作步骤。"
-                f"{USER_VISIBLE_PLAIN_TEXT_RULES}"
+                "禁止使用 emoji。"
+                "不允许把多个信息点挤在同一整段中。"
+                "普通解释使用自然段；当内容包含编号、清单、选项、步骤或文件列表时，每一项必须单独换行。"
+                "编号格式使用“1. 内容”“2. 内容”，不要把多个编号写在同一行。"
             ),
         },
         {
@@ -582,9 +472,6 @@ async def chat(request: ChatRequest) -> ChatResponse:
                 review_level = "light"
 
         if fix_result is None:
-            fix_result = await get_intent_fast_path_runner().run(input_data)
-
-        if fix_result is None:
             fix_result = await get_fix_agent().run_with_react(input_data)
         fix_result.metadata["user_message"] = input_data.user_message
         fix_result.metadata["original_user_message"] = request.message
@@ -635,7 +522,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         )
 
         response_message, diagnosis_items = _extract_structured_chat_payload(final_result.message)
-        evidence_images = _extract_evidence_images(final_result.metadata, request.message)
+        evidence_images = _extract_evidence_images(final_result.metadata)
 
         return ChatResponse(
             session_id=request.session_id,
@@ -674,7 +561,7 @@ def _render_maintenance_block(m: dict) -> str:
     lines.append(
         f"设备：{t.get('deviceName', '') or '未知'}；"
         f"故障：{t.get('faultDescription', '') or '未填写'}；"
-        f"检修等级：{t.get('maintenanceLevel', '') or '未提供'}"
+        f"检修等级：{t.get('maintenanceLevel', '') or '-'}"
     )
     prog = m.get("progress") or {}
     if prog:
@@ -726,8 +613,7 @@ async def _maintenance_fallback_answer(input_data: AgentInput, maint_ctx: dict):
         "用简明、安全第一、可操作的中文，直接给工人下一步可执行的建议。"
         "第一句话就给结论，即使知识库没有完全匹配的资料，也要基于通用检修经验务实作答。"
         "严禁以「资料不足 / 无法回答 / 暂不能生成」搪塞；"
-        "严禁输出任何 JSON、花括号 {} 或字段名，只用自然段中文回答。"
-        f"{USER_VISIBLE_PLAIN_TEXT_RULES}\n\n"
+        "严禁输出任何 JSON、花括号 {} 或字段名，只用自然段中文回答。\n\n"
         + _render_maintenance_block(maint_ctx)
     )
 
@@ -770,126 +656,6 @@ async def _maintenance_fallback_answer(input_data: AgentInput, maint_ctx: dict):
         return None
 
 
-async def _emit_reviewed_stream_from_output(
-    request: ChatRequest,
-    input_data: AgentInput,
-    fix_output: AgentOutput,
-    review_level: str = "full",
-):
-    """Review a completed AgentOutput and emit the final SSE token stream."""
-    import asyncio as _asyncio
-
-    react_trace = fix_output.metadata.get("react_trace", [])
-    metadata = fix_output.metadata if isinstance(fix_output.metadata, dict) else {}
-    evidence_images = _extract_evidence_images({**metadata, "react_trace": react_trace}, request.message)
-
-    for step in react_trace:
-        if step.get("action") != "tool_call":
-            continue
-        for tool_call in step.get("tool_calls", []):
-            tool_name = tool_call.get("name")
-            if tool_name:
-                yield f"data: {json_dumps({'event': 'tool', 'data': {'tool': tool_name}})}\n\n"
-
-    maint_ctx = (input_data.context or {}).get("maintenance")
-    fallback_text = None
-    if maint_ctx and _is_unhelpful_maintenance_reply(fix_output.message):
-        fallback_text = await _maintenance_fallback_answer(input_data, maint_ctx)
-        if fallback_text:
-            logger.info("[chat_stream] 检修助手出口兜底已触发 session=%s", request.session_id)
-
-    if fallback_text:
-        final_message = fallback_text
-        diagnosis_items = None
-        verification = {}
-        has_issues = False
-        markers = []
-        verified_tools = fix_output.tools_used
-        verified_latency = fix_output.latency_ms
-    else:
-        review_input = AgentOutput(
-            agent_name=fix_output.agent_name,
-            message=fix_output.message,
-            intention=fix_output.intention,
-            tools_used=fix_output.tools_used,
-            metadata={
-                **metadata,
-                "react_trace": react_trace,
-                "user_message": input_data.user_message,
-                "original_user_message": request.message,
-                "intent_decision": (input_data.context or {}).get("intent_decision"),
-            },
-            latency_ms=fix_output.latency_ms,
-            raw_response=fix_output.raw_response,
-        )
-
-        if review_input.metadata.get("execution_mode") == "knowledge_inventory_direct":
-            verified_output = review_input
-        else:
-            verified_output = await get_review_agent().review(review_input, level=review_level)
-        if "react_trace" not in verified_output.metadata and react_trace:
-            verified_output.metadata["react_trace"] = react_trace
-
-        verification = verified_output.metadata.get("verification", {})
-        has_issues = verified_output.metadata.get("verification_has_issues", False)
-        evidence_images = _extract_evidence_images(verified_output.metadata, request.message)
-        final_message, diagnosis_items = _extract_structured_chat_payload(verified_output.message)
-        markers = get_review_agent().get_inline_markers(final_message, verification)
-        verified_tools = verified_output.tools_used
-        verified_latency = verified_output.latency_ms
-
-    if maint_ctx and _is_unhelpful_maintenance_reply(final_message):
-        logger.info("[chat_stream] 检修助手最终保险触发，替换为安全话术 session=%s", request.session_id)
-        final_message = _MAINT_SAFE_FALLBACK_LINE
-        diagnosis_items = None
-        markers = []
-
-    marker_idx = 0
-    for index, char in enumerate(final_message):
-        while marker_idx < len(markers) and markers[marker_idx]["char_pos"] <= index:
-            marker = markers[marker_idx]
-            yield f"data: {json_dumps({'event': 'marker', 'data': {'text': marker['text'], 'type': marker['type']}})}\n\n"
-            marker_idx += 1
-
-        yield f"data: {json_dumps({'event': 'token', 'data': {'content': char}})}\n\n"
-        if index % 15 == 0:
-            await _asyncio.sleep(0)
-
-    while marker_idx < len(markers):
-        marker = markers[marker_idx]
-        yield f"data: {json_dumps({'event': 'marker', 'data': {'text': marker['text'], 'type': marker['type']}})}\n\n"
-        marker_idx += 1
-
-    verification_event = {
-        "event": "verification",
-        "data": {
-            "has_issues": has_issues,
-            "summary": {
-                "grounding_unverified": verification.get("grounding", {}).get("unverified_count", 0),
-                "graph_unverified": verification.get("graph", {}).get("unverified_count", 0),
-                "safety_missing": verification.get("safety", {}).get("missing_count", 0),
-            },
-        },
-    }
-    yield f"data: {json_dumps(verification_event)}\n\n"
-
-    final_done = {
-        "event": "done",
-        "data": {
-            "tools_used": verified_tools,
-            "latency_ms": verified_latency,
-        },
-    }
-    if diagnosis_items:
-        final_done["data"]["diagnosisItems"] = _serialize_diagnosis_items(diagnosis_items)
-    if evidence_images:
-        final_done["data"]["evidenceImages"] = [
-            image.model_dump(by_alias=True)
-            for image in evidence_images
-        ]
-    yield f"data: {json_dumps(final_done)}\n\n"
-
-
 @app.post("/ai/chat/stream")
 async def chat_stream(request: ChatRequest):
     """
@@ -914,25 +680,6 @@ async def chat_stream(request: ChatRequest):
         input_data = await _prepare_chat_agent_input(request)
 
         try:
-            fast_output = None
-            fast_review_level = "full"
-            if _should_use_rag_fast_path(request):
-                fast_output = await _run_rag_fast_path(request)
-                if fast_output is not None:
-                    fast_review_level = "light"
-
-            if fast_output is None:
-                fast_output = await get_intent_fast_path_runner().run(input_data)
-            if fast_output is not None:
-                async for chunk in _emit_reviewed_stream_from_output(
-                    request,
-                    input_data,
-                    fast_output,
-                    review_level=fast_review_level,
-                ):
-                    yield chunk
-                return
-
             fix_agent = get_fix_agent()
 
             # 执行 FixAgent ReAct，转发进度事件（status/tool），缓冲 token
@@ -949,8 +696,6 @@ async def chat_stream(request: ChatRequest):
                     yield f"data: {json_dumps(event)}\n\n"
                 elif ev_type == "tool":
                     tools_in_stream.append(event.get("data", {}).get("tool", ""))
-                    yield f"data: {json_dumps(event)}\n\n"
-                elif isinstance(ev_type, str) and ev_type.startswith("retrieval_"):
                     yield f"data: {json_dumps(event)}\n\n"
                 elif ev_type == "token":
                     token_buffer.append(event.get("data", {}).get("content", ""))
@@ -971,7 +716,7 @@ async def chat_stream(request: ChatRequest):
             fix_latency = done_data.get("latency_ms", 0)
             verified_tools = tools_in_stream if tools_in_stream else stream_tools_used
             verified_latency = fix_latency
-            evidence_images = _extract_evidence_images({**stream_metadata, "react_trace": stream_react_trace}, request.message)
+            evidence_images = _extract_evidence_images({**stream_metadata, "react_trace": stream_react_trace})
 
             # —— 检修助手出口兜底（仅 maintenance 场景）——
             # 模型若吐出控制结构 JSON（needs_more_tools / 残缺 {"message"..}）或套话式软拒答，
@@ -1016,7 +761,7 @@ async def chat_stream(request: ChatRequest):
                     verified_output.metadata["react_trace"] = fix_output.metadata["react_trace"]
                 verification = verified_output.metadata.get("verification", {})
                 has_issues = verified_output.metadata.get("verification_has_issues", False)
-                evidence_images = _extract_evidence_images(verified_output.metadata, request.message)
+                evidence_images = _extract_evidence_images(verified_output.metadata)
 
                 # 流式输出最终回答（逐字），在未验证语句前插入 marker 事件
                 final_message, diagnosis_items = _extract_structured_chat_payload(verified_output.message)
@@ -1113,12 +858,8 @@ async def knowledge_import(request: KnowledgeImportRequest) -> KnowledgeImportRe
         )
         logger.info(f"[knowledge_import] 文件={result['file_name']} "
                     f"页数={result['total_pages']} "
-                    f"解析文本块={result.get('parsed_text_chunks_count', 0)} "
-                    f"拆分文本块={result.get('chunked_text_chunks_count', 0)} "
-                    f"可入库文本块={result.get('indexable_text_chunks_count', 0)} "
                     f"文本={result['text_count']} 图片={result['image_count']} 表格={result['table_count']} "
-                    f"耗时={result['process_time_ms']}ms "
-                    f"阶段耗时={result.get('stage_timings_ms', {})}")
+                    f"耗时={result['process_time_ms']}ms")
         return KnowledgeImportResponse(
             success=True,
             message=f"导入完成：{result['file_name']}，共 {result['total_pages']} 页",
@@ -1283,104 +1024,6 @@ async def memory_consolidate(request: MemoryConsolidateRequest) -> MemoryConsoli
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/ai/memory/search_facts")
-async def search_facts(query: str, top_k: int = 5, session_ids: str = "",
-                       device_type: str = "", equipment_id: str = "",
-                       site_id: str = "", task_id: str = ""):
-    """
-    事实记忆向量检索接口 — 带多因子重排序 + 业务维度感知
-
-    Java 端在组装对话上下文时调用此接口，
-    用当前用户消息作为 query 去向量库中检索最相关的历史事实。
-    检索结果会被注入到 AI 对话上下文中，让 AI 能"记住"之前的事实。
-
-    【两阶段排序】
-    1. 粗筛：Redis KNN 取 top_k * 3 候选
-    2. 精排：FactReranker 多因子综合排序（语义 + 新近性 + 重要度 + 频率 + 置信度 + 业务匹配）
-
-    Args:
-        query: 用户当前发送的消息文本，用于语义匹配
-        top_k: 最多返回几条最相关的事实，默认5条
-        session_ids: 当前用户的会话ID列表，逗号分隔。用于过滤非本用户的事实
-        device_type: 当前设备类型（可选，用于业务维度加权）
-        equipment_id: 当前设备ID（可选）
-        site_id: 当前场地ID（可选）
-        task_id: 当前检修任务ID（可选）
-
-    Returns:
-        {"facts": [{"doc_id": "fact:xxx", "content": "...", "score": 0.85, "final_score": 0.72, ...}, ...]}
-    """
-    import time as t
-    from services.fact_reranker import rerank
-
-    if not (query or "").strip():
-        logger.info("[search_facts] empty query, skip fact vector search")
-        return {"facts": [], "query_time_ms": 0}
-
-    # 解析会话ID白名单
-    allowed_sessions = set()
-    if session_ids:
-        allowed_sessions = {sid.strip() for sid in session_ids.split(",") if sid.strip()}
-
-    try:
-        t0 = t.time()
-        svc = get_vector_service()
-        # 粗筛：多取候选，留给 reranker 精排
-        fact_filter = build_redis_filter(record_type="fact", status="active")
-        results = await svc.search_by_text(query, top_k=top_k * 3, filter=fact_filter)
-
-        # 过滤：只保留 type=fact, status=active, 属于当前用户
-        candidates = []
-        for r in results:
-            metadata = r.get("metadata", {})
-            if metadata.get("type") != "fact":
-                continue
-            # 过滤已废弃的事实（双重保障：即使旧向量未被删除，也不会返回）
-            if metadata.get("status") and metadata.get("status") != "active":
-                continue
-            # 按会话ID过滤：只保留属于当前用户的事实
-            fact_session = metadata.get("session_id", "")
-            if allowed_sessions and fact_session not in allowed_sessions:
-                continue
-            candidates.append(r)
-
-        # 构建业务上下文
-        business_context = {}
-        if device_type:
-            business_context["device_type"] = device_type
-        if equipment_id:
-            business_context["equipment_id"] = equipment_id
-        if site_id:
-            business_context["site_id"] = site_id
-        if task_id:
-            business_context["task_id"] = task_id
-
-        # 精排：多因子重排序（含业务维度）
-        ranked = rerank(candidates, top_k=top_k,
-                        business_context=business_context or None)
-
-        # 格式化输出
-        facts = []
-        for r in ranked:
-            metadata = r.get("metadata", {})
-            facts.append({
-                "content": r.get("text", ""),
-                "score": round(r.get("score", 0), 4),
-                "final_score": r.get("final_score", 0),
-                "score_breakdown": r.get("score_breakdown", {}),
-                "doc_id": r.get("doc_id", ""),
-                "keywords": metadata.get("keywords", ""),
-                "session_id": metadata.get("session_id", ""),
-            })
-
-        query_time_ms = int((t.time() - t0) * 1000)
-        logger.info(f"[search_facts] 查询={query[:50]} 候选={len(candidates)} 精排后={len(facts)} 耗时={query_time_ms}ms")
-        return {"facts": facts, "query_time_ms": query_time_ms}
-    except Exception as e:
-        logger.exception(f"[search_facts] error")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 class DeleteFactsRequest(BaseModel):
     fact_ids: list[str]
 
@@ -1400,104 +1043,8 @@ async def delete_facts(request: DeleteFactsRequest):
     return {"deleted": deleted}
 
 
-class RealtimeUpdateRequest(BaseModel):
-    """实时记忆更新请求体"""
-    session_id: str
-    user_message: str
-    ai_response: str = ""
-    recent_facts: list = []
-
-
-@app.post("/ai/memory/realtime_update")
-async def realtime_memory_update(request: RealtimeUpdateRequest):
-    """
-    实时记忆更新检测接口
-
-    每轮对话完成后，Java端异步调用此接口。
-    轻量级LLM判断用户是否纠正了事实或改变了偏好。
-    如果检测到变更，立即更新向量库和返回偏好变更给Java端保存。
-
-    【与定时整合的区别】
-    - 本接口：只处理"纠正"和"偏好变更"，2-3秒完成
-    - /consolidate：做完整整合（新事实、待办、摘要），40-60秒
-
-    【调用时机】
-    Java端在 doOnComplete 保存AI回复后立即异步调用。
-    不阻塞主对话流，用户感知不到。
-
-    Args:
-        session_id: 会话ID
-        user_message: 用户本轮消息
-        ai_response: AI本轮回复（可选）
-        recent_facts: JSON格式的本轮注入事实列表（可选）
-
-    Returns:
-        {
-            "has_update": true/false,
-            "fact_corrections": [...],  // 已在向量库中更新的事实
-            "preference_changes": [...] // 需要Java端保存的偏好变更
-        }
-    """
-    import time as t
-
-    try:
-        t0 = t.time()
-
-        session_id = request.session_id
-        user_message = request.user_message
-        ai_response = request.ai_response
-        recent_facts = request.recent_facts
-
-        # 解析 recent_facts
-        if isinstance(recent_facts, str):
-            try:
-                facts_list = json.loads(recent_facts) if recent_facts else []
-            except (json.JSONDecodeError, TypeError):
-                facts_list = []
-        else:
-            facts_list = recent_facts if recent_facts else []
-
-        from agents.realtime_memory_agent import get_realtime_memory_agent
-        agent = get_realtime_memory_agent()
-
-        input_data = AgentInput(
-            user_message=user_message,
-            session_id=session_id,
-            context={
-                "user_message": user_message,
-                "ai_response": ai_response,
-                "recent_facts": facts_list
-            }
-        )
-
-        result = await agent.run(input_data)
-        latency_ms = int((t.time() - t0) * 1000)
-
-        result_data = result.metadata.get("result", {})
-        logger.info(
-            f"[realtime_update] 会话={session_id} "
-            f"有更新={result_data.get('has_update', False)} "
-            f"耗时={latency_ms}ms"
-        )
-
-        return {
-            "has_update": result_data.get("has_update", False),
-            "fact_corrections": result_data.get("fact_corrections", []),
-            "preference_changes": result_data.get("preference_changes", []),
-            # 被替代的旧事实的向量库doc_id列表
-            # Java端用这些ID在MySQL memory_fact表中标记旧事实为superseded
-            "superseded_fact_ids": result_data.get("superseded_fact_ids", []),
-            "latency_ms": latency_ms
-        }
-
-    except Exception as e:
-        logger.exception(f"[realtime_update] error")
-        return {
-            "has_update": False,
-            "fact_corrections": [],
-            "preference_changes": [],
-            "error": str(e)
-        }
+# [已退役] /ai/memory/realtime_update 端点删除：实时记忆更新链路停用，
+# 事实纠正改由对话内 save_memory/delete_memory 处理（旧链路去向量后只加不替、产生矛盾数据）。
 
 # ==================== 检修案例沉淀 ====================
 
@@ -1512,6 +1059,19 @@ async def ai_case_draft(req: CaseDraftRequest):
 async def ai_case_compliance(req: CaseComplianceRequest):
     """门控 LLM：判断内容是否可纳入设备检修知识库。"""
     return CaseComplianceResponse(**await check_compliance(req.text))
+
+
+@app.post("/ai/validate")
+async def ai_validate(req: ValidateRequest):
+    """通用入口校验守门：case=相关性+合规；task=宽松任务有效性；graph=待入图谱实体有效性。"""
+    if req.purpose == "case":
+        c = await check_compliance(req.text)
+        return {"valid": c["compliant"], "reason": c["reason"]}
+    if req.purpose == "graph":
+        v = await validate_graph_entities(req.text)
+        return {"valid": v["valid"], "reason": v["reason"]}
+    v = await validate_task_text(req.text)
+    return {"valid": v["valid"], "reason": v["reason"]}
 
 
 # ==================== 多模态向量化（文本或图片，不融合）====================

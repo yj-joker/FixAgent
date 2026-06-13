@@ -64,51 +64,7 @@ async def publish_result(channel: aio_pika.abc.AbstractChannel, data: dict,
     )
 
 
-async def handle_realtime(message: aio_pika.abc.AbstractIncomingMessage, channel: aio_pika.abc.AbstractChannel):
-    async with message.process(requeue=False):
-        body = json.loads(message.body)
-        session_id = str(body["sessionId"])
-        user_id = body["userId"]
-        logger.info("[MQ消费] 实时更新开始, 会话ID:%s", session_id)
-
-        try:
-            from agents.realtime_memory_agent import get_realtime_memory_agent
-            from agents.base_agent import AgentInput
-
-            agent = get_realtime_memory_agent()
-            input_data = AgentInput(
-                user_message=body["userMessage"],
-                session_id=session_id,
-                context={
-                    "user_message": body["userMessage"],
-                    "ai_response": body.get("aiResponse", ""),
-                    "recent_facts": body.get("recentFacts", []),
-                },
-            )
-            result = await agent.run(input_data)
-            result_data = result.metadata.get("result", {})
-
-            await publish_result(channel, {
-                "type": "realtime_update",
-                "sessionId": session_id,
-                "userId": user_id,
-                "currentRound": body.get("currentRound"),
-                "success": True,
-                "data": result_data,
-            })
-            logger.info("[MQ消费] 实时更新完成, 会话ID:%s, has_update=%s",
-                        session_id, result_data.get("has_update", False))
-
-        except Exception as e:
-            logger.error("[MQ消费] 实时更新失败, 会话ID:%s, 错误:%s", session_id, e)
-            await publish_result(channel, {
-                "type": "realtime_update",
-                "sessionId": session_id,
-                "userId": user_id,
-                "success": False,
-                "error": str(e),
-                "data": {},
-            })
+# [已退役] handle_realtime 删除：实时记忆更新链路停用，事实纠正改由对话内 save_memory/delete_memory 处理。
 
 
 async def handle_consolidate(message: aio_pika.abc.AbstractIncomingMessage, channel: aio_pika.abc.AbstractChannel):
@@ -159,6 +115,8 @@ async def handle_consolidate(message: aio_pika.abc.AbstractIncomingMessage, chan
                     "old_preferences": params.get("memoryPreferenceVOList", []),
                     "old_unresolved": params.get("memoryUnresolvedVOList", []),
                     "previous_summary": params.get("previousSummary"),
+                    # 现有事实索引（name+type+description），让整合 LLM 看见已有事实，复用 name 去重 / 标记 superseded
+                    "existing_facts": params.get("existingFactIndex", ""),
                 },
             )
 
@@ -403,19 +361,29 @@ async def handle_reflection(message: aio_pika.abc.AbstractIncomingMessage, chann
         try:
             settings = get_settings()
 
-            # 从 Java 拉取用户全部 active 事实
+            # 从 Java 拉取：①用户长期事实(辅证据) ②已审核通过的检修案例履历(主证据)
+            headers = {"X-Internal-Token": settings.internal_token}
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(
                     f"{settings.java_service_url}/weixiu/memory/user-facts",
-                    params={"userId": user_id},
-                    headers={"X-Internal-Token": settings.internal_token},
+                    params={"userId": user_id}, headers=headers,
                 )
                 resp.raise_for_status()
-                api_result = resp.json()
+                facts = resp.json().get("data", [])
 
-            facts = api_result.get("data", [])
-            if not facts:
-                logger.info("[MQ消费] 用户无事实，跳过反思, userId:%s", user_id)
+                try:
+                    tresp = await client.get(
+                        f"{settings.java_service_url}/weixiu/memory/user-task-history",
+                        params={"userId": user_id}, headers=headers,
+                    )
+                    tresp.raise_for_status()
+                    task_history = tresp.json().get("data", [])
+                except Exception as te:
+                    logger.warning("[MQ消费] 拉取检修履历失败(降级为仅事实), userId:%s, err:%s", user_id, te)
+                    task_history = []
+
+            if not facts and not task_history:
+                logger.info("[MQ消费] 用户无事实也无检修履历，跳过反思, userId:%s", user_id)
                 return
 
             from agents.reflection_agent import get_reflection_agent
@@ -425,7 +393,7 @@ async def handle_reflection(message: aio_pika.abc.AbstractIncomingMessage, chann
             result = await agent.run(AgentInput(
                 user_message="请分析用户画像",
                 session_id=str(user_id),
-                context={"facts": facts, "user_id": user_id}
+                context={"facts": facts, "task_history": task_history, "user_id": user_id}
             ))
 
             if result.metadata.get("status") == "ok":
@@ -566,13 +534,8 @@ async def start_consumers():
     realtime_q, consolidate_q, knowledge_import_q, task_generate_q, step_verify_q, reflection_q = await _declare_topology(init_channel)
     await init_channel.close()
 
-    # 实时更新通道（prefetch=5，允许并发处理多条）
-    realtime_channel = await connection.channel()
-    await realtime_channel.set_qos(prefetch_count=5)
-    realtime_queue = await realtime_channel.get_queue(REALTIME_QUEUE)
-    await realtime_queue.consume(
-        lambda msg: handle_realtime(msg, realtime_channel)
-    )
+    # [已退役] 实时更新消费者删除：事实纠正改由对话内 save_memory/delete_memory 处理。
+    # 队列拓扑仍保留（Java 端已停止发送，队列长期为空，无副作用）。
 
     # 记忆整合通道（prefetch=1，单任务耗时长，串行处理）
     consolidate_channel = await connection.channel()
