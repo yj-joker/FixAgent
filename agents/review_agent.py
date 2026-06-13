@@ -698,6 +698,7 @@ class ReviewAgent:
         value = re.sub(r"^\s*\*\s+", "", value)
         value = re.sub(r"^\s*#{1,6}\s*", "", value)
         value = re.sub(r"^\s*>\s*", "", value)
+        value = re.sub(r"^\s*(?:\d+[.、)]\s*|Step\s*\d+\s*[:：.\-]?\s*)", "", value, flags=re.IGNORECASE)
         value = re.sub(r"\*\*([^*]+)\*\*", r"\1", value)
         value = re.sub(r"`([^`]+)`", r"\1", value)
         value = re.sub(r"\bsource=[^\s，。；;）)]+", "", value)
@@ -705,6 +706,29 @@ class ReviewAgent:
         value = re.sub(r"\b[\w-]+:\d{2}:img:\d{4}\b", "", value)
         value = re.sub(r"\s+", " ", value).strip()
         return value[:140] + "..." if len(value) > 140 else value
+
+    @staticmethod
+    def _renumber_ordered_list_lines(message: str) -> str:
+        item_pattern = re.compile(r"^(\s*)\d+[.、)]\s+(.+?)\s*$")
+        renumbered: List[str] = []
+        counter = 0
+        in_ordered_list = False
+
+        for line in (message or "").splitlines():
+            match = item_pattern.match(line)
+            if match:
+                counter = counter + 1 if in_ordered_list else 1
+                in_ordered_list = True
+                indent, body = match.groups()
+                renumbered.append(f"{indent}{counter}. {body.strip()}")
+                continue
+
+            renumbered.append(line)
+            if line.strip():
+                counter = 0
+                in_ordered_list = False
+
+        return "\n".join(renumbered)
 
     @classmethod
     def _format_pending_items(cls, items: List[str]) -> str:
@@ -793,6 +817,8 @@ class ReviewAgent:
         formal_message = "\n".join(kept_lines).strip()
         if not formal_message:
             formal_message = "当前资料不足以形成可确认的正式操作指引。"
+        else:
+            formal_message = ReviewAgent._renumber_ordered_list_lines(formal_message)
         return formal_message, removed
 
     @staticmethod
@@ -907,6 +933,7 @@ class ReviewAgent:
             confirmed_values=confirmed_values,
             pending_lines=pending_lines,
         )
+        final_message = _OutputSanitizer.sanitize(final_message)
 
         latency = verification["verification_latency_ms"]
         logger.info(
@@ -995,9 +1022,31 @@ class ReviewAgent:
 class _OutputSanitizer:
     """Clean model output before verification and composition."""
 
+    _EMOJI_PATTERN = re.compile(
+        "["
+        "\U0001F1E6-\U0001F1FF"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F600-\U0001F64F"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F700-\U0001F77F"
+        "\U0001F780-\U0001F7FF"
+        "\U0001F800-\U0001F8FF"
+        "\U0001F900-\U0001F9FF"
+        "\U0001FA70-\U0001FAFF"
+        "\u2600-\u26FF"
+        "\u2700-\u27BF"
+        "]+"
+    )
+    _VARIATION_SELECTOR_PATTERN = re.compile("[\ufe0e\ufe0f]")
+    _DECORATIVE_TONE_MARK_PATTERN = re.compile(r"[~\uff5e]+(?=\s*(?:$|[\u3002\uff01\uff1f!?,\uff0c\u3001\uff1b;]))")
+
     @staticmethod
     def sanitize(message: str) -> str:
-        return ReviewAgent._strip_leaked_tool_arguments(message or "")
+        cleaned = ReviewAgent._strip_leaked_tool_arguments(message or "")
+        cleaned = _OutputSanitizer._EMOJI_PATTERN.sub("", cleaned)
+        cleaned = _OutputSanitizer._VARIATION_SELECTOR_PATTERN.sub("", cleaned)
+        cleaned = _OutputSanitizer._DECORATIVE_TONE_MARK_PATTERN.sub("", cleaned)
+        return cleaned
 
 
 class _SafetyReviewer:
@@ -1078,9 +1127,21 @@ class _ResponseComposer:
 
         appended = (safety or {}).get("appended_text", "")
         if appended:
-            sections.append("安全提醒：\n" f"{appended}")
+            safety_title = "\u5b89\u5168\u63d0\u9192\uff1a"
+            appended = _ResponseComposer._strip_repeated_section_prefix(appended, safety_title)
+            sections.append(f"{safety_title}\n{appended}")
 
         return "\n\n".join(section for section in sections if section)
+
+    @staticmethod
+    def _strip_repeated_section_prefix(text: str, prefix: str) -> str:
+        lines: List[str] = []
+        for line in (text or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix):].strip()
+            lines.append(stripped if stripped else "")
+        return "\n".join(lines).strip()
 
     @staticmethod
     def _format_base_message(message: str, policy: Dict[str, Any]) -> str:
