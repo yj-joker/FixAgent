@@ -396,6 +396,13 @@ class FixAgent(BaseAgent):
             hint = str(visual_context["retrieval_hint"]).strip()
             if hint and hint not in query:
                 kwargs["query"] = hint if not query else f"{query} {hint}"
+        if tool_name == "knowledge_retrieval":
+            # 强制范围隔离：用会话绑定的 scope 覆盖 LLM 传入的范围参数，杜绝跨设备/跨手册串台
+            scope = run_context.retrieval_scope or {}
+            if scope.get("device_type"):
+                kwargs["device_type"] = scope["device_type"]
+            if scope.get("document_id"):
+                kwargs["document_id"] = scope["document_id"]
         return kwargs
 
     async def _run_with_react_contextual(

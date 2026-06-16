@@ -40,6 +40,8 @@ def build_redis_filter(
     status: str = None,
     chunk_label: str = None,
     parent_section_id: str = None,
+    answer_role: str = None,
+    parameter_type: str = None,
 ) -> Optional[str]:
     """构建 RediSearch 过滤表达式，供 API 层和工具层复用。
 
@@ -75,6 +77,10 @@ def build_redis_filter(
         filter_parts.append(f"@chunk_label:{{{escape_redis_tag_value(chunk_label)}}}")
     if parent_section_id:
         filter_parts.append(f"@parent_section_id:{{{escape_redis_tag_value(parent_section_id)}}}")
+    if answer_role:
+        filter_parts.append(f"@answer_role:{{{escape_redis_tag_value(answer_role)}}}")
+    if parameter_type:
+        filter_parts.append(f"@parameter_type:{{{escape_redis_tag_value(parameter_type)}}}")
     if not filter_parts:
         return None
     return " ".join(f"({p})" for p in filter_parts)
@@ -129,6 +135,8 @@ class VectorService:
                 "chunk_type", "TAG",
                 "chunk_label", "TAG",
                 "parent_section_id", "TAG",
+                "answer_role", "TAG",
+                "parameter_type", "TAG",
                 "record_type", "TAG",
                 "status", "TAG",
                 "device_type", "TAG",
@@ -148,6 +156,8 @@ class VectorService:
             "chunk_type",
             "chunk_label",
             "parent_section_id",
+            "answer_role",
+            "parameter_type",
             "record_type",
             "status",
             "device_type",
@@ -195,6 +205,8 @@ class VectorService:
                     "chunk_type",
                     "chunk_label",
                     "parent_section_id",
+                    "answer_role",
+                    "parameter_type",
                     "device_type",
                     "document_version",
                     "manual_type",
@@ -286,6 +298,8 @@ class VectorService:
             "chunk_type",
             "chunk_label",
             "parent_section_id",
+            "answer_role",
+            "parameter_type",
             "record_type",
             "status",
             "device_type",
@@ -672,6 +686,84 @@ class VectorService:
             return self._section_records_from_search_results(results, document_id, parent_section_id, limit)
         except Exception as e:
             logger.warning(f"get_section_records fallback lookup failed: {e}")
+            return []
+
+    @staticmethod
+    def _metadata_page_value(metadata: Dict[str, Any]) -> Optional[int]:
+        value = metadata.get("page")
+        if value is None:
+            value = metadata.get("page_num")
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _page_records_from_search_results(
+        self,
+        results: List[Any],
+        document_id: str,
+        page: int,
+        chunk_type: Optional[str],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        records = []
+        if not results or len(results) <= 1:
+            return records
+        for i in range(1, len(results), 2):
+            fallback = self._decode_redis_value(results[i]).removeprefix(self.VECTOR_KEY_PREFIX)
+            record = self._decode_search_result_fields(results[i + 1], fallback_doc_id=fallback)
+            metadata = record.get("metadata") or {}
+            if metadata.get("document_id") != document_id:
+                continue
+            if chunk_type and metadata.get("chunk_type") != chunk_type:
+                continue
+            if self._metadata_page_value(metadata) != page:
+                continue
+            records.append(record)
+            if len(records) >= limit:
+                break
+        return records
+
+    def get_page_records(
+        self,
+        document_id: str,
+        page: int,
+        chunk_type: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Read same-page records by document metadata without changing the Redis schema."""
+        if not document_id or page is None or limit <= 0:
+            return []
+        try:
+            page_number = int(page)
+        except (TypeError, ValueError):
+            return []
+
+        search_limit = max(limit * 8, 100)
+        try:
+            page_filter = build_redis_filter(
+                document_id=document_id,
+                chunk_type=chunk_type,
+                record_type="manual",
+                status="ready",
+            )
+            results = self.redis.execute_command(
+                "FT.SEARCH",
+                self.INDEX_NAME,
+                page_filter,
+                "RETURN", "3", "id", "text", "metadata",
+                "LIMIT", "0", str(search_limit),
+                "DIALECT", "2"
+            )
+            return self._page_records_from_search_results(
+                results,
+                document_id=document_id,
+                page=page_number,
+                chunk_type=chunk_type,
+                limit=limit,
+            )
+        except Exception as e:
+            logger.warning(f"get_page_records lookup failed: {e}")
             return []
 
     async def search_by_text(

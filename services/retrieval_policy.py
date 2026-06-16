@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from typing import Any, Dict, Iterable, List
 
 
@@ -70,39 +69,6 @@ def diversify_candidates(
         if len(selected) >= top_k:
             break
     return selected
-
-
-def rerank_candidates(
-    query: str,
-    candidates: Iterable[Dict[str, Any]],
-    intent: str = "mixed",
-) -> List[Dict[str, Any]]:
-    """Apply a lightweight rerank score before an external reranker is wired in."""
-    query_terms = {term for term in re.split(r"[\s,，。；;、]+", query or "") if term}
-    ranked: List[Dict[str, Any]] = []
-    for candidate in candidates:
-        metadata = candidate.get("metadata") or {}
-        content = " ".join(
-            str(value)
-            for value in (
-                candidate.get("text", ""),
-                metadata.get("image_title", ""),
-                metadata.get("image_summary", ""),
-                metadata.get("caption", ""),
-            )
-            if value
-        )
-        overlap = sum(1 for term in query_terms if term in content)
-        lexical_bonus = min(0.12, overlap * 0.04)
-        route_bonus = 0.03 if "keyword" in set(candidate.get("routes") or []) else 0.0
-        intent_bonus = 0.08 if intent != "mixed" and _chunk_type(candidate) == intent else 0.0
-        item = dict(candidate)
-        item["rerank_score"] = round(
-            min(candidate.get("relevance_score", 0.0) + lexical_bonus + route_bonus + intent_bonus, 1.0),
-            6,
-        )
-        ranked.append(item)
-    return sorted(ranked, key=lambda item: item.get("rerank_score", 0.0), reverse=True)
 
 
 def summarize_confidence(candidates: Iterable[Dict[str, Any]], intent: str = "mixed") -> Dict[str, Any]:

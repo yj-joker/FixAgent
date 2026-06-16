@@ -29,6 +29,14 @@ from services.vector_service import get_vector_service
 logger = logging.getLogger(__name__)
 
 
+def build_image_retrieval_text(policy_text: str, caption: str, section_title: str, page) -> str:
+    """Choose the text indexed beside an image record."""
+    caption = (caption or "").strip()
+    if caption:
+        return caption
+    return f"{(section_title or '').strip()} 第{page or '?'}页插图"
+
+
 class KnowledgeService:
     """知识入库服务"""
 
@@ -39,6 +47,10 @@ class KnowledgeService:
     _IMAGE_CONCURRENCY = 3
     _IMAGE_BATCH_SIZE = 8
     _IMAGE_SUMMARY_CONCURRENCY = 3
+    # 入向量文本差异化策略：长内容类(step/大纲/通用)补 contextual 上下文以提升召回，
+    # 短精确类(safety/参数/表格)保留纯正文避免前缀稀释短句语义。
+    # 依据 evaluation v14/v16 各题型 Recall 对比 + golden chunk_label 分布得出。
+    _CONTEXTUAL_EMBED_LABELS = {"step", "outline", "general"}
 
     def __init__(self):
         self.parser = get_document_parser()
@@ -151,7 +163,7 @@ class KnowledgeService:
         source_file_url = self.file_storage.ensure_document_url(file_url)
 
         document_id = document_id or hashlib.md5(f"{file_name}|{file_url}".encode()).hexdigest()[:12]
-        doc_prefix = hashlib.md5(document_id.encode()).hexdigest()[:8]
+        doc_prefix = hashlib.md5(document_id.encode()).hexdigest()[:12]  # [:8]→[:12]：48bit，碰撞窗口推到数百万文档
         common_metadata = {
             "record_type": "manual",
             "status": "ready",
@@ -207,13 +219,13 @@ class KnowledgeService:
             ]
             text_policy_chunks = [
                 chunk for chunk in structured_chunks
-                if chunk.get("chunk_type") == "text"
+                if chunk.get("chunk_type") in {"text", "outline"}
             ]
             chunked_text_chunks_count += len(text_policy_chunks)
 
             valid_chunks = [
                 chunk for chunk in text_policy_chunks
-                if len((chunk.get("text") or "").strip()) >= 10
+                if len(((chunk.get("metadata") or {}).get("raw_text") or chunk.get("text") or "").strip()) >= 10
             ]
             indexable_text_chunks_count += len(valid_chunks)
             table_chunks_for_refs = [
@@ -221,7 +233,8 @@ class KnowledgeService:
                 if chunk.get("chunk_type") == "table" and (chunk.get("text") or "").strip()
             ]
             for global_i, chunk in enumerate(valid_chunks):
-                chunk_id = f"{doc_prefix}:{sec_idx:02d}:txt:{global_i:04d}"
+                id_kind = "out" if chunk.get("chunk_type") == "outline" else "txt"
+                chunk_id = f"{doc_prefix}:{sec_idx:02d}:{id_kind}:{global_i:04d}"
                 global_chunk_doc_ids[chunk.get("id")] = chunk_id
                 text_jobs.append({
                     "order": len(text_jobs),
@@ -276,6 +289,7 @@ class KnowledgeService:
                     "img_id": f"{doc_prefix}:{sec_idx:02d}:img:{img_idx:04d}",
                     "summary_id": f"{doc_prefix}:{sec_idx:02d}:ims:{img_idx:04d}",
                     "policy_metadata": dict(policy_image.get("metadata") or {}),
+                    "policy_text": policy_image.get("text", ""),
                     "section_title": section_title,
                     "page_range": page_range,
                     "sec_category": sec_category,
@@ -292,7 +306,9 @@ class KnowledgeService:
 
         async def embed_text_batch(batch_spec):
             batch_start, batch = batch_spec
-            vectors = await self.text_emb.embed_batch([job["chunk"]["text"] for job in batch])
+            vectors = await self.text_emb.embed_batch(
+                [self._embed_text_for_chunk(job["chunk"]) for job in batch]
+            )
             if len(vectors) != len(batch):
                 raise RuntimeError("text embedding count mismatch")
             return batch_start, batch, vectors
@@ -313,7 +329,7 @@ class KnowledgeService:
                     **(chunk.get("metadata") or {}),
                     "section_title": job["section_title"],
                     "page_range": job["page_range"],
-                    "chunk_type": "text",
+                    "chunk_type": chunk.get("chunk_type", "text"),
                     "page": chunk.get("page"),
                     "chunk_label": chunk.get("chunk_label", "general"),
                 }
@@ -325,6 +341,37 @@ class KnowledgeService:
                     "category": job["sec_category"],
                     "tags": tags,
                     "metadata": chunk_metadata
+                })
+
+        # 方案乙：给 step 块额外嵌一份“纯内容”向量（doc_id 用 :srw: 后缀）。
+        # 召回侧 step_raw 路命中后，经 _canonical_id 的 source_chunk_id 归并回原块；
+        # 原块 id/边界/带前缀向量一律不动，150 条 golden 仍可比。
+        step_raw_inputs = [
+            doc for doc in text_docs
+            if (doc.get("metadata") or {}).get("chunk_label") == "step"
+            and ((doc.get("metadata") or {}).get("raw_text") or "").strip()
+        ]
+        if step_raw_inputs:
+            raw_vectors = await self.text_emb.embed_batch(
+                [doc["metadata"]["raw_text"].strip() for doc in step_raw_inputs]
+            )
+            for doc, vec in zip(step_raw_inputs, raw_vectors):
+                raw_text = doc["metadata"]["raw_text"].strip()
+                srw_meta = dict(doc["metadata"])
+                srw_meta.update({
+                    "chunk_type": "step_raw",
+                    "chunk_label": "step_raw",
+                    "retrieval_route": "step_raw",
+                    "source_chunk_id": doc["doc_id"],
+                    "contextual_text": raw_text,
+                })
+                text_docs.append({
+                    "doc_id": doc["doc_id"].replace(":txt:", ":srw:"),
+                    "text": raw_text,
+                    "vector": vec,
+                    "category": doc.get("category"),
+                    "tags": doc.get("tags"),
+                    "metadata": srw_meta,
                 })
 
         text_write_started = time.time()
@@ -408,7 +455,12 @@ class KnowledgeService:
             local_path = img.get("local_path", "")
             try:
                 image_url = await asyncio.to_thread(self.file_storage.ensure_public_url, img)
-                img_text = caption if caption else f"{image_job['section_title']} 第{img.get('page', '?')}页插图"
+                img_text = build_image_retrieval_text(
+                    image_job.get("policy_text", ""),
+                    caption,
+                    image_job["section_title"],
+                    img.get("page", "?"),
+                )
                 if local_path:
                     embedding_input = local_path
                     embedding_source = "local_image"
@@ -618,6 +670,7 @@ class KnowledgeService:
                     context_before=img.get("context_before", ""),
                     context_after=img.get("context_after", ""),
                     section_title=image_result["section_title"],
+                    local_path=image_result.get("local_path", ""),
                 )
                 summary_text = ((summary or {}).get("image_summary") or "").strip()
                 return {
@@ -803,6 +856,21 @@ class KnowledgeService:
             "extraction_summary": extraction_summary,
             "process_time_ms": int((t1 - t0) * 1000)
         }
+
+    @staticmethod
+    def _embed_text_for_chunk(chunk: dict) -> str:
+        """选择送入 embedding 的文本：长内容类补 contextual 上下文，短精确类保纯正文。
+
+        只改变向量化输入，不改变 chunk 数量/顺序/doc_id，
+        因此 evaluation 的 golden_chunk_ids 仍可复用、指标可比。
+        """
+        metadata = chunk.get("metadata") or {}
+        label = metadata.get("chunk_label") or chunk.get("chunk_label") or ""
+        if label in KnowledgeService._CONTEXTUAL_EMBED_LABELS:
+            contextual = (metadata.get("contextual_text") or "").strip()
+            if contextual:
+                return contextual
+        return chunk["text"]
 
     @staticmethod
     def _table_to_text(table: dict) -> str:

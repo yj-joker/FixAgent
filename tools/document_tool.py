@@ -207,11 +207,16 @@ class DocumentParserTool(BaseTool):
                     "images": images
                 })
 
+        # 读取 PDF 自带目录（出版社写好的权威章节结构），用于章节锚定
+        toc_entries = (
+            self._build_toc_entries(fitz_doc.get_toc())
+            if fitz_doc is not None else []
+        )
         if fitz_doc is not None:
             fitz_doc.close()
 
         # 将逐页数据合并为章节
-        sections = self._group_into_sections(pages_data)
+        sections = self._group_into_sections(pages_data, toc_entries)
 
         return {
             "total_pages": total_pages,
@@ -665,6 +670,17 @@ class DocumentParserTool(BaseTool):
         page_text = text.strip()
         if not page_text:
             return []
+        if DocumentParserTool._looks_like_outline_page(page_text):
+            chunk_uid = f"p{page_num}:outline:0000"
+            return [{
+                "chunk_uid": chunk_uid,
+                "text": page_text,
+                "page": page_num,
+                "chunk_label": "outline",
+                "context_before": "",
+                "context_after": "",
+                "_off": 0,
+            }]
 
         step_pattern = re.compile(r'(?m)^\s*(\d+[\.\、\)](?!\d)\s*[^\n]+)')
         matches = list(step_pattern.finditer(page_text))
@@ -677,6 +693,7 @@ class DocumentParserTool(BaseTool):
                 "chunk_label": "page",
                 "context_before": "",
                 "context_after": "",
+                "_off": 0,
             }]
 
         prefix = page_text[:matches[0].start()].strip()
@@ -698,6 +715,7 @@ class DocumentParserTool(BaseTool):
                 "step_index": index,
                 "context_before": prefix,
                 "context_after": page_text[end:end + 300].strip(),
+                "_off": start,
             })
         for index, chunk in enumerate(chunks):
             if index > 0:
@@ -705,6 +723,78 @@ class DocumentParserTool(BaseTool):
             if index + 1 < len(chunks):
                 chunk["next_step_id"] = chunks[index + 1]["chunk_uid"]
         return chunks
+
+    @staticmethod
+    def _heading_pos(page_text: str, entry: dict) -> int:
+        """在页面文本里定位某目录标题所在的行首位置；找不到返回 -1。
+
+        按行首锚定匹配，避免把正文里偶然出现的同名词当成标题。
+        """
+        for candidate in (entry.get("title"), entry.get("core")):
+            if not candidate:
+                continue
+            parts = [re.escape(p) for p in candidate.split() if p]
+            if not parts:
+                continue
+            pattern = r'(?m)^\s*' + r'\s*'.join(parts)
+            match = re.search(pattern, page_text)
+            if match:
+                return match.start()
+        return -1
+
+    @staticmethod
+    def _assign_toc_paths(text: str, chunks: list, page_num: int, toc_entries: list | None) -> None:
+        """按字符位置给本页每个 chunk 标注正确的目录路径（章 > 节 > 子过程）。
+
+        - 进位 carry_in：起始页 < 本页 的最近一个标题（即"翻到本页时所在的小节"）。
+        - 页内细分：本页起始的各标题，按它们在页面文本里的出现位置排序；
+          某 chunk 归属于"位置 <= 该 chunk 偏移"的最后一个标题。
+        - 找不到任何标题则不写 toc_path。
+        """
+        if not toc_entries:
+            for chunk in chunks:
+                chunk.pop("_off", None)
+            return
+        page_text = text.strip()
+        carry_in = None
+        for entry in toc_entries:
+            if entry.get("page") is not None and entry["page"] < page_num:
+                carry_in = entry
+        heads = []
+        for entry in toc_entries:
+            if entry.get("page") == page_num:
+                pos = DocumentParserTool._heading_pos(page_text, entry)
+                if pos >= 0:
+                    heads.append((pos, entry))
+        heads.sort(key=lambda item: item[0])
+        for chunk in chunks:
+            off = chunk.pop("_off", 0)
+            gov = carry_in
+            for pos, entry in heads:
+                if pos <= off:
+                    gov = entry
+                else:
+                    break
+            if gov:
+                chunk["toc_path"] = " > ".join(gov.get("path") or [gov.get("title", "")])
+
+    @staticmethod
+    def _looks_like_outline_page(page_text: str) -> bool:
+        """Detect table-of-contents pages before numbered entries become step chunks."""
+        lines = [line.strip() for line in (page_text or "").splitlines() if line.strip()]
+        if len(lines) < 6:
+            return False
+        outline_lines = [
+            line for line in lines
+            if re.match(r"^(?:[一二三四五六七八九十]+、|\d+\.\d+\s+).+", line)
+        ]
+        operation_lines = [line for line in lines if re.match(r"^\d+[\.、\)](?!\d)\s+", line)]
+        has_outline_title = any("目录" in line or "维修手册" in line for line in lines[:3])
+        return (
+            len(outline_lines) >= 6
+            and not operation_lines
+            and (has_outline_title or len(outline_lines) >= max(6, len(lines) // 2))
+        )
 
     # ==================== 章节合并 ====================
 
@@ -777,7 +867,40 @@ class DocumentParserTool(BaseTool):
     # ==================== 文件下载 ====================
 
     @staticmethod
-    def _group_into_sections(pages_data: list) -> list:
+    def _build_toc_entries(toc: list) -> list:
+        """把 PDF 自带目录 [[level, title, page], ...] 转成带祖先路径的条目。
+
+        每条记录:
+          page  —— 该标题起始页（1-based）
+          path  —— 从章到当前标题的祖先链，如 ["六、…", "6.4 …", "拆卸离合器"]
+          core  —— 去掉编号/标点后的纯标题，用于在 chunk 正文里做归属判定
+        """
+        strip_re = re.compile(r'^[\s\d\.\、，,（）()【】．一二三四五六七八九十]+')
+        entries: list = []
+        stack: list = []  # [(level, title)]
+        for item in toc or []:
+            try:
+                level, title, page = int(item[0]), str(item[1]).strip(), int(item[2])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if not title:
+                continue
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            path = [t for _, t in stack] + [title]
+            core = strip_re.sub('', title).strip()
+            entries.append({
+                "page": page,
+                "level": level,
+                "title": title,
+                "path": path,
+                "core": core if len(core) >= 2 else "",
+            })
+            stack.append((level, title))
+        return entries
+
+    @staticmethod
+    def _group_into_sections(pages_data: list, toc_entries: list | None = None) -> list:
         """Group cleaned layout-aware page content into sections."""
         repeated_noise = DocumentParserTool._repeated_margin_texts(pages_data)
         chapter_pattern = re.compile(
@@ -820,7 +943,9 @@ class DocumentParserTool(BaseTool):
                 current_section["_start_page"] = page_num
 
             if text.strip():
-                current_section["text_chunks"].extend(DocumentParserTool._split_page_text(text, page_num))
+                page_chunks = DocumentParserTool._split_page_text(text, page_num)
+                DocumentParserTool._assign_toc_paths(text, page_chunks, page_num, toc_entries)
+                current_section["text_chunks"].extend(page_chunks)
             current_section["images"].extend(page_data.get("images") or [])
             for table in valid_tables:
                 if isinstance(table, dict):

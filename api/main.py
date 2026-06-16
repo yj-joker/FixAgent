@@ -258,6 +258,11 @@ async def _prepare_chat_agent_input(request: ChatRequest) -> AgentInput:
     raw_message = request.message or ""
     effective_message = raw_message.strip() or IMAGE_ONLY_DEFAULT_MESSAGE
     context = dict(request.context or {})
+    # 检索范围强制隔离：把会话绑定的设备/手册透传给检索工具（注入钩子里覆盖 LLM，LLM 不可放宽）
+    context["retrieval_scope"] = {
+        "device_type": request.device_type,
+        "document_id": request.document_id,
+    }
 
     intent_decision = await get_intent_router().classify(
         raw_message,

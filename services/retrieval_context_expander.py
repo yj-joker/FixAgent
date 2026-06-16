@@ -199,6 +199,9 @@ def expand_retrieval_context(
             record = fetched_by_id.get(ref_id)
             if not record:
                 continue
+            # 防御：按 id 直取的上下文扩展只拼接手册记录，杜绝会话事实混入手册回答
+            if (record.get("metadata") or {}).get("record_type", "manual") != "manual":
+                continue
             source_id, reason, source_score = expansion_meta[ref_id]
             expanded.append(_mark_expanded(record, source_id, reason, source_score))
             seen_ids.add(ref_id)

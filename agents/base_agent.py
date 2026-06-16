@@ -50,6 +50,7 @@ class AgentRunContext(BaseModel):
     enhanced_query: Optional[str] = None
     intent_decision: Dict[str, Any] = Field(default_factory=dict)
     allowed_tools: Optional[List[str]] = None
+    retrieval_scope: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentOutput(BaseModel):
@@ -162,6 +163,7 @@ class BaseAgent(ABC):
             enhanced_query=str(context["enhanced_retrieval_query"]) if context.get("enhanced_retrieval_query") else None,
             intent_decision=dict(intent_decision),
             allowed_tools=[str(name) for name in allowed_tools] if isinstance(allowed_tools, list) else None,
+            retrieval_scope=dict(context.get("retrieval_scope") or {}),
         )
 
     def get_system_prompt_for_run(self, run_context: AgentRunContext) -> str:

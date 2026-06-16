@@ -104,6 +104,8 @@ class ChatRequest(BaseModel):
     stream: bool = Field(default=True, description="是否启用流式输出")
     conversation_history: Optional[List[dict]] = Field(default=None, description="多轮对话历史，格式：[{'role':'user','content':'...'},{'role':'assistant','content':'...'}]")
     context: Optional[dict] = Field(default=None, description="结构化上下文（摘要、事实、偏好、待办）")
+    device_type: Optional[str] = Field(default=None, description="检索范围限定的设备型号（会话绑定，缺省=不限定，退回全库检索）")
+    document_id: Optional[str] = Field(default=None, description="检索范围限定的单本手册ID（可选，比 device_type 更严）")
 
     @field_validator('images')
     @classmethod

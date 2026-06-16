@@ -37,7 +37,8 @@ class LLMService:
         max_tokens: Optional[int] = None,
         stream: bool = False,
         response_format: Optional[Dict[str, str]] = None,
-        model: Optional[str] = None
+        model: Optional[str] = None,
+        seed: Optional[int] = None
     ) -> Dict[str, Any] | AsyncIterator[str]:
         """
         对话接口
@@ -58,10 +59,14 @@ class LLMService:
         params = {
             "model": use_model,
             "messages": messages,
-            "temperature": temperature or self.settings.llm_temperature,
+            # 用 is not None 判断，避免 temperature=0 被 `or` 当成 falsy 而回退默认值
+            "temperature": temperature if temperature is not None else self.settings.llm_temperature,
             "top_p": self.settings.llm_top_p,
             "max_tokens": max_tokens or self.settings.llm_max_tokens
         }
+
+        if seed is not None:
+            params["seed"] = seed
 
         if response_format:
             params["response_format"] = response_format
