@@ -95,6 +95,103 @@ def _normalize_draft(d: dict) -> dict:
     return d
 
 
+_OCR_SYS = """你是文字识别助手。识别图片中的所有文字（含手写笔记），按原文逐字输出，保持换行。
+只输出识别到的文字本身，不要翻译、不要解释、不要补充任何说明。图中无文字则输出空。"""
+
+
+async def extract_material(req) -> dict:
+    """把上传的文件(pdf/txt/docx) + 图片(VLM OCR) 抽取/识别成纯文本，汇总返回 {"text": ...}。"""
+    parts: list[str] = []
+
+    # 1) 文档抽取
+    for f in (req.files or []):
+        name = (getattr(f, "name", "") or "").lower()
+        b64 = getattr(f, "content_base64", "") or ""
+        if not b64:
+            continue
+        try:
+            import base64
+            raw = base64.b64decode(b64)
+        except Exception as e:
+            logger.warning("[case_extract] 文件 Base64 解码失败 name=%s: %s", name, e)
+            continue
+        text = ""
+        try:
+            if name.endswith(".txt") or name.endswith(".md"):
+                text = raw.decode("utf-8", errors="ignore")
+            elif name.endswith(".pdf"):
+                text = _parse_pdf_bytes(raw)
+            elif name.endswith(".docx"):
+                text = _parse_docx_bytes(raw)
+            else:
+                # 未知扩展名：尽力按文本解码
+                text = raw.decode("utf-8", errors="ignore")
+        except Exception as e:
+            logger.warning("[case_extract] 文档解析失败 name=%s: %s", name, e)
+        if text and text.strip():
+            parts.append(f"【文件：{getattr(f, 'name', '') or '未命名'}】\n{text.strip()}")
+
+    # 2) 图片 OCR（VLM）
+    for url in (req.images or []):
+        if not url:
+            continue
+        ocr = await _ocr_image(url)
+        if ocr and ocr.strip():
+            parts.append(f"【图片识别】\n{ocr.strip()}")
+
+    return {"text": "\n\n".join(parts).strip()}
+
+
+def _parse_pdf_bytes(raw: bytes) -> str:
+    """用 pdfplumber 逐页提取 PDF 文字。"""
+    import io
+    import pdfplumber
+    out = []
+    with pdfplumber.open(io.BytesIO(raw)) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            if t.strip():
+                out.append(t)
+    return "\n".join(out)
+
+
+def _parse_docx_bytes(raw: bytes) -> str:
+    """用 python-docx 提取 Word 文字；库缺失时返回空并告警。"""
+    try:
+        import io
+        from docx import Document
+    except Exception as e:
+        logger.warning("[case_extract] python-docx 不可用，跳过 docx 解析: %s", e)
+        return ""
+    import io as _io
+    doc = Document(_io.BytesIO(raw))
+    return "\n".join(p.text for p in doc.paragraphs if p.text and p.text.strip())
+
+
+async def _ocr_image(image_url: str) -> str:
+    """调 VLM 识别单张图片中的文字。"""
+    llm = get_llm_service()
+    # 兼容裸 base64：转成 data-uri
+    url = image_url
+    if url and not url.startswith("http") and not url.startswith("data:"):
+        url = f"data:image/jpeg;base64,{url}"
+    try:
+        r = await llm.chat(
+            messages=[
+                {"role": "system", "content": _OCR_SYS},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": url}},
+                    {"type": "text", "text": "请识别这张图片中的全部文字。"},
+                ]},
+            ],
+            model=get_settings().vlm_model,
+        )
+        return (r.get("content") or "") if isinstance(r, dict) else ""
+    except Exception as e:
+        logger.warning("[case_extract] 图片 OCR 失败: %s", e)
+        return ""
+
+
 async def check_compliance(text: str) -> dict:
     """门控 LLM：判断文本是否相关且合法。"""
     llm = get_llm_service()
