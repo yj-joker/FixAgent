@@ -858,3 +858,14 @@ class CaseComplianceResponse(BaseModel):
     legality: bool
     reason: str = ""
 
+
+class CaseExtractResponse(BaseModel):
+    """
+    案例素材抽取响应
+
+    【功能关联】POST /ai/case/extract
+    【字段说明】
+    - text: 文件文字 + 图片 OCR 汇总后的纯文本（供 /ai/case/draft 起草）
+    """
+    text: str = ""
+

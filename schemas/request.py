@@ -732,6 +732,28 @@ class CaseComplianceRequest(BaseModel):
     text: str
 
 
+class CaseExtractFile(BaseModel):
+    """上传文件（pdf/txt/docx）的 Base64 载体。"""
+    name: str = ""                       # 原始文件名（带扩展名，用于判定类型）
+    content_base64: str = ""             # 文件字节的 Base64
+
+
+class CaseExtractRequest(BaseModel):
+    """
+    案例素材抽取请求（文件/图片 → 纯文本）
+
+    【功能关联】POST /ai/case/extract
+    【何时用】工人通过"上传经验"通道提交文件(pdf/txt/docx)或笔记照片时，
+    由 Python 抽取文档文字 + VLM 识别图片文字，汇成纯文本，再交给 /ai/case/draft 起草。
+
+    【字段说明】
+    - files: 待抽取的文档列表（Base64）
+    - images: 笔记照片（URL 或 data-uri/base64），走 VLM OCR
+    """
+    files: Optional[List[CaseExtractFile]] = None
+    images: Optional[List[str]] = None
+
+
 class ValidateRequest(BaseModel):
     """
     通用入口校验请求（守门 LLM 泛化）

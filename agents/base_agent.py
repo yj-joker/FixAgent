@@ -32,6 +32,87 @@ from config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 
+def _jsonable(value):
+    return value.model_dump() if hasattr(value, "model_dump") else value
+
+
+def _coerce_result_item(raw, index: int, max_chars: int) -> Dict[str, Any]:
+    """把单条工具结果整理成 {title, content, type, page, score} 卡片。"""
+    data = _jsonable(raw)
+    if not isinstance(data, dict):
+        return {"title": f"结果 {index + 1}", "content": str(data)[:max_chars]}
+    meta = _jsonable(data.get("metadata")) or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    title = (
+        meta.get("section_title")
+        or meta.get("chunk_label")
+        or data.get("title")
+        or data.get("name")
+        or data.get("deviceName")
+        or data.get("faultName")
+        or meta.get("document_id")
+        or f"结果 {index + 1}"
+    )
+    content = (
+        data.get("content")
+        or data.get("text")
+        or data.get("context")
+        or data.get("summary")
+        or data.get("description")
+        or data.get("pathText")
+        or ""
+    )
+    if not content:
+        content = json.dumps(
+            {k: v for k, v in data.items() if k != "metadata"},
+            ensure_ascii=False,
+        )
+    score = data.get("relevance_score")
+    if score is None:
+        score = data.get("score")
+    if score is None:
+        score = data.get("matchScore")
+    return {
+        "title": str(title),
+        "content": str(content)[:max_chars],
+        "type": str(meta.get("source_chunk_type") or meta.get("chunk_type") or ""),
+        "page": meta.get("page_number") or meta.get("page"),
+        "score": round(float(score), 3) if isinstance(score, (int, float)) else None,
+    }
+
+
+def summarize_tool_result(tool_name: str, data, item_limit: int = 8, max_chars: int = 1200) -> Dict[str, Any]:
+    """把工具返回结果整理成前端可读的内容：text（正文）+ items（结构化卡片）。
+
+    - 列表结果（如知识检索）→ 拆成 items 卡片；
+    - 带 context/text 的字典结果（如图谱）→ 直接用其可读正文；
+    - 其他字典 → 取其中的子列表或兜底 JSON。
+    """
+    data = _jsonable(data)
+    items: List[Dict[str, Any]] = []
+    text = ""
+
+    if isinstance(data, list):
+        for index, raw in enumerate(data[:item_limit]):
+            items.append(_coerce_result_item(raw, index, max_chars))
+    elif isinstance(data, dict):
+        text = str(data.get("context") or data.get("text") or "")
+        if not text:
+            for key in ("records", "raw_records", "devices", "cases", "items", "data", "evidence", "results"):
+                sub = data.get(key)
+                if isinstance(sub, list) and sub:
+                    for index, raw in enumerate(sub[:item_limit]):
+                        items.append(_coerce_result_item(raw, index, max_chars))
+                    break
+            if not items:
+                text = json.dumps(data, ensure_ascii=False)
+    else:
+        text = str(data or "")
+
+    return {"tool": tool_name, "text": text[:max_chars * 3], "items": items}
+
+
 class AgentInput(BaseModel):
     """Agent输入模型"""
     user_message: str = Field(description="当前轮用户消息（纯文本）")
@@ -319,6 +400,13 @@ class BaseAgent(ABC):
                         lines.append("检查点：" + "；".join(fs.get("checkpointItems") or []))
                     if fs.get("sources"):
                         lines.append(f"该步参考依据：{fs.get('sources')}")
+                    # 执行态：让助手能针对性回答"这步为什么没过 / 怎么改 / 重传还是强制完成"
+                    if fs.get("status"):
+                        lines.append(f"该步当前状态：{fs.get('status')}")
+                    if fs.get("aiReason"):
+                        lines.append(f"AI 验收意见：{fs.get('aiReason')}")
+                    if fs.get("note"):
+                        lines.append(f"工人本步备注：{fs.get('note')}")
                 ov = m.get("overview")
                 if ov:
                     overview_lines = "\n".join(
@@ -326,11 +414,21 @@ class BaseAgent(ABC):
                         for index, step in enumerate(ov, start=1)
                     )
                     lines.append("\n全部步骤一览：\n" + overview_lines)
+                rej = m.get("rejectedSteps")
+                if rej:
+                    rej_lines = "\n".join(
+                        f"第 {r.get('sortOrder', '?')} 步「{r.get('title', '')}」未通过原因：{r.get('aiReason', '')}"
+                        for r in rej
+                    )
+                    lines.append("\n未通过步骤的 AI 驳回理由：\n" + rej_lines)
                 context_parts.append(
                     "当前检修任务：\n" + "\n".join(lines)
                     + "\n\n你是现场检修助手，正在与工人进行【连续的现场对话】。"
                     "请结合上面的任务背景、当前聚焦步骤、以及前面的对话内容来回答；"
                     "当工人追问「还不行怎么办 / 下一步呢」时，要承接前文继续给出可操作的排查与处置建议，必要时引用其它步骤。"
+                    "工人若问到某一步的状态/为什么没过，优先用上面的『AI 验收意见』或『未通过步骤的 AI 驳回理由』直接解答，"
+                    "并明确告诉他该怎么改、以及重新提交还是强制完成；"
+                    "若工人问到某步但上文只有标题没有细节，请用步骤总览定位，并提示他『点一下那个步骤，我就能看到更多细节』。"
                     "即使知识库未直接命中，也应基于检修常识与现场情境给出务实、安全的建议，"
                     "不要简单回复「资料不足」；仅在涉及不确定的关键技术参数时提示「需现场确认」。"
                     "安全第一，简明可操作。"
@@ -604,7 +702,7 @@ class BaseAgent(ABC):
                             kwargs["_event_sink"] = _event_sink
                         try:
                             result = await t.run(**kwargs)
-                        except Exception:
+                        except Exception as tool_exc:
                             duration_ms = int((time.time() - tool_start) * 1000)
                             logger.exception(
                                 "[%s][tool_exception] tool=%s duration_ms=%s",
@@ -612,6 +710,16 @@ class BaseAgent(ABC):
                                 t.name,
                                 duration_ms,
                             )
+                            try:
+                                await self._emit_stream_event(
+                                    _event_sink,
+                                    {
+                                        "event": "tool_result",
+                                        "data": {"tool": t.name, "text": f"调用异常：{tool_exc}", "items": []},
+                                    },
+                                )
+                            except Exception:
+                                logger.exception("[%s][tool_result_emit_failed] tool=%s", self.name, t.name)
                             raise
 
                         duration_ms = int((time.time() - tool_start) * 1000)
@@ -623,6 +731,16 @@ class BaseAgent(ABC):
                                 duration_ms,
                                 self._summarize_for_log(result.data),
                             )
+                            try:
+                                await self._emit_stream_event(
+                                    _event_sink,
+                                    {
+                                        "event": "tool_result",
+                                        "data": summarize_tool_result(t.name, result.data),
+                                    },
+                                )
+                            except Exception:
+                                logger.exception("[%s][tool_result_emit_failed] tool=%s", self.name, t.name)
                             return result.data if result.data is not None else {"result": "success"}
                         else:
                             logger.warning(
@@ -632,7 +750,18 @@ class BaseAgent(ABC):
                                 duration_ms,
                                 self._summarize_for_log(result.error),
                             )
-                            return {"error": result.error.message if result.error else "unknown error"}
+                            err_msg = result.error.message if result.error else "unknown error"
+                            try:
+                                await self._emit_stream_event(
+                                    _event_sink,
+                                    {
+                                        "event": "tool_result",
+                                        "data": {"tool": t.name, "text": f"调用失败：{err_msg}", "items": []},
+                                    },
+                                )
+                            except Exception:
+                                logger.exception("[%s][tool_result_emit_failed] tool=%s", self.name, t.name)
+                            return {"error": err_msg}
                     return handler
                 tool_handlers[tool.name] = _make_handler(tool)
 

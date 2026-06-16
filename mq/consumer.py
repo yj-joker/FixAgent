@@ -40,6 +40,11 @@ TASK_GENERATE_QUEUE = "task.generate.queue"
 TASK_GENERATE_RESULT_KEY = "task.generate.result"
 TASK_GENERATE_RESULT_QUEUE = "task.generate.result.queue"
 
+# ===== 画像出题队列 =====
+QUIZ_GENERATE_QUEUE = "quiz.generate.queue"
+QUIZ_GENERATE_RESULT_KEY = "quiz.generate.result"
+QUIZ_GENERATE_RESULT_QUEUE = "quiz.generate.result.queue"
+
 # ===== 步骤AI验证队列 =====
 TASK_STEP_VERIFY_QUEUE = "task.step.verify.queue"
 TASK_STEP_VERIFY_RESULT_KEY = "task.step.verify.result"
@@ -307,6 +312,39 @@ async def handle_task_generate(message: aio_pika.abc.AbstractIncomingMessage, ch
             }, exchange_name=TASK_EXCHANGE, routing_key=TASK_GENERATE_RESULT_KEY)
 
 
+async def handle_quiz_generate(message: aio_pika.abc.AbstractIncomingMessage, channel: aio_pika.abc.AbstractChannel):
+    """消费出题请求，调用 QuizAgent 生成客观题。"""
+    async with message.process(requeue=False):
+        body = json.loads(message.body)
+        session_id = body.get("quizSessionId")
+        logger.info("[MQ消费] 出题生成开始, sessionId=%s, userId=%s", session_id, body.get("userId"))
+        try:
+            from agents.quiz_agent import get_quiz_agent
+            result = await get_quiz_agent().generate(body)
+
+            if result.get("success"):
+                # QuizQuestionOut 用 by_alias 输出 camelCase
+                from schemas.quiz import QuizQuestionOut
+                questions = [QuizQuestionOut(**q).model_dump(by_alias=True) for q in result["questions"]]
+                await publish_result(channel, {
+                    "quizSessionId": session_id,
+                    "success": True,
+                    "questions": questions,
+                }, exchange_name=TASK_EXCHANGE, routing_key=QUIZ_GENERATE_RESULT_KEY)
+                logger.info("[MQ消费] 出题成功, sessionId=%s, 题数=%d", session_id, len(questions))
+            else:
+                await publish_result(channel, {
+                    "quizSessionId": session_id, "success": False,
+                    "error": result.get("error", "出题失败"),
+                }, exchange_name=TASK_EXCHANGE, routing_key=QUIZ_GENERATE_RESULT_KEY)
+                logger.warning("[MQ消费] 出题失败, sessionId=%s, error=%s", session_id, result.get("error"))
+        except Exception as e:
+            logger.error("[MQ消费] 出题异常, sessionId=%s, 错误:%s", session_id, e, exc_info=True)
+            await publish_result(channel, {
+                "quizSessionId": session_id, "success": False, "error": str(e),
+            }, exchange_name=TASK_EXCHANGE, routing_key=QUIZ_GENERATE_RESULT_KEY)
+
+
 async def handle_step_verify(message: aio_pika.abc.AbstractIncomingMessage, channel: aio_pika.abc.AbstractChannel):
     """消费步骤AI验证请求，调用 StepVerifyAgent 多模态验证"""
     async with message.process(requeue=False):
@@ -493,6 +531,18 @@ async def _declare_topology(channel: aio_pika.abc.AbstractChannel):
     )
     await task_generate_result_q.bind(task_exchange, "task.generate.result")
 
+    # ===== 画像出题拓扑（复用 task.exchange） =====
+    quiz_generate_q = await channel.declare_queue(
+        QUIZ_GENERATE_QUEUE, durable=True,
+        arguments={"x-message-ttl": 300_000, "x-dead-letter-exchange": "memory.dlx"},
+    )
+    await quiz_generate_q.bind(task_exchange, "quiz.generate")
+
+    quiz_generate_result_q = await channel.declare_queue(
+        QUIZ_GENERATE_RESULT_QUEUE, durable=True,
+    )
+    await quiz_generate_result_q.bind(task_exchange, "quiz.generate.result")
+
     # ===== 步骤AI验证拓扑 =====
 
     # 步骤验证队列（TTL 5min）
@@ -559,6 +609,14 @@ async def start_consumers():
     task_queue = await task_channel.get_queue(TASK_GENERATE_QUEUE)
     await task_queue.consume(
         lambda msg: handle_task_generate(msg, task_channel)
+    )
+
+    # 出题生成通道（prefetch=1，LLM 检索+生成耗时，串行处理）
+    quiz_channel = await connection.channel()
+    await quiz_channel.set_qos(prefetch_count=1)
+    quiz_queue = await quiz_channel.get_queue(QUIZ_GENERATE_QUEUE)
+    await quiz_queue.consume(
+        lambda msg: handle_quiz_generate(msg, quiz_channel)
     )
 
     # 步骤AI验证通道（prefetch=1，多模态LLM验证耗时，串行处理）

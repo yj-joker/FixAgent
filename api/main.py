@@ -22,6 +22,7 @@ from schemas.request import (
     TemporaryPlanGenerateRequest,
     CaseDraftRequest,
     CaseComplianceRequest,
+    CaseExtractRequest,
     ValidateRequest,
 )
 from schemas.response import (
@@ -36,8 +37,9 @@ from schemas.response import (
     TemporaryPlanDraftResponse,
     CaseDraftResponse,
     CaseComplianceResponse,
+    CaseExtractResponse,
 )
-from agents.case_agent import draft_case, check_compliance, validate_task_text, validate_graph_entities
+from agents.case_agent import draft_case, check_compliance, extract_material, validate_task_text, validate_graph_entities
 from agents.fix_agent import get_fix_agent
 from agents.review_agent import get_review_agent
 from agents.memory_agent import get_memory_agent
@@ -85,24 +87,51 @@ def _serialize_diagnosis_items(items: list[dict]) -> list[dict]:
     ]
 
 
+def _parse_chat_payload_json(text: str) -> dict | None:
+    """解析聊天结构化 payload。
+
+    先尝试整段 JSON；失败则从文本中扫描提取「含 message 键」的 JSON 对象——
+    覆盖模型不老实、在 JSON 前加前言/代码块包裹（文字+JSON 混排）的情况。
+    用 raw_decode 从每个 '{' 处尝试，能正确处理 JSON 字符串内的花括号。
+    """
+    # 1. 整段就是 JSON 对象
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    # 2. 混排：从每个 '{' 处尝试解析，取第一个含 "message" 键的对象
+    decoder = json.JSONDecoder()
+    idx = text.find('{')
+    while idx != -1:
+        try:
+            obj, _ = decoder.raw_decode(text[idx:])
+            if isinstance(obj, dict) and "message" in obj:
+                return obj
+        except json.JSONDecodeError:
+            pass
+        idx = text.find('{', idx + 1)
+    return None
+
+
 def _extract_structured_chat_payload(message: str) -> tuple[str, list[dict] | None]:
     """
     从模型最终文本中提取结构化诊断结果。
 
-    兼容两种形式：
+    兼容三种形式：
     1. 纯 JSON：{"message":"...","diagnosisItems":[...]}
-    2. 普通文本：原样返回，不填 diagnosisItems
+    2. 文字+JSON 混排（模型在 JSON 前加了前言或 ```json``` 包裹）：提取其中含 message 的 JSON
+    3. 普通文本：原样返回，不填 diagnosisItems
     """
     text = (message or "").strip()
     if not text:
         return message, None
 
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return message, None
-
-    if not isinstance(payload, dict):
+    payload = _parse_chat_payload_json(text)
+    # 必须是含 message 键的对象才视为结构化 payload；否则当普通文本原样返回
+    # （避免把正文里偶然出现的无关 {..} 误当 payload 而丢失正文）
+    if not isinstance(payload, dict) or "message" not in payload:
         return message, None
 
     raw_items = payload.get("diagnosisItems") or payload.get("diagnosis_items")
@@ -583,14 +612,30 @@ def _render_maintenance_block(m: dict) -> str:
             lines.append(f"安全提示：{fs.get('safetyNote')}")
         if fs.get("sources"):
             lines.append(f"该步参考依据：{fs.get('sources')}")
+        if fs.get("status"):
+            lines.append(f"该步当前状态：{fs.get('status')}")
+        if fs.get("aiReason"):
+            lines.append(f"AI 验收意见：{fs.get('aiReason')}")
+        if fs.get("note"):
+            lines.append(f"工人本步备注：{fs.get('note')}")
     ov = m.get("overview")
     if ov:
         lines.append("全部步骤：" + "；".join(ov))
+    rej = m.get("rejectedSteps")
+    if rej:
+        lines.append("未通过步骤驳回理由：" + "；".join(
+            f"第{r.get('sortOrder', '?')}步「{r.get('title', '')}」{r.get('aiReason', '')}" for r in rej
+        ))
     return "【任务背景】\n" + "\n".join(lines)
 
 
 def _is_unhelpful_maintenance_reply(message: str) -> bool:
-    """判断检修助手回复是否「翻车」：控制结构 JSON / 残缺 JSON / 套话式软拒答。"""
+    """判断检修助手回复是否「翻车」：控制结构 JSON / 残缺 JSON / 套话式软拒答。
+
+    注意软拒答的判据要克制：长答案里偶尔出现"需现场确认/无法给出精确值"属正常谨慎措辞，
+    不应判翻车（否则正经技术问答会被误降级为安全话术）。仅当「整段简短、且本身就是一句拒答」
+    才判翻车——与 _maintenance_fallback_answer._bad 的判据保持一致。
+    """
     s = (message or "").strip()
     if not s:
         return True
@@ -598,11 +643,15 @@ def _is_unhelpful_maintenance_reply(message: str) -> bool:
     p = (plain or "").strip()
     if not p:
         return True
+    # 控制结构 / 残缺 JSON：真翻车
     if (p.startswith("{") or p.startswith("```")
             or "needs_more_tools" in p or "needs_user_clarification" in p
             or '"status"' in p[:40]):
         return True
-    return any(h in p[:120] for h in _MAINT_REFUSAL_HINTS)
+    # 软拒答：仅当「短（<80字）且整体像拒答」才判翻车；长答案中的谨慎措辞放行
+    if len(p) < 80 and any(h in p for h in _MAINT_REFUSAL_HINTS):
+        return True
+    return False
 
 
 def _clean_fallback_text(text: str) -> str:
@@ -617,6 +666,9 @@ async def _maintenance_fallback_answer(input_data: AgentInput, maint_ctx: dict):
         "你是经验丰富的现场检修助手。请根据下面的【任务背景】和对话历史，"
         "用简明、安全第一、可操作的中文，直接给工人下一步可执行的建议。"
         "第一句话就给结论，即使知识库没有完全匹配的资料，也要基于通用检修经验务实作答。"
+        "对常见故障原因、排查思路、原理性问题，要大胆运用专业常识给出有价值的判断；"
+        "但涉及精确参数（扭矩、间隙、公差、具体型号规格、确切数值）时，只给方向、范围或排查方法，"
+        "并提示『具体数值以该设备手册/铭牌为准』，绝不编造确切数字。"
         "严禁以「资料不足 / 无法回答 / 暂不能生成」搪塞；"
         "严禁输出任何 JSON、花括号 {} 或字段名，只用自然段中文回答。\n\n"
         + _render_maintenance_block(maint_ctx)
@@ -702,6 +754,8 @@ async def chat_stream(request: ChatRequest):
                 elif ev_type == "tool":
                     tools_in_stream.append(event.get("data", {}).get("tool", ""))
                     yield f"data: {json_dumps(event)}\n\n"
+                elif ev_type == "tool_result":
+                    yield f"data: {json_dumps(event)}\n\n"
                 elif ev_type == "token":
                     token_buffer.append(event.get("data", {}).get("content", ""))
                 elif ev_type == "done":
@@ -773,6 +827,17 @@ async def chat_stream(request: ChatRequest):
                 markers = get_review_agent().get_inline_markers(final_message, verification)
                 verified_tools = verified_output.tools_used
                 verified_latency = verified_output.latency_ms
+
+                # 检修助手：review 因"证据不足"把回答压成软拒答（"知识库未检索到…请补型号"）时，
+                # 不直接甩给工人——改用「上下文+常识」重答。通用原理/常见原因据此放开作答；
+                # 精确参数由 _maintenance_fallback_answer 的 prompt 约束为"给方向、以手册为准、不编数值"。
+                if maint_ctx and verified_output.metadata.get("blocked_for_insufficient_evidence"):
+                    retry = await _maintenance_fallback_answer(input_data, maint_ctx)
+                    if retry:
+                        logger.info("[chat_stream] 检修助手证据不足→改用常识重答 session=%s", request.session_id)
+                        final_message = retry
+                        diagnosis_items = None
+                        markers = []
 
             # —— 最终硬保险：检修场景下绝不让结构化 JSON / 冷拒答流给工人 ——
             if maint_ctx and _is_unhelpful_maintenance_reply(final_message):
@@ -1064,6 +1129,12 @@ async def ai_case_draft(req: CaseDraftRequest):
 async def ai_case_compliance(req: CaseComplianceRequest):
     """门控 LLM：判断内容是否可纳入设备检修知识库。"""
     return CaseComplianceResponse(**await check_compliance(req.text))
+
+
+@app.post("/ai/case/extract", response_model=CaseExtractResponse)
+async def ai_case_extract(req: CaseExtractRequest):
+    """文件(pdf/txt/docx)抽文本 + 图片 VLM OCR → 汇总纯文本（供 /ai/case/draft 起草）。"""
+    return CaseExtractResponse(**await extract_material(req))
 
 
 @app.post("/ai/validate")
